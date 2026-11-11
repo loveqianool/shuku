@@ -85,6 +85,16 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .reader-content[data-reader-theme="sepia"] { background: #f4ecd8; color: #433422; }
 .reader-content[data-reader-theme="dark"] { background: #1a1a1a; color: #d8d8d8; }
 .reader-content[data-reader-theme="light"], .reader-content[data-reader-theme="sepia"], .reader-content[data-reader-theme="dark"] { padding: 16px; border-radius: var(--radius); }
+/* 仿另一家阅读器：底部固定栏（全书进度滑杆 + 目录/搜索/朗读/设置），点正文唤出/收起。 */
+.reader-bottombar { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: min(720px, 100%); background: var(--bg); border-top: 1px solid var(--border); padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px)); z-index: 20; box-sizing: border-box; }
+.reader-bottombar .book-progress { display: flex; gap: 8px; align-items: center; }
+.reader-bottombar .book-progress input[type="range"] { flex: 1; min-width: 0; }
+.reader-bottombar .bar-actions { display: flex; gap: 8px; margin-top: 8px; }
+.reader-bottombar .bar-actions button { flex: 1; }
+/* 本章竖向进度滑杆：固定在右侧中部，拖动滚动本章。 */
+.chapter-progress { position: fixed; right: 4px; top: 50%; transform: translateY(-50%); height: 40vh; width: 18px; z-index: 15; opacity: 0.65; writing-mode: vertical-lr; direction: rtl; }
+/* 底栏显示时留出底部空间，免得固定底栏盖住正文末尾。 */
+.reader.chrome-on { padding-bottom: 120px; }
 
 table.logs { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.logs td, table.logs th { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }

@@ -68,6 +68,15 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [currentOccurrence, setCurrentOccurrence] = createSignal(-1);
   // 本书内搜索高亮：点结果跳章后，在正文里标亮该词全部出现处。
   const [searchTerm, setSearchTerm] = createSignal("");
+  // 仿另一家阅读器的交互：顶栏和底栏平时显示，点一下正文收起来，
+  // 再点一下浮出来；搜尋与设置面板由底栏按钮唤出，平时收起。
+  const [showChrome, setShowChrome] = createSignal(true);
+  const [showSearch, setShowSearch] = createSignal(false);
+  const [showSettings, setShowSettings] = createSignal(false);
+  // 本章内滚动进度（0..1），驱动右边的竖向滑杆与全书进度。
+  const [scrollFrac, setScrollFrac] = createSignal(0);
+  // 底栏全书滑杆拖动中的值（null 表示没在拖），松手才跳章，免得拖动时反复加载。
+  const [bookDrag, setBookDrag] = createSignal<number | null>(null);
 
   // 当前选中处定位：章节渲染好之后，把本章第 currentOccurrence 个
   // mark.search-hit 单独标亮（search-hit-current）并滚到它。只在当前
@@ -221,6 +230,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       setSelText("");
       location.hash = `#/read/${encodeURIComponent(props.bookId)}/${i}`;
       if (contentRef) contentRef.scrollTop = 0;
+      window.scrollTo(0, 0);
+      setScrollFrac(0);
       // 进度：切章即保存
       await api.saveProgress(props.bookId, { chapter_idx: i, offset: 0 }).catch(() => {});
     } catch (e) {
@@ -253,6 +264,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   // 滚动进度自动保存（防抖 1s）
   const onScroll = () => {
     if (!contentRef) return;
+    setScrollFrac(getScrollFrac());
     clearTimeout(saveTimer);
     const offset = contentRef.scrollTop;
     saveTimer = setTimeout(() => {
@@ -282,6 +294,63 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const pageStep = (dir: 1 | -1) => {
     if (!contentRef) return;
     contentRef.scrollBy({ top: dir * contentRef.clientHeight * 0.92, behavior: "smooth" });
+  };
+
+  // 本章滚动进度：仿真翻页模式下正文容器自己滚，滚动模式下整页滚。
+  const getScrollFrac = () => {
+    if (settings().mode === "page") {
+      const el = contentRef;
+      if (!el) return 0;
+      const max = el.scrollHeight - el.clientHeight;
+      return max > 0 ? Math.min(1, Math.max(0, el.scrollTop / max)) : 0;
+    }
+    const max = document.documentElement.scrollHeight - window.innerHeight;
+    return max > 0 ? Math.min(1, Math.max(0, window.scrollY / max)) : 0;
+  };
+  const scrollToFrac = (f: number) => {
+    const v = Math.min(1, Math.max(0, f));
+    if (settings().mode === "page") {
+      const el = contentRef;
+      if (!el) return;
+      el.scrollTo({ top: v * (el.scrollHeight - el.clientHeight) });
+    } else {
+      window.scrollTo({ top: v * (document.documentElement.scrollHeight - window.innerHeight) });
+    }
+  };
+  // 滚动模式下整页滚，用 window 滚动事件同步本章进度。
+  const onWinScroll = () => { if (settings().mode !== "page") setScrollFrac(getScrollFrac()); };
+  window.addEventListener("scroll", onWinScroll, { passive: true });
+  onCleanup(() => window.removeEventListener("scroll", onWinScroll));
+
+  // 全书进度（0..100）：章节序号 + 本章内滚动进度，底栏滑杆用。
+  const bookPct = () => {
+    const n = toc().length;
+    if (n === 0) return 0;
+    return ((idx() + scrollFrac()) / n) * 100;
+  };
+  // 底栏滑杆拖动：跳到对应章节（同章时只滚到对应位置）。
+  const jumpToBookPct = (pct: number) => {
+    const n = toc().length;
+    if (n === 0) return;
+    const target = Math.min(n - 1, Math.max(0, Math.floor((pct / 100) * n)));
+    if (target === idx()) {
+      scrollToFrac((pct / 100) * n - target);
+      return;
+    }
+    loadChapter(target);
+  };
+  // 底栏「搜索」：浮出顶栏与搜索面板并聚焦输入框。
+  let searchInputRef: HTMLInputElement | undefined;
+  const openSearch = () => {
+    setShowChrome(true);
+    setShowSearch(true);
+    requestAnimationFrame(() => searchInputRef?.focus());
+  };
+  // 点正文切换顶栏/底栏显隐（有选词时不切换，免得干扰批注）。
+  const toggleChrome = () => {
+    const sel = window.getSelection();
+    if (sel && sel.toString().trim()) return;
+    setShowChrome(!showChrome());
   };
 
   const onKey = (e: KeyboardEvent) => {
@@ -316,6 +385,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setCurrentMatch(-1);
     setCurrentOccurrence(-1);
     setInBookHits([]);
+    setShowSearch(false);
     await loadChapter(h.chapter_idx);
     requestAnimationFrame(() => {
       contentRef?.querySelector("mark.search-hit")?.scrollIntoView({ block: "center" });
@@ -329,6 +399,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     if (!m) return;
     setSearchTerm(inBookQ().trim());
     setCurrentMatch(i);
+    setShowSearch(false);
     // 该处在本章里的第几个出现处（用来单独标亮）。
     const k = inBookMatches().slice(0, i).filter((x) => x.chapter_idx === m.chapter_idx).length;
     if (m.chapter_idx !== idx()) {
@@ -413,22 +484,32 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const ch = () => chapter();
 
   return (
-    <div class="reader">
-      <div class="reader-bar">
-        <a href="#/">‹ 书库</a>
-        <strong>{book()?.title ?? "…"}</strong>
-        <button onClick={() => setShowToc(!showToc())}>目录</button>
-        <span class="muted">第 {idx() + 1} 章 / 共 {toc().length} 章</span>
-        <input
-          placeholder="本书内搜索"
-          value={inBookQ()}
-          onInput={(e) => setInBookQ(e.currentTarget.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") searchInBook(); }}
-        />
-        <button disabled={inBookSearching()} onClick={searchInBook}>搜</button>
-      </div>
+    <div class="reader" classList={{ "chrome-on": showChrome() }}>
+      <Show when={showChrome()}>
+        <div class="reader-bar">
+          <a href="#/">‹ 书库</a>
+          <strong>{book()?.title ?? "…"}</strong>
+          <span class="muted">第 {idx() + 1} 章 / 共 {toc().length} 章</span>
+        </div>
+      </Show>
 
-      <Show when={inBookMatches().length > 0}>
+      <Show when={showSearch()}>
+        <div class="card">
+          <div class="row">
+            <input
+              ref={searchInputRef}
+              placeholder="本书内搜索"
+              value={inBookQ()}
+              onInput={(e) => setInBookQ(e.currentTarget.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") searchInBook(); }}
+            />
+            <button disabled={inBookSearching()} onClick={searchInBook}>搜</button>
+            <button onClick={() => { setShowSearch(false); clearSearch(); }}>✕</button>
+          </div>
+        </div>
+      </Show>
+
+      <Show when={showSearch() && inBookMatches().length > 0}>
         <div class="card">
           <strong>本书内搜索「{inBookQ()}」：共 {inBookMatchTotal()} 处</strong>
           <button onClick={clearSearch}>清除</button>
@@ -451,7 +532,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
-      <Show when={inBookMatches().length === 0 && inBookHits().length > 0}>
+      <Show when={showSearch() && inBookMatches().length === 0 && inBookHits().length > 0}>
         <div class="card">
           <strong>本书内搜索：{inBookTotal()} 条</strong>
           <button onClick={clearSearch}>清除</button>
@@ -469,14 +550,14 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
-      <Show when={inBookMatches().length === 0 && inBookHits().length === 0 && searchDone() && inBookQ().trim() !== ""}>
+      <Show when={showSearch() && inBookMatches().length === 0 && inBookHits().length === 0 && searchDone() && inBookQ().trim() !== ""}>
         <div class="card">
           <span class="muted">没有找到「{inBookQ()}」</span>
           <button onClick={clearSearch}>清除</button>
         </div>
       </Show>
 
-      <Show when={searchTerm()}>
+      <Show when={searchTerm() && showChrome()}>
         <div class="card row">
           <Show when={currentMatch() >= 0} fallback={
             <span>搜索「{searchTerm()}」：本章 {(chapter()?.paragraphs ?? []).reduce((n, p) => n + (p.text ?? "").split(searchTerm()).length - 1, 0)} 处</span>
@@ -501,6 +582,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
+      <Show when={showSettings()}>
       <div class="reader-settings">
         <label>字号 <input type="number" min={12} max={32} value={s().fontSize} onChange={(e) => patchSettings({ fontSize: Number(e.currentTarget.value) })} /></label>
         <label>行距 <input type="number" step={0.1} min={1.2} max={3} value={s().lineHeight} onChange={(e) => patchSettings({ lineHeight: Number(e.currentTarget.value) })} /></label>
@@ -525,7 +607,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
             <option value="simp">简体</option>
           </select>
         </label>
+        <label>语速 <input type="number" step={0.1} min={0.5} max={2} value={ttsRate()} onChange={(e) => setTtsRate(Number(e.currentTarget.value))} /></label>
       </div>
+      </Show>
 
       <Show when={error()}><p class="error">{error()}</p></Show>
       <Show when={loading()}><p class="muted">加载章节中…</p></Show>
@@ -540,6 +624,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       </Show>
 
       <Show when={ch()}>
+        <div onClick={toggleChrome}>
         <h2>{disp(ch()!.title)}</h2>
         <div
           ref={contentRef}
@@ -574,6 +659,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
               </Show>
             )}
           </For>
+        </div>
         </div>
         <Show when={highlights().length > 0}>
           <div class="card">
@@ -638,16 +724,36 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
-      <div class="toolbar">
-        <button disabled={idx() <= 0 || loading()} onClick={() => loadChapter(idx() - 1)}>上一章</button>
-        <Show when={s().mode === "page"}>
-          <button onClick={() => pageStep(-1)}>‹ 上一屏</button>
-          <button onClick={() => pageStep(1)}>下一屏 ›</button>
-        </Show>
-        <button disabled={idx() >= toc().length - 1 || loading()} onClick={() => loadChapter(idx() + 1)}>下一章</button>
-        <button onClick={speakChapter}>{speaking() ? "⏹ 停止朗读" : "🔊 朗读本章"}</button>
-        <label>语速 <input type="number" step={0.1} min={0.5} max={2} value={ttsRate()} onChange={(e) => setTtsRate(Number(e.currentTarget.value))} /></label>
-      </div>
+      <Show when={showChrome()}>
+        <div class="reader-bottombar">
+          <div class="book-progress">
+            <button disabled={idx() <= 0 || loading()} onClick={() => loadChapter(idx() - 1)}>‹</button>
+            <input
+              type="range" min="0" max="100" step="0.1"
+              value={bookDrag() ?? bookPct()}
+              onInput={(e) => setBookDrag(Number(e.currentTarget.value))}
+              onChange={(e) => { const v = Number(e.currentTarget.value); setBookDrag(null); jumpToBookPct(v); }}
+              aria-label="全书进度"
+            />
+            <span class="muted">{Math.round(bookDrag() ?? bookPct())}%</span>
+            <button disabled={idx() >= toc().length - 1 || loading()} onClick={() => loadChapter(idx() + 1)}>›</button>
+          </div>
+          <div class="bar-actions">
+            <button onClick={() => setShowToc(!showToc())}>📑 目录</button>
+            <button onClick={openSearch}>🔍 搜索</button>
+            <button onClick={speakChapter}>{speaking() ? "⏹ 停止朗读" : "🔊 朗读"}</button>
+            <button onClick={() => setShowSettings(!showSettings())}>⚙️ 设置</button>
+          </div>
+        </div>
+      </Show>
+
+      <input
+        type="range" min="0" max="100" step="0.1"
+        value={scrollFrac() * 100}
+        onInput={(e) => scrollToFrac(Number(e.currentTarget.value) / 100)}
+        class="chapter-progress"
+        aria-label="本章进度"
+      />
     </div>
   );
 };
