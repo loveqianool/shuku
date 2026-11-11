@@ -51,17 +51,10 @@ const App: Component = () => {
   };
   document.documentElement.dataset.theme = dark() ? "dark" : "light";
 
-  const link = (href: string, name: string) => (
-    <a href={href} class={route().name === name ? "active" : ""}>
-      {href === "#/" && name === "books" ? "书库" : name === "search" ? "检索" : name === "sources" ? "书源" : name === "tasks" ? "任务" : name}
-    </a>
-  );
-
   return (
     <div class="app">
       <nav class="nav">
-        <span class="brand">📚 书库</span>
-        <a href="#/" class={route().name === "books" ? "active" : ""}>书库</a>
+        <a href="#/" class={route().name === "books" ? "brand active" : "brand"}>📚 书库</a>
         <a href="#/search" class={route().name === "search" ? "active" : ""}>检索</a>
         <a href="#/sources" class={route().name === "sources" || route().name === "test" ? "active" : ""}>书源</a>
         <a href="#/picker" class={route().name === "picker" ? "active" : ""}>规则拾取</a>
