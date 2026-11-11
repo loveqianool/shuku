@@ -154,3 +154,9 @@
 - `Dockerfile`（仓库根）：alpine:3.21 + 预编的 musl 静态二进制（CI 每架构编一个，`bin-<arch>/legado-server`），建 `/tmp`（扫描暂存用）`/data` `/books`；默认 `LEGADO_BOOKS_DIR=/books`、`LEGADO_DATA_DIR=/data`、`LEGADO_ADDR=0.0.0.0:8080`，端口 8080。reqwest 用 rustls 自带根证书，镜像里不需要 CA 证书包。
 - `.github/workflows/docker.yml`：push 到 main 或 `v*` 标签时跑；`binary` 任务在 amd64（ubuntu-24.04）与 arm64（ubuntu-24.04-arm）原生 runner 上各编前端 + musl 二进制，**先跑全量测试，通过才推镜像**；`docker` 任务（PR 不跑）用 buildx 各推 `amd64-<sha>` / `arm64-<sha>` 镜像，再 `imagetools create` 合成多架构清单 `:latest`、`:sha-<sha>`（打标签时另加 `:<版本号>`）。GHCR 包默认私有，工作流最后一步用 `gh api` 把它改公开（best-effort，失败不影响构建）。
 - 本地编镜像：先编 musl 二进制，放进 `bin-amd64/legado-server`，再 `docker build -t legado-server .`（本机无 docker，未本地验证，靠 CI 首跑验证）。
+
+## 发布（PAT 推送，2026-11-11，Ye 要求）
+
+- 项目 PAT「legado-server Muse」（fine-grained，只限本仓库，Contents + Workflows 读写，到期 2027-11-11），存在连接器 custom.github-legado-pat，token 值只在保险库里，不进任何文件。
+- 推送走 `~/workspace/custom-connectors/custom.github-legado-pat/bin/gh_push.py`（Git Data API：blob→tree→commit→更新 main，一次提交）；不要用 MCP push_files（在有提交的仓库上建 tree 会 403），不要用 MCP create_or_update_file 逐文件推（每个文件一次提交、一次批准卡）。
+- `.github/workflows/*` 同样走 gh_push.py（PAT 有 Workflows 权限，App 没有）。
