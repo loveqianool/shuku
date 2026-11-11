@@ -148,3 +148,9 @@
 - 全量：99 单元 + 2 端到端全绿，零警告；前端 `npm run build` 通过（dist 11 个预缓存条目）；musl 静态二进制 + fixture 冒烟见下。
 - 代码里只剩两处 TODO，都是 build.rs/static_files.rs 里的流程提醒（发布构建前先编前端 dist，否则二进制内嵌占位页）；build.rs 已有防护——dist 不存在时构建会打警告，且本次冒烟验证了内嵌的是真实前端。
 - 项目没有 git 仓库（`git status` 报 not a git repository），版本历史不在版本控制里——Ye 定是否要建。
+
+## Docker CI（2026-11-11，Ye 要求）
+
+- `Dockerfile`（仓库根）：alpine:3.21 + 预编的 musl 静态二进制（CI 每架构编一个，`bin-<arch>/legado-server`），建 `/tmp`（扫描暂存用）`/data` `/books`；默认 `LEGADO_BOOKS_DIR=/books`、`LEGADO_DATA_DIR=/data`、`LEGADO_ADDR=0.0.0.0:8080`，端口 8080。reqwest 用 rustls 自带根证书，镜像里不需要 CA 证书包。
+- `.github/workflows/docker.yml`：push 到 main 或 `v*` 标签时跑；`binary` 任务在 amd64（ubuntu-24.04）与 arm64（ubuntu-24.04-arm）原生 runner 上各编前端 + musl 二进制，**先跑全量测试，通过才推镜像**；`docker` 任务（PR 不跑）用 buildx 各推 `amd64-<sha>` / `arm64-<sha>` 镜像，再 `imagetools create` 合成多架构清单 `:latest`、`:sha-<sha>`（打标签时另加 `:<版本号>`）。GHCR 包默认私有，工作流最后一步用 `gh api` 把它改公开（best-effort，失败不影响构建）。
+- 本地编镜像：先编 musl 二进制，放进 `bin-amd64/legado-server`，再 `docker build -t legado-server .`（本机无 docker，未本地验证，靠 CI 首跑验证）。
