@@ -49,6 +49,7 @@ export interface SearchHit {
   chapter_title: string;
   snippet: string;
   score?: number;
+  match_count?: number;
 }
 
 export type SearchScope = "local" | "cached" | "all";

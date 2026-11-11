@@ -57,6 +57,108 @@ pub struct SearchHit {
     pub chapter_title: String,
     pub snippet: String,
     pub score: f32,
+    /// Literal occurrences of the query terms in this chapter's content
+    /// (0 when the match is only via pinyin/title).
+    pub match_count: i64,
+}
+
+/// HTML-escape one char into `out` (fragments are rendered as HTML).
+fn escape_char(out: &mut String, c: char) {
+    match c {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#39;"),
+        _ => out.push(c),
+    }
+}
+
+/// Build up to `max_fragments` windows around literal occurrences of
+/// `terms` in `content` (document order, char-based), each with the
+/// terms wrapped in `<em>`. Returns the fragments and the total number
+/// of literal occurrences in the whole content.
+///
+/// A tantivy snippet shows only the single best fragment, but a chapter
+/// can mention the term dozens of times, so the result list looked
+/// incomplete. When no literal occurrence is found (e.g. pinyin-only
+/// matches) this returns empty and the caller keeps the tantivy snippet.
+fn content_fragments(content: &str, terms: &[&str], max_fragments: usize) -> (Vec<String>, usize) {
+    let chars: Vec<char> = content.chars().collect();
+    let mut term_chars: Vec<Vec<char>> = terms
+        .iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().collect())
+        .collect();
+    // Longer terms first, so a longer match wins over a shorter one
+    // starting at the same position when highlighting.
+    term_chars.sort_by(|a, b| b.len().cmp(&a.len()));
+    if term_chars.is_empty() || chars.is_empty() {
+        return (vec![], 0);
+    }
+    // All occurrences, in document order: (char_pos, term_char_len).
+    let mut occs: Vec<(usize, usize)> = vec![];
+    for tc in &term_chars {
+        let mut i = 0;
+        while i + tc.len() <= chars.len() {
+            if chars[i..i + tc.len()] == tc[..] {
+                occs.push((i, tc.len()));
+                i += tc.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let match_count = occs.len();
+    if occs.is_empty() {
+        return (vec![], 0);
+    }
+    occs.sort();
+    // Merge occurrences into windows: 60 chars before, 90 after.
+    const BEFORE: usize = 60;
+    const AFTER: usize = 90;
+    let mut windows: Vec<(usize, usize)> = vec![];
+    for (pos, len) in occs {
+        let s = pos.saturating_sub(BEFORE);
+        let e = (pos + len + AFTER).min(chars.len());
+        if let Some(last) = windows.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        windows.push((s, e));
+    }
+    windows.truncate(max_fragments);
+    let fragments = windows
+        .iter()
+        .map(|&(s, e)| {
+            let mut out = String::new();
+            let mut i = s;
+            while i < e {
+                let mut matched: Option<usize> = None;
+                for tc in &term_chars {
+                    if i + tc.len() <= e && chars[i..i + tc.len()] == tc[..] {
+                        matched = Some(tc.len());
+                        break;
+                    }
+                }
+                if let Some(len) = matched {
+                    out.push_str("<em>");
+                    for c in &chars[i..i + len] {
+                        escape_char(&mut out, *c);
+                    }
+                    out.push_str("</em>");
+                    i += len;
+                } else {
+                    escape_char(&mut out, chars[i]);
+                    i += 1;
+                }
+            }
+            out
+        })
+        .collect();
+    (fragments, match_count)
 }
 
 pub struct SearchIndex {
@@ -440,6 +542,18 @@ impl SearchIndex {
                     .replace("<b>", "<em>")
                     .replace("</b>", "</em>");
             }
+            // One tantivy fragment per chapter made results look
+            // incomplete; show up to 5 windows around literal
+            // occurrences instead, plus the total occurrence count.
+            let content = doc
+                .get_first(self.f_content)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let terms: Vec<&str> = query_str.split_whitespace().collect();
+            let (fragments, match_count) = content_fragments(content, &terms, 5);
+            if !fragments.is_empty() {
+                snippet = fragments.join(" … ");
+            }
             hits.push(SearchHit {
                 book_id: bid.to_string(),
                 book_title: doc.get_first(self.f_book_title).and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -448,6 +562,7 @@ impl SearchIndex {
                 chapter_title: doc.get_first(self.f_chapter_title).and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 snippet,
                 score,
+                match_count: match_count as i64,
             });
         }
         Ok((hits, total))
@@ -467,6 +582,20 @@ mod tests {
         // Not pinyin: left untouched, so english/code search is unaffected.
         assert_eq!(expand_pinyin_query("harry"), "harry");
         assert_eq!(expand_pinyin_query("hello world"), "hello world");
+    }
+
+    #[test]
+    fn content_fragments_multiple_windows() {
+        let filler = "甲".repeat(200);
+        let content = format!("李茉进了屋。{filler}李茉又出来了。{filler}李茉回来了。");
+        let (frags, count) = content_fragments(&content, &["李茉"], 5);
+        assert_eq!(count, 3);
+        assert_eq!(frags.len(), 3);
+        assert!(frags.iter().all(|f| f.contains("<em>李茉</em>")));
+        // No literal occurrence (pinyin): empty fragments, count 0.
+        let (frags, count) = content_fragments(&content, &["limo"], 5);
+        assert_eq!(count, 0);
+        assert!(frags.is_empty());
     }
 
     #[test]

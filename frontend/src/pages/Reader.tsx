@@ -341,6 +341,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
                 <a href="#" onClick={(e) => { e.preventDefault(); jumpToSearchHit(h); }}>
                   {h.chapter_title}
                 </a>{" "}
+                {(h.match_count ?? 0) > 0 ? <span class="muted">· {h.match_count} 处 </span> : null}
                 <span innerHTML={h.snippet} />
               </p>
             )}

@@ -58,6 +58,26 @@ const Bookshelf: Component = () => {
     overscan: 8,
   });
 
+  // 可见书目直接由 books() 派生：虚拟滚动内部的 getVirtualItems() 是
+  // 一个 store，经 reconcile 按 index 复用旧项，列表换了它也可能不更新，
+  // 造成“共 N 本”已变、列表还显示旧书；越界项直接滤掉，顺带防崩。
+  type VItem = ReturnType<typeof virtualizer.getVirtualItems>[number];
+  const visibleBooks = (): { item: VItem; book: Book }[] => {
+    const list = books();
+    const out: { item: VItem; book: Book }[] = [];
+    for (const item of virtualizer.getVirtualItems()) {
+      const book = list[item.index];
+      if (book) out.push({ item, book });
+    }
+    return out;
+  };
+
+  // books() 变化时强制虚拟滚动重测，避免容器高度还停在旧列表的尺寸。
+  createEffect(() => {
+    void books();
+    virtualizer.measure();
+  });
+
   const onScroll = () => {
     const el = parentRef;
     if (!el || loading()) return;
@@ -95,12 +115,10 @@ const Bookshelf: Component = () => {
       <Show when={error()}><p class="error">{error()}</p></Show>
       <div class="vlist" ref={parentRef} onScroll={onScroll}>
         <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
-          <For each={virtualizer.getVirtualItems()}>
-            {(item) => {
-              const book = books()[item.index];
-              // 虚拟滚动的测量缓存滞后于列表缩短时，旧项的 index 会越界，
-              // book 为 undefined；直接不渲染，否则读 .tags 会整页崩掉。
-              if (!book) return null;
+          <For each={visibleBooks()}>
+            {(x) => {
+              const item = x.item;
+              const book = x.book;
               const b = () => book;
               return (
                 <div

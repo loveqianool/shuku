@@ -99,7 +99,7 @@ const SearchPage: Component = () => {
           {(h) => (
             <div class="card" onClick={() => (location.hash = `#/read/${encodeURIComponent(h.book_id)}/${h.chapter_idx}`)} style={{ cursor: "pointer" }}>
               <h3>{h.book_title} <span class="muted">/ {h.chapter_title}</span></h3>
-              <p class="muted">{h.author ?? ""} · 第 {h.chapter_idx + 1} 章 · score {h.score?.toFixed(2) ?? "-"}</p>
+              <p class="muted">{h.author ?? ""} · 第 {h.chapter_idx + 1} 章{(h.match_count ?? 0) > 0 ? <> · {h.match_count} 处</> : null} · score {h.score?.toFixed(2) ?? "-"}</p>
               {/* snippet 来自后端 tantivy 高亮（<em>），直接渲染 */}
               <p innerHTML={h.snippet} />
             </div>
