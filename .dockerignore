@@ -1,0 +1,12 @@
+# Keep the build context small: only the Dockerfile and the prebuilt
+# binaries (bin-*/legado-server) are needed at image build time.
+.git
+.github
+target/
+crates/
+frontend/
+data/
+books/
+perf-books/
+*.log
+.DS_Store
