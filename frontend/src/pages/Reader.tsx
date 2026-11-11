@@ -1,4 +1,4 @@
-import { createSignal, createEffect, For, Show, onCleanup, type Component } from "solid-js";
+import { createSignal, createEffect, createMemo, For, Show, onCleanup, type Component } from "solid-js";
 import { api, type Book, type Chapter, type ChapterMeta, type ChapterIssue, type SearchHit } from "../lib/api";
 import { downloadBook, deleteOfflineBook, offlineChapterCount } from "../lib/offline";
 import {
@@ -26,6 +26,21 @@ function renderTextWithHighlights(text: string, highlights: Highlight[]) {
   return parts;
 }
 
+function splitOnTerm(text: string, term: string) {
+  // 按词切分全部出现处（批注只标首处，搜索要标全部）。
+  if (!term) return [{ text, hit: false }];
+  const parts: { text: string; hit: boolean }[] = [];
+  let rest = text;
+  for (;;) {
+    const i = rest.indexOf(term);
+    if (i < 0) { if (rest) parts.push({ text: rest, hit: false }); break; }
+    if (i > 0) parts.push({ text: rest.slice(0, i), hit: false });
+    parts.push({ text: term, hit: true });
+    rest = rest.slice(i + term.length);
+  }
+  return parts;
+}
+
 const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [book, setBook] = createSignal<Book | null>(null);
   const [toc, setToc] = createSignal<ChapterMeta[]>([]);
@@ -42,6 +57,13 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [inBookHits, setInBookHits] = createSignal<SearchHit[]>([]);
   const [inBookTotal, setInBookTotal] = createSignal(0);
   const [inBookSearching, setInBookSearching] = createSignal(false);
+  // 本书内搜索高亮：点结果跳章后，在正文里标亮该词全部出现处。
+  const [searchTerm, setSearchTerm] = createSignal("");
+  const searchMatchCount = createMemo(() => {
+    const term = searchTerm();
+    if (!term) return 0;
+    return (chapter()?.paragraphs ?? []).reduce((n, p) => n + (p.text ?? "").split(term).length - 1, 0);
+  });
   const [sameAuthor, setSameAuthor] = createSignal<Book[]>([]);
   // 整本离线状态（实际查 Cache Storage）。
   const [offlineCount, setOfflineCount] = createSignal<number | null>(null);
@@ -263,9 +285,21 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     window.getSelection()?.removeAllRanges();
   };
 
+  // 点搜索结果：跳到那章，标亮该词全部出现处，滚到第一处。
+  const jumpToSearchHit = async (h: SearchHit) => {
+    const term = inBookQ().trim();
+    setSearchTerm(term);
+    setInBookHits([]);
+    await loadChapter(h.chapter_idx);
+    requestAnimationFrame(() => {
+      contentRef?.querySelector("mark.search-hit")?.scrollIntoView({ block: "center" });
+    });
+  };
+
   const searchInBook = async () => {
     const q = inBookQ().trim();
     if (!q) return;
+    setSearchTerm("");
     setInBookSearching(true);
     try {
       const res = await api.search(q, "all", 1, 20, props.bookId);
@@ -300,17 +334,24 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       <Show when={inBookHits().length > 0 || (inBookTotal() === 0 && inBookQ().trim() !== "" && !inBookSearching())}>
         <div class="card">
           <strong>本书内搜索：{inBookTotal()} 条</strong>
-          <button onClick={() => { setInBookHits([]); setInBookTotal(0); setInBookQ(""); }}>清除</button>
+          <button onClick={() => { setInBookHits([]); setInBookTotal(0); setInBookQ(""); setSearchTerm(""); }}>清除</button>
           <For each={inBookHits()}>
             {(h) => (
               <p>
-                <a href="#" onClick={(e) => { e.preventDefault(); setInBookHits([]); loadChapter(h.chapter_idx); }}>
+                <a href="#" onClick={(e) => { e.preventDefault(); jumpToSearchHit(h); }}>
                   {h.chapter_title}
                 </a>{" "}
                 <span innerHTML={h.snippet} />
               </p>
             )}
           </For>
+        </div>
+      </Show>
+
+      <Show when={searchTerm()}>
+        <div class="card row">
+          <span>搜索「{searchTerm()}」：本章 {searchMatchCount()} 处</span>
+          <button onClick={() => setSearchTerm("")}>清除标亮</button>
         </div>
       </Show>
 
@@ -384,7 +425,13 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
               <Show when={p.img} fallback={
                 <p>
                   <For each={renderTextWithHighlights(p.text ?? "", highlights())}>
-                    {(part) => part.anno ? <mark class="anno" title={highlights().find((h) => h.text === part.text)?.note ?? ""}>{disp(part.text)}</mark> : <>{disp(part.text)}</>}
+                    {(part) => part.anno ? (
+                      <mark class="anno" title={highlights().find((h) => h.text === part.text)?.note ?? ""}>{disp(part.text)}</mark>
+                    ) : (
+                      <For each={splitOnTerm(part.text, searchTerm())}>
+                        {(sp) => sp.hit ? <mark class="search-hit">{disp(sp.text)}</mark> : <>{disp(sp.text)}</>}
+                      </For>
+                    )}
                   </For>
                 </p>
               }>

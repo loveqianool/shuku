@@ -401,7 +401,7 @@ impl SearchIndex {
         )?;
         let total = searcher.search(&*query, &tantivy::collector::Count)?;
         let mut snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_content)?;
-        snippet_gen.set_max_num_chars(200);
+        snippet_gen.set_max_num_chars(400);
         let mut title_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_chapter_title)?;
         title_snippet_gen.set_max_num_chars(120);
         let mut book_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_book_title)?;

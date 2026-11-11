@@ -51,6 +51,7 @@ pre { background: var(--surface); border: 1px solid var(--border); border-radius
 .badge { display: inline-block; background: var(--surface2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; font-size: 12px; color: var(--muted); }
 mark { background: #b58900; color: #fff; border-radius: 2px; padding: 0 1px; }
 mark.anno { background: #7c3aed; }
+mark.search-hit { background: #b45309; }
 em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; padding: 0 1px; }
 
 .vlist { height: 70vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
