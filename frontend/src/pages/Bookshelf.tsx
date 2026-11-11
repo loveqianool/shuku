@@ -20,24 +20,32 @@ const Bookshelf: Component = () => {
   const [changeSourceId, setChangeSourceId] = createSignal("");
   let parentRef: HTMLDivElement | undefined;
 
+  // 每次筛选输入都会触发 load，连续输入会并发多个请求；用序号丢弃过期响应，
+  // 否则先发的慢响应会覆盖后发的筛选结果。
+  let loadSeq = 0;
   const load = async (p: number, append: boolean) => {
+    const my = ++loadSeq;
     setLoading(true);
     setError("");
     try {
       const res = await api.listBooks({ q: q(), author: author(), tag: tag(), sort: sort(), page: p, page_size: PAGE_SIZE });
+      if (my !== loadSeq) return;
       setBooks(append ? [...books(), ...res.items] : res.items);
       setTotal(res.total);
       setPage(p);
     } catch (e) {
+      if (my !== loadSeq) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (my === loadSeq) setLoading(false);
     }
   };
 
-  // 筛选变化时回到第 1 页
+  // 筛选变化时回到第 1 页并滚回顶部（否则虚拟列表还停在旧的滚动位置，
+  // 配合同步滞后的测量缓存会渲染到越界的旧索引）。
   createEffect(() => {
     void q(); void author(); void tag(); void sort();
+    parentRef?.scrollTo({ top: 0 });
     load(1, false);
   });
 
@@ -89,7 +97,11 @@ const Bookshelf: Component = () => {
         <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
           <For each={virtualizer.getVirtualItems()}>
             {(item) => {
-              const b = () => books()[item.index];
+              const book = books()[item.index];
+              // 虚拟滚动的测量缓存滞后于列表缩短时，旧项的 index 会越界，
+              // book 为 undefined；直接不渲染，否则读 .tags 会整页崩掉。
+              if (!book) return null;
+              const b = () => book;
               return (
                 <div
                   class="vlist-item"

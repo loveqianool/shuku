@@ -191,3 +191,9 @@
 ## 删「Make package public」步骤（2026-11-11）
 
 - 该步骤每次都回 404（`gh api PATCH /user/packages/container/shuku`，exit 1，靠 `continue-on-error` 才没拖垮 job），从 run #3 到 run #8 从没成功过。镜像本身早已是公开（匿名拉取 manifest 多次核实），可见性是套件级属性、推新版本不会变回私有，所以这步是纯噪音，已删。万一将来套件被删重建，仍需在 GHCR 网页上手动点公开（这步的 API 路径本来也调不通）。
+
+## 修书架虚拟滚动越界崩溃（2026-11-11）
+
+- 现象：书架筛选框打拼音时整页崩 `can't access property "tags", Z() is undefined`（Firefox 报错；`Z()` 是压缩后的书卡 accessor `b()`）。
+- 根因：`Bookshelf.tsx` 用 `@tanstack/solid-virtual`，项渲染是 `b = () => books()[item.index]`。虚拟滚动的测量缓存滞后于列表缩短一拍，旧项的 index 会越界，`b()` 返 `undefined` 再读 `.tags` 就崩。筛选框无防抖，打字会并发多个 `load()`，过期响应还会覆盖新结果，加剧触发。
+- 修：① 项渲染先取 `book = books()[item.index]`，越界直接 `return null`；② `load()` 加序号，丢弃过期响应；③ 筛选变化时滚回顶部。另注：书架筛选框目前是 `instr` 精确子串（不走拼音），拼音搜在全文检索页；要不要给筛选框也加拼音，待 Ye 定。
