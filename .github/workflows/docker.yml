@@ -64,17 +64,16 @@ jobs:
           workspaces: crates/server
           key: ${{ matrix.arch }}
 
-      - name: Install musl tools
-        # 2026-11-11：run #17 里 amd64 job 在这步挂了——runner 偶发解析不到
-        # azure.archive.ubuntu.com（Temporary failure resolving），包下不下来。
-        # 加三遍重试，免得一次 DNS 抖动就杀掉整个构建。
-        run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y musl-tools && break
-            echo "apt install attempt $i failed, retrying in 15s..."
-            sleep 15
-          done
-          command -v musl-gcc || { echo "musl-tools install failed after 3 attempts"; exit 1; }
+      # 2026-11-11：apt 装 musl-tools 彻底靠不住——run #17 amd64 job 解析不到
+      # azure.archive.ubuntu.com（exit 100）；run #18 里重试 3 次仍失败，
+      # amd64 在这步挂了 19 分钟，arm64 卡了 21 分钟，Ubuntu 镜像 DNS
+      # 持续解析不到。改用预编译交叉工具链（从 GitHub 下载，不经 apt），
+      # 不再依赖 Ubuntu 镜像。注意：它会设 CARGO_BUILD_TARGET，cargo test
+      # 随之跑 musl 目标（同架构 runner 上可直接运行，与发版二进制一致）。
+      - name: Install musl toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
 
       # Gate the image on tests: a failing suite publishes nothing.
       - name: Test

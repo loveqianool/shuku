@@ -249,3 +249,8 @@
 
 - run #17（阅读器交互重构，8dc1958）失败：amd64 job 在 `Install musl tools` 步挂了——runner 偶发解析不到 `azure.archive.ubuntu.com`（Temporary failure resolving 'azure.archive.ubuntu.com'），musl/musl-dev/musl-tools 三个包下不下来，exit 100。arm64 job 成功，docker job 因依赖失败没跑。代码本身没问题，是 runner 侧偶发 DNS 抖动。
 - PAT 没有重跑 workflow 的权限（rerun-failed-jobs 返回 403），改走修 workflow 触发新一轮：`Install musl tools` 步改成最多 3 遍重试（每次失败睡 15 秒），装完校验 `command -v musl-gcc`，三次都失败才报错退出。
+
+## CI：apt 装 musl-tools 改预编译交叉工具链（2026-11-11）
+
+- run #18（apt 三遍重试，f5413cd）实质失败：amd64 在 `Install musl tools` 步挂了 19 分 20 秒，azure.archive.ubuntu.com 解析失败，重试 3 次仍失败；arm64 同一步卡了 21 分钟。结论：这不是一两分钟的抖动，是 Ubuntu 镜像 DNS 持续解析不到，重试修不了。
+- 改法：`Install musl tools`（apt）换成 `taiki-e/setup-cross-toolchain-action@v1`（target 由 matrix 传），从 GitHub 下载预编译交叉工具链，完全不经 apt、不依赖 Ubuntu 镜像。注意：它会设 CARGO_BUILD_TARGET，cargo test 随之跑 musl 目标（同架构 runner 上可直接运行，与发版二进制一致）。
