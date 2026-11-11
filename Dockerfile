@@ -5,8 +5,11 @@
 # Local build: build the musl binary first, then
 #   mkdir -p bin-amd64 && cp crates/server/target/x86_64-unknown-linux-musl/release/legado-server bin-amd64/legado-server
 #   docker build -t legado-server .
-ARG TARGETARCH=amd64
+# TARGETARCH must be declared after FROM: an ARG declared before FROM is
+# out of scope inside the stage, and declaring it globally shadows
+# BuildKit's predefined per-platform value (it resolves to empty).
 FROM alpine:3.21
+ARG TARGETARCH
 RUN mkdir -p /tmp /data /books
 COPY bin-${TARGETARCH}/legado-server /legado-server
 EXPOSE 8080
