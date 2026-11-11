@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/books", get(list_books))
         .route("/api/books/duplicates", get(list_duplicates))
+        .route("/api/books/recent", get(list_recent_books))
         .route("/api/books/{id}", get(get_book).delete(delete_book))
         .route("/api/books/{id}/chapters", get(list_chapters))
         .route("/api/books/{id}/chapters/{idx}", get(get_chapter))
@@ -157,6 +158,12 @@ async fn list_books(State(s): State<AppState>, Query(q): Query<BookListQuery>) -
         .list_books(q.q, q.author, q.tag, q.sort.as_deref().unwrap_or("updated"), page, page_size)
         .await?;
     Ok(page_envelope(items, total, page, page_size))
+}
+
+/// 最近阅读：最近打开的 100 本书（按阅读进度的更新时间倒序）。
+async fn list_recent_books(State(s): State<AppState>) -> ApiResult<Json<Value>> {
+    let items = s.db.recent_books(100).await?;
+    Ok(Json(json!({ "items": items })))
 }
 
 async fn get_book(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {

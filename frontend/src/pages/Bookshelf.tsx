@@ -1,6 +1,6 @@
-import { createSignal, createEffect, For, Show, type Component } from "solid-js";
+import { createSignal, createEffect, onMount, For, Show, type Component } from "solid-js";
 import { createVirtualizer } from "@tanstack/solid-virtual";
-import { api, type Book, type Source } from "../lib/api";
+import { api, type Book, type RecentBook } from "../lib/api";
 
 const PAGE_SIZE = 50;
 
@@ -14,10 +14,8 @@ const Bookshelf: Component = () => {
   const [page, setPage] = createSignal(1);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
-  const [notice, setNotice] = createSignal("");
-  const [sources, setSources] = createSignal<Source[]>([]);
-  const [changingId, setChangingId] = createSignal<string | null>(null);
-  const [changeSourceId, setChangeSourceId] = createSignal("");
+  const [recent, setRecent] = createSignal<RecentBook[]>([]);
+  const [recentOpen, setRecentOpen] = createSignal(true);
   let parentRef: HTMLDivElement | undefined;
 
   // 每次筛选输入都会触发 load，连续输入会并发多个请求；用序号丢弃过期响应，
@@ -40,6 +38,16 @@ const Bookshelf: Component = () => {
       if (my === loadSeq) setLoading(false);
     }
   };
+
+  // 最近阅读：最近打开的 100 本书（打开书时阅读器会写进度），点开续读。
+  onMount(async () => {
+    try {
+      const res = await api.recentBooks();
+      setRecent(res.items);
+    } catch {
+      // 没有最近阅读不影响书库列表。
+    }
+  });
 
   // 筛选变化时回到第 1 页并滚回顶部（否则虚拟列表还停在旧的滚动位置，
   // 配合同步滞后的测量缓存会渲染到越界的旧索引）。
@@ -96,22 +104,29 @@ const Bookshelf: Component = () => {
           <option value="title">书名</option>
           <option value="author">作者</option>
         </select>
-        <button
-          onClick={async () => {
-            setNotice("");
-            try {
-              const res = await api.checkUpdatesAll();
-              setNotice(`已排队检查 ${res.queued ?? 0} 本书的更新（后台进行，稍后刷新查看）`);
-            } catch (e) {
-              setError(e instanceof Error ? e.message : String(e));
-            }
-          }}
-        >
-          检查更新
-        </button>
       </div>
+      <Show when={recent().length > 0}>
+        <div class="card">
+          <h3 style={{ cursor: "pointer", margin: "0 0 8px" }} onClick={() => setRecentOpen(!recentOpen())}>
+            最近阅读 {recentOpen() ? "▾" : "▸"}
+          </h3>
+          <Show when={recentOpen()}>
+            <For each={recent()}>
+              {(r) => (
+                <div
+                  class="recent-row"
+                  onClick={() => (location.hash = `#/read/${encodeURIComponent(r.id)}/${r.last_chapter_idx}`)}
+                >
+                  <strong>{r.title}</strong>
+                  <span class="muted"> {r.author ?? ""}</span>
+                  <span class="muted"> · 第 {r.last_chapter_idx + 1} 章</span>
+                </div>
+              )}
+            </For>
+          </Show>
+        </div>
+      </Show>
       <p class="muted">共 {total()} 本 · 虚拟滚动（长列表不渲染全部 DOM）</p>
-      <Show when={notice()}><p class="muted">{notice()}</p></Show>
       <Show when={error()}><p class="error">{error()}</p></Show>
       <div class="vlist" ref={parentRef} onScroll={onScroll}>
         <div style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
@@ -135,67 +150,6 @@ const Bookshelf: Component = () => {
                   <Show when={b().has_update}>
                     <span class="badge" style={{ "background": "#b45309", "color": "#fff" }}> 有更新</span>
                   </Show>
-                  <Show when={b().source === "cached"}>
-                    <button
-                      style={{ "margin-left": "8px" }}
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        setNotice("");
-                        try {
-                          await api.checkUpdate(b().id);
-                          setNotice(`已排队检查《${b().title}》的更新`);
-                        } catch (err) {
-                          setError(err instanceof Error ? err.message : String(err));
-                        }
-                      }}
-                    >
-                      检查
-                    </button>
-                    <button
-                      style={{ "margin-left": "4px" }}
-                      onClick={async (e) => {
-                        e.stopPropagation();
-                        if (sources().length === 0) {
-                          try {
-                            setSources(await api.listSources());
-                          } catch (err) {
-                            setError(err instanceof Error ? err.message : String(err));
-                            return;
-                          }
-                        }
-                        const enabled = sources().filter((s) => s.enabled !== false);
-                        setChangeSourceId(enabled[0]?.bookSourceUrl ?? "");
-                        setChangingId(b().id);
-                      }}
-                    >
-                      换源
-                    </button>
-                  </Show>
-                  <Show when={changingId() === b().id}>
-                    <span onClick={(e) => e.stopPropagation()}>
-                      <select value={changeSourceId()} onChange={(e) => setChangeSourceId(e.currentTarget.value)}>
-                        <For each={sources().filter((s) => s.enabled !== false)}>
-                          {(s) => <option value={s.bookSourceUrl}>{s.bookSourceName}</option>}
-                        </For>
-                      </select>
-                      <button
-                        onClick={async () => {
-                          if (!changeSourceId()) return;
-                          try {
-                            await api.changeSource(b().id, { source_id: changeSourceId() });
-                            setNotice(`已排队为《${b().title}》换源（按书名在新源搜索，后台进行）`);
-                          } catch (err) {
-                            setError(err instanceof Error ? err.message : String(err));
-                          } finally {
-                            setChangingId(null);
-                          }
-                        }}
-                      >
-                        确认
-                      </button>
-                      <button onClick={() => setChangingId(null)}>取消</button>
-                    </span>
-                  </Show>
                   <div>
                     <span class="badge">{b().source ?? "local"}</span>
                     <Show when={b().chapter_count != null}><span class="badge"> {b().chapter_count} 章</span></Show>
@@ -210,7 +164,7 @@ const Bookshelf: Component = () => {
       </div>
       <Show when={loading()}><p class="muted">加载中…</p></Show>
       <Show when={!loading() && books().length === 0 && !error()}>
-        <p class="muted">书架为空：后端扫描书籍目录后这里会出现书籍（或检查后端是否运行）。</p>
+        <p class="muted">书库为空：后端扫描书籍目录后这里会出现书籍（或检查后端是否运行）。</p>
       </Show>
     </div>
   );

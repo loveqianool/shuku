@@ -24,6 +24,12 @@ export interface Book {
   [k: string]: unknown;
 }
 
+/// 最近阅读里的一本书：书目字段 + 上次打开的位置。
+export interface RecentBook extends Book {
+  last_read_at: number;
+  last_chapter_idx: number;
+}
+
 export interface ChapterMeta {
   idx: number;
   title: string;
@@ -205,6 +211,7 @@ export const api = {
 
   listBooks: (p: { q?: string; author?: string; tag?: string; sort?: string; page?: number; page_size?: number }) =>
     req<Page<Book>>("/api/books" + qs(p)),
+  recentBooks: () => req<{ items: RecentBook[] }>("/api/books/recent"),
   getBook: (id: string) => req<Book>(`/api/books/${encodeURIComponent(id)}`),
   listChapters: (id: string, page = 1, page_size = 200) =>
     req<Page<ChapterMeta>>(`/api/books/${encodeURIComponent(id)}/chapters${qs({ page, page_size })}`),

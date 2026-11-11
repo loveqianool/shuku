@@ -215,3 +215,11 @@
 - 现象：Ye 问筛「wlcl」为什么不显示书名「武林沉沦」的书——`wlcl` 是「武林沉沦」的拼音首字母，理应命中。
 - 根因：书架筛选只是 `instr(title)` 字面子串，拼音只在全文检索页才有。
 - 修：books 表新增 `title_pinyin` 列（`search::pinyin_text` 的输出：音节 + 连写 + 全部首字母前缀）；迁移时对已有行一次性回填；`upsert_book` / `upsert_books_batch` 写行时同步算好（不改 BookRow / BOOK_COLS）；`list_books` 的 q 筛选改为 `instr(title, ?1) > 0 OR instr(title_pinyin, lower(?1)) > 0`（拼音匹配不区分大小写，仍用 instr、不走 LIKE）。测试：新增 `list_books_matches_pinyin_initials`（wlcl / wl / wulin / WLCL 命中，武林字面命中，zz 无命中）。全量 `cargo test --release` 102 单元 + 2 端到端全绿。注意：已部署的库在新版启动时自动回填 title_pinyin（几千本只需一次）。
+
+## 书架改名书库 + 最近阅读（2026-11-11）
+
+- Ye 要求：书架改名书库，只用来搜索打开书库的书；加最近阅读，显示最近打开的 100 本书。
+- 改名：App.tsx 导航页签「书架」→「书库」（品牌本来就是「📚 书库」），Bookshelf 空态文案同步改「书库为空」；组件/文件名不动。
+- 只用来搜索打开：Bookshelf 剥走管理操作——工具栏「检查更新」按钮、每本缓存书的「检查」「换源」按钮与换源下拉对话框（及 `sources` / `changingId` / `changeSourceId` / `notice` 状态）。后端接口（check-update / check-updates / change-source）保留不动；「有更新」徽标仍显示（只是状态提示）。
+- 最近阅读：新接口 `GET /api/books/recent`（db `recent_books(100)`：books JOIN reading_progress 按 updated_at 倒序，LIMIT 100；打开书时阅读器 loadChapter 会写进度，所以 updated_at 就是上次打开时间）。前端书库页工具栏下方加「最近阅读」区块（可点标题折叠/展开，默认展开），每行书名+作者+「第 X 章」，点开直接续读上次章节。无最近阅读时区块不显示。
+- 测试：新增 `recent_books_orders_by_last_opened`（排序、last_chapter_idx/last_read_at、limit、未打开的书不出现；时间戳用 SQL 固定，避免同一秒写进度导致排序不稳）。全量 `cargo test --release` 103 单元 + 2 端到端全绿，前端构建通过。

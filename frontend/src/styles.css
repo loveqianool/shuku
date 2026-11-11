@@ -57,6 +57,9 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .vlist { height: 70vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
 .vlist-item { padding: 10px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .vlist-item:hover { background: var(--surface2); }
+.recent-row { padding: 6px 2px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.recent-row:last-child { border-bottom: none; }
+.recent-row:hover { background: var(--surface2); }
 
 /* 阅读页 */
 .reader { max-width: 720px; margin: 0 auto; }

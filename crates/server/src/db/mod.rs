@@ -72,6 +72,17 @@ pub struct BookRow {
     pub cover: String,
 }
 
+/// A book with its last-read position, for the 最近阅读 list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentBook {
+    #[serde(flatten)]
+    pub book: BookRow,
+    /// Unix seconds of the last open (reading_progress.updated_at).
+    pub last_read_at: i64,
+    /// 0-based chapter index last read.
+    pub last_chapter_idx: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChapterRow {
     pub book_id: String,
@@ -1064,6 +1075,39 @@ impl Database {
             .await
     }
 
+    /// The most recently opened books, for the 最近阅读 list: one row
+    /// per book (reading_progress has book_id as PRIMARY KEY), newest
+    /// first. Opening a book writes progress (see Reader loadChapter),
+    /// so updated_at is the last-opened time.
+    pub async fn recent_books(&self, limit: i64) -> Result<Vec<RecentBook>> {
+        let limit = limit.clamp(1, 200);
+        self.call_db(move |c| {
+                let cols = BOOK_COLS
+                    .split(',')
+                    .map(|col| format!("b.{col}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT {cols}, rp.updated_at, rp.chapter_idx FROM books b \
+                     JOIN reading_progress rp ON rp.book_id = b.id \
+                     ORDER BY rp.updated_at DESC LIMIT ?1"
+                );
+                let mut stmt = c.prepare(&sql)?;
+                let rows = stmt
+                    .query_map(params![limit], |r| {
+                        let book = row_book(r)?;
+                        Ok(RecentBook {
+                            book,
+                            last_read_at: r.get(17)?,
+                            last_chapter_idx: r.get(18)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+    }
+
     /// Add seconds to a book's accumulated reading time (called by the
     /// reader with small deltas). Non-positive deltas are ignored.
     pub async fn add_reading_seconds(&self, book_id: &str, seconds: i64) -> Result<()> {
@@ -1331,6 +1375,44 @@ mod tests {
         // Unrelated pinyin matches nothing.
         let (_, total) = db.list_books(Some("zz".into()), None, None, "title", 1, 50).await.unwrap();
         assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn recent_books_orders_by_last_opened() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mk = |id: &str, title: &str| BookRow {
+            id: id.into(), title: title.into(), author: "".into(), path: None,
+            source_url: None, source: "local".into(),
+            mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 5,
+            created_at: now, updated_at: now, source_id: String::new(),
+            has_update: false, last_update_check: 0, cover: String::new(),
+        };
+        db.upsert_book(&mk("1", "第一本")).await.unwrap();
+        db.upsert_book(&mk("2", "第二本")).await.unwrap();
+        db.upsert_book(&mk("3", "第三本")).await.unwrap();
+        db.put_progress("1", 0, 0).await.unwrap();
+        db.put_progress("2", 3, 0).await.unwrap();
+        // Pin distinct timestamps so the order is deterministic
+        // (put_progress stamps seconds; two fast calls can tie).
+        db.call_db(|c| {
+            c.execute("UPDATE reading_progress SET updated_at = 1000 WHERE book_id = '1'", [])?;
+            c.execute("UPDATE reading_progress SET updated_at = 2000 WHERE book_id = '2'", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        // Book 3 was never opened: excluded.
+        let got = db.recent_books(100).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].book.id, "2");
+        assert_eq!(got[0].last_chapter_idx, 3);
+        assert_eq!(got[0].last_read_at, 2000);
+        assert_eq!(got[1].book.id, "1");
+        // Limit applies.
+        let got = db.recent_books(1).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].book.id, "2");
     }
 
     #[tokio::test]
