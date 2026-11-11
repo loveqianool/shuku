@@ -13,7 +13,7 @@ cd crates/server && cargo build --release
 
 # 后端（musl 单静态二进制，无外部依赖）
 cargo build --release --target x86_64-unknown-linux-musl
-# 产物：target/x86_64-unknown-linux-musl/release/legado-server（约 26MB）
+# 产物：target/x86_64-unknown-linux-musl/release/legado-server（约 29.5MB）
 ```
 
 前置：Rust stable（`rustup target add x86_64-unknown-linux-musl`）、musl-gcc（Ubuntu：`apt install musl-tools`）、Node 20+。
@@ -37,6 +37,19 @@ LEGADO_ADDR=0.0.0.0:8080 \
 - `LEGADO_BREAKER_FAILURES` / `LEGADO_BREAKER_COOLDOWN_SECS`：熔断（默认 5 次失败后冷却 60s）
 - `LEGADO_CACHE_TTL_SEARCH_SECS` / `LEGADO_CACHE_TTL_TOC_SECS` / `LEGADO_CACHE_TTL_CONTENT_SECS`：三级缓存 TTL（默认 60s / 600s / 86400s）；非法值回退默认，不影响启动
 - 打开浏览器访问 `http://<host>:8080/` 即是 PWA 阅读器；书源、任务、测试面板都在前端里。
+
+## Docker
+
+```sh
+docker run -d --name legado-server \
+  -p 8080:8080 \
+  -v /path/to/books:/books:ro \
+  -v /path/to/data:/data \
+  ghcr.io/loveqianool/legado-server:latest
+```
+
+- 镜像是 amd64 + arm64 双架构（`docker pull` 自动按本机架构取）；`/books` 放书（只读挂载即可），`/data` 存数据库、索引、缓存章节，必须持久化；端口 8080；环境变量同上（`LEGADO_*`）。
+- CI（`.github/workflows/docker.yml`）：推 main 或 `v*` 标签时自动编 musl 二进制（先跑全量测试，通过才推）、建双架构镜像推 GHCR（`:latest`、`:sha-<提交>`，打标签时另加 `:<版本号>`）；PR 只编不推。
 
 ## 自测
 
