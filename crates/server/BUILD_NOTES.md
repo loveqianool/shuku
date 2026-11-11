@@ -187,3 +187,7 @@
 - npm 早已有缓存（setup-node `cache: npm`）。
 - 新增 cargo 缓存：binary 任务用 Swatinem/rust-cache@v2（`workspaces: crates/server`，按 `matrix.arch` 分 key，amd64/arm64 各一份）。首跑只填充缓存（仍约 10 分钟），之后 test + musl 构建走增量，预期降到约 6 分钟。缓存 miss/被逐出只会回落到全量重编，不影响正确性。
 - 新增 Docker 层缓存：两个 build-push 步骤各加 `cache-from/cache-to type=gha`（按架构分 scope，mode=max）。收益较小（镜像层只有 alpine 底 + COPY 二进制），主要是底包层复用。
+
+## 删「Make package public」步骤（2026-11-11）
+
+- 该步骤每次都回 404（`gh api PATCH /user/packages/container/shuku`，exit 1，靠 `continue-on-error` 才没拖垮 job），从 run #3 到 run #8 从没成功过。镜像本身早已是公开（匿名拉取 manifest 多次核实），可见性是套件级属性、推新版本不会变回私有，所以这步是纯噪音，已删。万一将来套件被删重建，仍需在 GHCR 网页上手动点公开（这步的 API 路径本来也调不通）。

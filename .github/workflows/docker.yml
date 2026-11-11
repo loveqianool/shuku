@@ -168,12 +168,3 @@ jobs:
           docker buildx imagetools create "${args[@]}" \
             ghcr.io/${{ github.repository }}:amd64-${{ github.sha }} \
             ghcr.io/${{ github.repository }}:arm64-${{ github.sha }}
-
-      # GHCR packages pushed with GITHUB_TOKEN start private; flip it
-      # public so the image is actually pullable. Best-effort: a
-      # failure here must not fail the build.
-      - name: Make package public
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh api --method PATCH /user/packages/container/shuku -f visibility=public
