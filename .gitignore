@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+crates/server/target/
+# Frontend generated files
+frontend/node_modules/
+frontend/dist/
+# Runtime data: SQLite, tantivy index, covers, chapter cache
+data/
+# Local book library and perf corpus (never commit books)
+books/
+perf-books/
+# Logs and OS files
+*.log
+.DS_Store
+
+# TypeScript incremental build info
+frontend/tsconfig.tsbuildinfo
