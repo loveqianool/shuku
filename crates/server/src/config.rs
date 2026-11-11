@@ -14,8 +14,26 @@ fn env_i64(name: &str, default: i64, min: i64) -> i64 {
     std::env::var(name).ok().and_then(|v| v.parse::<i64>().ok()).map(|v| v.max(min)).unwrap_or(default)
 }
 
+/// Directory layout (unified under one root):
+///
+/// ```text
+/// $LEGADO_HOME/
+///   books/      local library (epub/txt), scanned by the watcher
+///   data/
+///     legado.db     SQLite metadata (books/sources/tasks/progress/...)
+///     index/        tantivy chapter index
+///     chapters/     cached network-book chapter text (<book_id>/<idx>.txt)
+///     covers/       epub cover bytes (<book_id>)
+/// ```
+///
+/// `LEGADO_HOME` defaults to `.` (current directory), so a bare launch
+/// behaves exactly as before (`./books`, `./data`). `LEGADO_BOOKS_DIR`
+/// and `LEGADO_DATA_DIR` still override each directory individually.
+/// The scanner's staging dirs under the OS temp dir stay ephemeral.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Service root; `books` and `data` live directly under it.
+    pub home: PathBuf,
     pub books_dir: PathBuf,
     pub data_dir: PathBuf,
     pub addr: String,
@@ -45,6 +63,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            home: PathBuf::from("."),
             books_dir: PathBuf::from("./books"),
             data_dir: PathBuf::from("./data"),
             addr: "0.0.0.0:8080".to_string(),
@@ -67,9 +86,15 @@ impl Default for Config {
 impl Config {
     pub fn from_env() -> Self {
         let d = Self::default();
+        let home = std::env::var("LEGADO_HOME").map(PathBuf::from).unwrap_or(d.home);
         Self {
-            books_dir: std::env::var("LEGADO_BOOKS_DIR").map(PathBuf::from).unwrap_or(d.books_dir),
-            data_dir: std::env::var("LEGADO_DATA_DIR").map(PathBuf::from).unwrap_or(d.data_dir),
+            home: home.clone(),
+            books_dir: std::env::var("LEGADO_BOOKS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| home.join("books")),
+            data_dir: std::env::var("LEGADO_DATA_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| home.join("data")),
             addr: std::env::var("LEGADO_ADDR").unwrap_or(d.addr),
             rate_per_sec: env_f64("LEGADO_RATE_PER_SEC", d.rate_per_sec, 0.1),
             rate_burst: env_f64("LEGADO_RATE_BURST", d.rate_burst, 1.0),
@@ -124,5 +149,27 @@ mod tests {
         assert_eq!(c.breaker_failures, 3);
         assert_eq!(c.cache_ttl_search_secs, 5);
         assert_eq!(c.cache_ttl_toc_secs, 600, "unset vars keep defaults");
+    }
+
+    #[test]
+    fn home_derivation_and_precedence() {
+        // LEGADO_HOME alone derives both dirs under it.
+        std::env::set_var("LEGADO_HOME", "/srv/legado");
+        let c = Config::from_env();
+        assert_eq!(c.home, PathBuf::from("/srv/legado"));
+        assert_eq!(c.books_dir, PathBuf::from("/srv/legado/books"));
+        assert_eq!(c.data_dir, PathBuf::from("/srv/legado/data"));
+        // Per-dir vars win over the home derivation.
+        std::env::set_var("LEGADO_BOOKS_DIR", "/mnt/books");
+        let c = Config::from_env();
+        assert_eq!(c.books_dir, PathBuf::from("/mnt/books"));
+        assert_eq!(c.data_dir, PathBuf::from("/srv/legado/data"));
+        std::env::remove_var("LEGADO_HOME");
+        std::env::remove_var("LEGADO_BOOKS_DIR");
+        // No vars at all: defaults, identical to before LEGADO_HOME.
+        let c = Config::from_env();
+        assert_eq!(c.home, PathBuf::from("."));
+        assert_eq!(c.books_dir, PathBuf::from("./books"));
+        assert_eq!(c.data_dir, PathBuf::from("./data"));
     }
 }

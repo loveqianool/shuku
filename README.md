@@ -21,14 +21,24 @@ cargo build --release --target x86_64-unknown-linux-musl
 ## 运行
 
 ```sh
-LEGADO_BOOKS_DIR=/path/to/books \
-LEGADO_DATA_DIR=/path/to/data \
+LEGADO_HOME=/srv/legado \
 LEGADO_ADDR=0.0.0.0:8080 \
 ./legado-server
 ```
 
-- `LEGADO_BOOKS_DIR`：本地书目录（epub/txt），默认 `./books`
-- `LEGADO_DATA_DIR`：SQLite + tantivy 索引 + 缓存章节，默认 `./data`
+- `LEGADO_HOME`：服务根目录，默认 `.`（当前目录）；书库和数据都按固定结构放它下面：
+
+```text
+$LEGADO_HOME/
+  books/      本地书库（epub/txt），默认 $LEGADO_HOME/books
+  data/       服务数据，默认 $LEGADO_HOME/data
+    legado.db     SQLite 元数据（书/书源/任务/进度/书签）
+    index/        tantivy 章节索引
+    chapters/     缓存书的章节正文（<book_id>/<序号>.txt）
+    covers/       epub 封面字节（<book_id>）
+```
+
+- `LEGADO_BOOKS_DIR` / `LEGADO_DATA_DIR`：单独覆盖书库或数据目录，优先级高于 `LEGADO_HOME`；不设就走上面的固定结构。Docker 镜像里 `LEGADO_HOME=/`，对应 `/books` 和 `/data`。
 - `LEGADO_ADDR`：监听地址，默认 `0.0.0.0:8080`
 - `LEGADO_SCAN_WORKERS`：并行扫描解析并发数，默认核数一半（1..8）；txt 解析是 CPU 密集型（编码识别 + 章节切分），解析线程和索引线程共享核数，两边默认各一半，总线程数贴着核数走；想用满核可手动调大
 - `LEGADO_INDEX_THREADS`：tantivy 索引线程数，默认核数一半（1..8）；实测超过 2 线程收益很小，解析并发已占核，别让两者加起来远超核数
@@ -54,7 +64,7 @@ docker run -d --name legado-server \
 ## 自测
 
 ```sh
-cd crates/server && cargo test   # 99 个单元测试 + 2 个端到端
+cd crates/server && cargo test   # 100 个单元测试 + 2 个端到端
 ```
 
 ## 结构

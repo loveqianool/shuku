@@ -56,5 +56,5 @@ books, chapters, sources, source_cache, scan_tasks, crawl_tasks, bookmarks, read
 
 ## 部署
 - `cargo build --release --target x86_64-unknown-linux-musl`
-- 环境变量：`LEGADO_BOOKS_DIR`（默认 ./books）、`LEGADO_DATA_DIR`（默认 ./data）、`LEGADO_ADDR`（默认 0.0.0.0:8080）
+- 环境变量：`LEGADO_HOME`（默认 `.`，书库在 `$LEGADO_HOME/books`、数据在 `$LEGADO_HOME/data`）、`LEGADO_BOOKS_DIR` / `LEGADO_DATA_DIR`（单独覆盖，优先于 `LEGADO_HOME`）、`LEGADO_ADDR`（默认 0.0.0.0:8080）
 - 单 binary + data 目录（sqlite + tantivy index）即可运行，无外部依赖。

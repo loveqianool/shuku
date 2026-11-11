@@ -13,7 +13,6 @@ ARG TARGETARCH
 RUN mkdir -p /tmp /data /books
 COPY bin-${TARGETARCH}/legado-server /legado-server
 EXPOSE 8080
-ENV LEGADO_BOOKS_DIR=/books \
-    LEGADO_DATA_DIR=/data \
+ENV LEGADO_HOME=/ \
     LEGADO_ADDR=0.0.0.0:8080
 ENTRYPOINT ["/legado-server"]

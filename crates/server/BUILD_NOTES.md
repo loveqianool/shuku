@@ -164,3 +164,10 @@
 ## CI actions 升版（2026-11-11，Ye 贴出 Node.js 20 弃用警告）
 
 - 全部 action 升到用 Node.js 24 的大版：checkout v4→v7、setup-node v4→v7、upload-artifact v4→v7、download-artifact v4→v8、build-push-action v6→v7、login-action v3→v4、setup-buildx-action v3→v4、setup-qemu-action v3→v4（升版前逐个核对过最新 release 的 `runs.using: node24` 与大版标签存在）。dtolnay/rust-toolchain 不动（composite，无 Node 运行时）。
+
+## 数据目录统一（2026-11-11，Ye 要求）
+
+- 新增 `LEGADO_HOME`（默认 `.`）：书库固定在 `$LEGADO_HOME/books`，全部服务数据固定在 `$LEGADO_HOME/data`（legado.db、index/、chapters/、covers/）。`LEGADO_BOOKS_DIR` / `LEGADO_DATA_DIR` 保留，单独覆盖时优先于 `LEGADO_HOME`。
+- 不设 `LEGADO_HOME` 时行为与以前完全一致（`./books`、`./data`），已有部署不用搬数据；Docker 镜像改设 `LEGADO_HOME=/`，对应原来的 `/books`、`/data`。
+- 扫描暂存目录仍在系统临时目录（`legado-scan-*`，用完即删），不进数据目录。
+- 修复经过：config 单元测试新增 `home_derivation_and_precedence`（派生 + 优先级 + 默认），全量测试 100 单元 + 2 端到端全绿。
