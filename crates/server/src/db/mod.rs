@@ -156,6 +156,7 @@ impl Database {
                     ("books", "has_update", "INTEGER NOT NULL DEFAULT 0"),
                     ("books", "last_update_check", "INTEGER NOT NULL DEFAULT 0"),
                     ("books", "cover", "TEXT NOT NULL DEFAULT ''"),
+                    ("books", "title_pinyin", "TEXT NOT NULL DEFAULT ''"),
                     ("sources", "health", "TEXT NOT NULL DEFAULT 'unknown'"),
                     ("sources", "health_error", "TEXT NOT NULL DEFAULT ''"),
                     ("sources", "subscription_url", "TEXT NOT NULL DEFAULT ''"),
@@ -170,6 +171,26 @@ impl Database {
                         .map(|n| n > 0)?;
                     if !exists {
                         c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ddl}"))?;
+                        if table == "books" && col == "title_pinyin" {
+                            // Backfill once for rows written before the
+                            // column existed (later rows get it from upsert).
+                            let rows: Vec<(String, String)> = {
+                                let mut stmt = c.prepare("SELECT id, title FROM books")?;
+                                let rows = stmt
+                                    .query_map([], |r| {
+                                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                                    })?
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                rows
+                            };
+                            for (id, title) in rows {
+                                let py = crate::search::pinyin_text(&title);
+                                c.execute(
+                                    "UPDATE books SET title_pinyin = ?1 WHERE id = ?2",
+                                    params![py, id],
+                                )?;
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -244,9 +265,13 @@ impl Database {
                 let mut where_sql = String::from("1=1");
                 let mut args: Vec<String> = vec![];
                 if !q.is_empty() {
-                    // exact-substring metadata filter on title only; use `instr`
-                    // (not LIKE) to stay out of the LIKE-search ban.
-                    where_sql.push_str(" AND instr(title, ?1) > 0");
+                    // exact-substring metadata filter on title, plus pinyin:
+                    // the title's pinyin (syllables + concatenated + initials
+                    // prefixes, see search::pinyin_text) lets "wlcl" match
+                    // 武林沉沦. Use `instr` (not LIKE) to stay out of the
+                    // LIKE-search ban; `lower()` makes pinyin matching
+                    // case-insensitive.
+                    where_sql.push_str(" AND (instr(title, ?1) > 0 OR instr(title_pinyin, lower(?1)) > 0)");
                     args.push(q);
                 }
                 if !author.is_empty() {
@@ -279,9 +304,9 @@ impl Database {
         let b = b.clone();
         self.call_db(move |c| {
                 c.execute(
-                    "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
-                     ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover",
-                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover],
+                    "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover,title_pinyin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                     ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover,title_pinyin=excluded.title_pinyin",
+                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover, crate::search::pinyin_text(&b.title)],
                 )?;
                 Ok(())
             })
@@ -303,9 +328,9 @@ impl Database {
             let tx = c.transaction()?;
             for b in &books {
                 tx.execute(
-                    "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
-                     ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover",
-                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover],
+                    "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover,title_pinyin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                     ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover,title_pinyin=excluded.title_pinyin",
+                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover, crate::search::pinyin_text(&b.title)],
                 )?;
             }
             for (book_id, titles) in &chapters {
@@ -1271,6 +1296,41 @@ mod tests {
         assert!(db.suggest_books("不存在", 8).await.unwrap().is_empty());
         let got = db.suggest_books("修", 1).await.unwrap();
         assert_eq!(got.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_books_matches_pinyin_initials() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mk = |id: &str, title: &str| BookRow {
+            id: id.into(), title: title.into(), author: "".into(), path: None,
+            source_url: None, source: "local".into(),
+            mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 1,
+            created_at: now, updated_at: now, source_id: String::new(),
+            has_update: false, last_update_check: 0, cover: String::new(),
+        };
+        db.upsert_book(&mk("1", "武林沉沦")).await.unwrap();
+        db.upsert_book(&mk("2", "修仙传")).await.unwrap();
+        db.upsert_book(&mk("3", "另一本")).await.unwrap();
+        // Full pinyin initials: wlcl = 武林沉沦.
+        let (items, total) = db.list_books(Some("wlcl".into()), None, None, "title", 1, 50).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, "1");
+        // Partial initials prefix.
+        let (_, total) = db.list_books(Some("wl".into()), None, None, "title", 1, 50).await.unwrap();
+        assert_eq!(total, 1);
+        // Concatenated pinyin.
+        let (_, total) = db.list_books(Some("wulin".into()), None, None, "title", 1, 50).await.unwrap();
+        assert_eq!(total, 1);
+        // Uppercase initials (case-insensitive pinyin match).
+        let (_, total) = db.list_books(Some("WLCL".into()), None, None, "title", 1, 50).await.unwrap();
+        assert_eq!(total, 1);
+        // Literal title still works.
+        let (_, total) = db.list_books(Some("武林".into()), None, None, "title", 1, 50).await.unwrap();
+        assert_eq!(total, 1);
+        // Unrelated pinyin matches nothing.
+        let (_, total) = db.list_books(Some("zz".into()), None, None, "title", 1, 50).await.unwrap();
+        assert_eq!(total, 0);
     }
 
     #[tokio::test]

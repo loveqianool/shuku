@@ -209,3 +209,9 @@
 - 现象：Ye 发 6 张截图——书架筛「wl」显示「共 1 本」但列表还留着旧的 3 本书（筛「wlcl」显示「共 0 本」列表仍是那 3 本）；本书内搜索即使节录加到 400 字仍只是一章一个片段。
 - 根因有二：① `@tanstack/solid-virtual` 的 `getVirtualItems()` 返回的是内部 store，经 `reconcile(key: "index")` 复用旧项，列表换了它也可能不更新，造成数已变、列表还是旧书（后来自行恢复，是虚拟滚动最终重测才纠正）；② 后端每章只返一个 tantivy 最佳片段，章内出现几十次也只看得到一个。
 - 修：① 书架列表改由 `books()` 直接派生（`visibleBooks()`：虚拟项 + 当前 books() 一一对应，越界项滤掉），`books()` 变化时调 `virtualizer.measure()` 强制重测容器高度；② 后端新增 `content_fragments`：在存的正文里找查询词的全部字面出现位置，按前后 60/90 字切窗、重叠的合并，最多返 5 个片段（`<em>` 标亮、HTML 转义），另加 `match_count`（整章出现总次数；拼音匹配时为 0、回退到原 tantivy 节录）；③ 前端搜索页与本书内搜索结果旁显示「· X 处」。全量 `cargo test --release` 101 单元 + 2 端到端全绿，前端构建通过。
+
+## 书架筛选支持拼音（2026-11-11）
+
+- 现象：Ye 问筛「wlcl」为什么不显示书名「武林沉沦」的书——`wlcl` 是「武林沉沦」的拼音首字母，理应命中。
+- 根因：书架筛选只是 `instr(title)` 字面子串，拼音只在全文检索页才有。
+- 修：books 表新增 `title_pinyin` 列（`search::pinyin_text` 的输出：音节 + 连写 + 全部首字母前缀）；迁移时对已有行一次性回填；`upsert_book` / `upsert_books_batch` 写行时同步算好（不改 BookRow / BOOK_COLS）；`list_books` 的 q 筛选改为 `instr(title, ?1) > 0 OR instr(title_pinyin, lower(?1)) > 0`（拼音匹配不区分大小写，仍用 instr、不走 LIKE）。测试：新增 `list_books_matches_pinyin_initials`（wlcl / wl / wulin / WLCL 命中，武林字面命中，zz 无命中）。全量 `cargo test --release` 102 单元 + 2 端到端全绿。注意：已部署的库在新版启动时自动回填 title_pinyin（几千本只需一次）。
