@@ -160,3 +160,7 @@
 - 项目 PAT「legado-server Muse」（fine-grained，只限本仓库，Contents + Workflows 读写，到期 2027-11-11），存在连接器 custom.github-legado-pat，token 值只在保险库里，不进任何文件。
 - 推送走 `~/workspace/custom-connectors/custom.github-legado-pat/bin/gh_push.py`（Git Data API：blob→tree→commit→更新 main，一次提交）；不要用 MCP push_files（在有提交的仓库上建 tree 会 403），不要用 MCP create_or_update_file 逐文件推（每个文件一次提交、一次批准卡）。
 - `.github/workflows/*` 同样走 gh_push.py（PAT 有 Workflows 权限，App 没有）。
+
+## CI actions 升版（2026-11-11，Ye 贴出 Node.js 20 弃用警告）
+
+- 全部 action 升到用 Node.js 24 的大版：checkout v4→v7、setup-node v4→v7、upload-artifact v4→v7、download-artifact v4→v8、build-push-action v6→v7、login-action v3→v4、setup-buildx-action v3→v4、setup-qemu-action v3→v4（升版前逐个核对过最新 release 的 `runs.using: node24` 与大版标签存在）。dtolnay/rust-toolchain 不动（composite，无 Node 运行时）。
