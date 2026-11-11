@@ -244,3 +244,8 @@
   - 右边本章竖向滑杆：position: fixed 右侧中部，writing-mode: vertical-lr，值 = 本章内滚动进度（0..100），拖动滚动本章；滚动模式用 window 滚动事件同步进度，仿真翻页模式用正文容器 onScroll。
   - 删旧底部 .toolbar（上一章/上一屏/下一屏/下一章/朗读/语速），语速进设置、翻页由竖向滑杆与键盘方向键承担。
 - 前端构建通过；后端无改动。
+
+## CI：apt 装 musl-tools 加重试（2026-11-11）
+
+- run #17（阅读器交互重构，8dc1958）失败：amd64 job 在 `Install musl tools` 步挂了——runner 偶发解析不到 `azure.archive.ubuntu.com`（Temporary failure resolving 'azure.archive.ubuntu.com'），musl/musl-dev/musl-tools 三个包下不下来，exit 100。arm64 job 成功，docker job 因依赖失败没跑。代码本身没问题，是 runner 侧偶发 DNS 抖动。
+- PAT 没有重跑 workflow 的权限（rerun-failed-jobs 返回 403），改走修 workflow 触发新一轮：`Install musl tools` 步改成最多 3 遍重试（每次失败睡 15 秒），装完校验 `command -v musl-gcc`，三次都失败才报错退出。

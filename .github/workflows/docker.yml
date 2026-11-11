@@ -65,7 +65,16 @@ jobs:
           key: ${{ matrix.arch }}
 
       - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        # 2026-11-11：run #17 里 amd64 job 在这步挂了——runner 偶发解析不到
+        # azure.archive.ubuntu.com（Temporary failure resolving），包下不下来。
+        # 加三遍重试，免得一次 DNS 抖动就杀掉整个构建。
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y musl-tools && break
+            echo "apt install attempt $i failed, retrying in 15s..."
+            sleep 15
+          done
+          command -v musl-gcc || { echo "musl-tools install failed after 3 attempts"; exit 1; }
 
       # Gate the image on tests: a failing suite publishes nothing.
       - name: Test
