@@ -53,6 +53,17 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      # Cache the cargo registry + target dir across runs (keyed per
+      # arch: the two matrix jobs build different targets). First run
+      # with the cache only populates it; later runs reuse it and the
+      # test + musl builds become incremental. A cache miss or eviction
+      # just falls back to a full rebuild — never a wrong build.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/server
+          key: ${{ matrix.arch }}
+
       - name: Install musl tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
@@ -120,6 +131,8 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
+          cache-from: type=gha,scope=shuku-amd64
+          cache-to: type=gha,scope=shuku-amd64,mode=max
           tags: ghcr.io/${{ github.repository }}:amd64-${{ github.sha }}
 
       - name: Build and push arm64 image
@@ -129,6 +142,8 @@ jobs:
           file: Dockerfile
           platforms: linux/arm64
           push: true
+          cache-from: type=gha,scope=shuku-arm64
+          cache-to: type=gha,scope=shuku-arm64,mode=max
           tags: ghcr.io/${{ github.repository }}:arm64-${{ github.sha }}
 
       - name: Compute manifest tags

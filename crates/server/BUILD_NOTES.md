@@ -181,3 +181,9 @@
 - OPDS feed id 从 `urn:legado:*` 改为 `urn:shuku:*`；User-Agent `shuku/0.1 (compatible; Reading3)`。
 - 不改：对「Legado（阅读3）JSON 书源格式」的兼容描述仍保留（那是格式名，不是项目名）；PAT「legado-server Muse」与连接器 custom.github-legado-pat 是凭据侧的既有名字，也不动。
 - 旧仓库名历史：此前 BUILD_NOTES 条目里的 legado-server 指同一项目改名前。
+
+## CI 构建缓存（2026-11-11）
+
+- npm 早已有缓存（setup-node `cache: npm`）。
+- 新增 cargo 缓存：binary 任务用 Swatinem/rust-cache@v2（`workspaces: crates/server`，按 `matrix.arch` 分 key，amd64/arm64 各一份）。首跑只填充缓存（仍约 10 分钟），之后 test + musl 构建走增量，预期降到约 6 分钟。缓存 miss/被逐出只会回落到全量重编，不影响正确性。
+- 新增 Docker 层缓存：两个 build-push 步骤各加 `cache-from/cache-to type=gha`（按架构分 scope，mode=max）。收益较小（镜像层只有 alpine 底 + COPY 二进制），主要是底包层复用。
