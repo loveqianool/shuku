@@ -58,6 +58,15 @@ export interface SearchHit {
   match_count?: number;
 }
 
+/// One literal occurrence of the query in a chapter, for the flat
+/// in-book match list (tap one to jump to that exact spot).
+export interface BookMatch {
+  chapter_idx: number;
+  chapter_title: string;
+  offset: number;
+  snippet: string;
+}
+
 export type SearchScope = "local" | "cached" | "all";
 
 export interface Source {
@@ -220,6 +229,8 @@ export const api = {
 
   search: (q: string, scope: SearchScope = "all", page = 1, page_size = 20, bookId?: string) =>
     req<Page<SearchHit>>("/api/search" + qs({ q, scope, page, page_size, book_id: bookId })),
+  listMatches: (bookId: string, q: string, page = 1, page_size = 500) =>
+    req<Page<BookMatch>>(`/api/books/${encodeURIComponent(bookId)}/matches${qs({ q, page, page_size })}`),
   suggest: (q: string) =>
     req<{ items: Suggestion[] }>("/api/suggest" + qs({ q })),
 

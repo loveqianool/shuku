@@ -86,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/books/{id}", get(get_book).delete(delete_book))
         .route("/api/books/{id}/chapters", get(list_chapters))
         .route("/api/books/{id}/chapters/{idx}", get(get_chapter))
+        .route("/api/books/{id}/matches", get(list_book_matches))
         .route("/api/books/{id}/images/{*path}", get(get_book_image))
         .route("/api/books/{id}/cover", get(get_book_cover))
         .route("/api/search", get(search))
@@ -325,6 +326,25 @@ async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> ApiR
     let search = s.search.clone();
     let (hits, total) = tokio::task::spawn_blocking(move || search.search(&query, ids.as_deref(), limit, offset)).await??;
     Ok(page_envelope(hits, total as i64, q.pq().page(), q.pq().page_size()))
+}
+
+/// Flat in-book match list: every literal occurrence of the query in
+/// one book, in document order (chapter, then offset), for the reader's
+/// numbered match list (tap one to jump to that exact spot).
+async fn list_book_matches(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<SearchQuery>) -> ApiResult<Json<Value>> {
+    let term = q.q.trim().to_string();
+    if term.is_empty() {
+        return Ok(page_envelope(Vec::<Value>::new(), 0, q.pq().page(), q.pq().page_size()));
+    }
+    let book_id: u64 = match id.parse() {
+        Ok(n) => n,
+        Err(_) => return Ok(page_envelope(Vec::<Value>::new(), 0, q.pq().page(), q.pq().page_size())),
+    };
+    let limit = q.pq().page_size() as usize;
+    let offset = ((q.pq().page() - 1) * q.pq().page_size()) as usize;
+    let search = s.search.clone();
+    let (items, total) = tokio::task::spawn_blocking(move || search.list_matches(book_id, &term, limit, offset)).await??;
+    Ok(page_envelope(items, total as i64, q.pq().page(), q.pq().page_size()))
 }
 
 /// Search suggestions for the search box dropdown: title/author

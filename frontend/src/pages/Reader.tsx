@@ -1,5 +1,5 @@
-import { createSignal, createEffect, createMemo, For, Show, onCleanup, type Component } from "solid-js";
-import { api, type Book, type Chapter, type ChapterMeta, type ChapterIssue, type SearchHit } from "../lib/api";
+import { createSignal, createEffect, For, Show, onCleanup, type Component } from "solid-js";
+import { api, type Book, type Chapter, type ChapterMeta, type ChapterIssue, type SearchHit, type BookMatch } from "../lib/api";
 import { downloadBook, deleteOfflineBook, offlineChapterCount } from "../lib/offline";
 import {
   loadSettings, saveSettings, loadHighlights, saveHighlights,
@@ -57,12 +57,36 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [inBookHits, setInBookHits] = createSignal<SearchHit[]>([]);
   const [inBookTotal, setInBookTotal] = createSignal(0);
   const [inBookSearching, setInBookSearching] = createSignal(false);
+  const [searchDone, setSearchDone] = createSignal(false);
+  // 本书内搜索：逐个列出全部出现处（另一家阅读器的交互），点一个跳去那一处。
+  const [inBookMatches, setInBookMatches] = createSignal<BookMatch[]>([]);
+  const [inBookMatchTotal, setInBookMatchTotal] = createSignal(0);
+  const [inBookMatchPage, setInBookMatchPage] = createSignal(1);
+  // 当前选中的是第几处（在全部结果里的序号，0 起）；-1 表示未选。
+  const [currentMatch, setCurrentMatch] = createSignal(-1);
+  // 当前选中处在本章里的第几个出现处（0 起），用来在正文里单独标亮并滚动定位。
+  const [currentOccurrence, setCurrentOccurrence] = createSignal(-1);
   // 本书内搜索高亮：点结果跳章后，在正文里标亮该词全部出现处。
   const [searchTerm, setSearchTerm] = createSignal("");
-  const searchMatchCount = createMemo(() => {
+
+  // 当前选中处定位：章节渲染好之后，把本章第 currentOccurrence 个
+  // mark.search-hit 单独标亮（search-hit-current）并滚到它。只在当前
+  // 章节就是选中处所在的章节时定位，避免换章途中用旧的序号去滚新章。
+  createEffect(() => {
+    const k = currentOccurrence();
     const term = searchTerm();
-    if (!term) return 0;
-    return (chapter()?.paragraphs ?? []).reduce((n, p) => n + (p.text ?? "").split(term).length - 1, 0);
+    void chapter();
+    if (k < 0 || !term) return;
+    const m = inBookMatches()[currentMatch()];
+    if (!m || m.chapter_idx !== idx()) return;
+    requestAnimationFrame(() => {
+      const marks = contentRef?.querySelectorAll("mark.search-hit");
+      if (!marks || k >= marks.length) return;
+      marks.forEach((el) => el.classList.remove("search-hit-current"));
+      const el = marks[k];
+      el.classList.add("search-hit-current");
+      el.scrollIntoView({ block: "center" });
+    });
   });
   const [sameAuthor, setSameAuthor] = createSignal<Book[]>([]);
   // 整本离线状态（实际查 Cache Storage）。
@@ -285,10 +309,12 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     window.getSelection()?.removeAllRanges();
   };
 
-  // 点搜索结果：跳到那章，标亮该词全部出现处，滚到第一处。
+  // 点章节搜索结果（拼音回退时用）：跳到那章，标亮该词全部出现处，滚到第一处。
   const jumpToSearchHit = async (h: SearchHit) => {
     const term = inBookQ().trim();
     setSearchTerm(term);
+    setCurrentMatch(-1);
+    setCurrentOccurrence(-1);
     setInBookHits([]);
     await loadChapter(h.chapter_idx);
     requestAnimationFrame(() => {
@@ -296,15 +322,86 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     });
   };
 
+  // 点搜索结果：跳到那一处（不是只跳章），标亮该词全部出现处，
+  // 再把选中的那一处单独标亮并滚到它。
+  const jumpToMatch = async (i: number) => {
+    const m = inBookMatches()[i];
+    if (!m) return;
+    setSearchTerm(inBookQ().trim());
+    setCurrentMatch(i);
+    // 该处在本章里的第几个出现处（用来单独标亮）。
+    const k = inBookMatches().slice(0, i).filter((x) => x.chapter_idx === m.chapter_idx).length;
+    if (m.chapter_idx !== idx()) {
+      setCurrentOccurrence(-1);
+      await loadChapter(m.chapter_idx);
+    }
+    setCurrentOccurrence(k);
+  };
+
+  // 上一处 / 下一处：超出已加载的结果时先加载下一页。
+  const stepMatch = async (d: number) => {
+    const total = inBookMatchTotal();
+    if (total === 0) return;
+    let n = currentMatch() + d;
+    if (n < 0) n = 0;
+    if (n >= total) n = total - 1;
+    if (n >= inBookMatches().length) {
+      await loadMoreMatches();
+    }
+    await jumpToMatch(n);
+  };
+
+  const loadMoreMatches = async () => {
+    const q = inBookQ().trim();
+    if (!q || inBookMatches().length >= inBookMatchTotal()) return;
+    const next = inBookMatchPage() + 1;
+    try {
+      const res = await api.listMatches(props.bookId, q, next, 500);
+      setInBookMatches([...inBookMatches(), ...res.items]);
+      setInBookMatchPage(next);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const clearSearch = () => {
+    setInBookQ("");
+    setInBookMatches([]);
+    setInBookMatchTotal(0);
+    setInBookMatchPage(1);
+    setInBookHits([]);
+    setInBookTotal(0);
+    setSearchTerm("");
+    setCurrentMatch(-1);
+    setCurrentOccurrence(-1);
+    setSearchDone(false);
+  };
+
   const searchInBook = async () => {
     const q = inBookQ().trim();
     if (!q) return;
     setSearchTerm("");
+    setCurrentMatch(-1);
+    setCurrentOccurrence(-1);
+    setInBookMatches([]);
+    setInBookMatchTotal(0);
+    setInBookMatchPage(1);
+    setInBookHits([]);
+    setInBookTotal(0);
+    setSearchDone(false);
     setInBookSearching(true);
     try {
-      const res = await api.search(q, "all", 1, 20, props.bookId);
-      setInBookHits(res.items);
-      setInBookTotal(res.total);
+      const res = await api.listMatches(props.bookId, q, 1, 500);
+      setInBookMatches(res.items);
+      setInBookMatchTotal(res.total);
+      setInBookMatchPage(1);
+      if (res.total === 0) {
+        // 没有字面出现处（例如打拼音）：回退到按章节分组的搜索。
+        const ch = await api.search(q, "all", 1, 20, props.bookId);
+        setInBookHits(ch.items);
+        setInBookTotal(ch.total);
+      }
+      setSearchDone(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -318,7 +415,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   return (
     <div class="reader">
       <div class="reader-bar">
-        <a href="#/">‹ 书架</a>
+        <a href="#/">‹ 书库</a>
         <strong>{book()?.title ?? "…"}</strong>
         <button onClick={() => setShowToc(!showToc())}>目录</button>
         <span class="muted">第 {idx() + 1} 章 / 共 {toc().length} 章</span>
@@ -331,10 +428,33 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         <button disabled={inBookSearching()} onClick={searchInBook}>搜</button>
       </div>
 
-      <Show when={inBookHits().length > 0 || (inBookTotal() === 0 && inBookQ().trim() !== "" && !inBookSearching())}>
+      <Show when={inBookMatches().length > 0}>
+        <div class="card">
+          <strong>本书内搜索「{inBookQ()}」：共 {inBookMatchTotal()} 处</strong>
+          <button onClick={clearSearch}>清除</button>
+          <For each={inBookMatches()}>
+            {(m, i) => (
+              <p
+                class="match-row"
+                classList={{ current: i() === currentMatch() }}
+                onClick={() => jumpToMatch(i())}
+              >
+                <span class="muted">{i() + 1}. </span>
+                <span innerHTML={m.snippet} />{" "}
+                <span class="muted">{m.chapter_title}</span>
+              </p>
+            )}
+          </For>
+          <Show when={inBookMatches().length < inBookMatchTotal()}>
+            <button onClick={loadMoreMatches}>加载更多（还剩 {inBookMatchTotal() - inBookMatches().length} 处）</button>
+          </Show>
+        </div>
+      </Show>
+
+      <Show when={inBookMatches().length === 0 && inBookHits().length > 0}>
         <div class="card">
           <strong>本书内搜索：{inBookTotal()} 条</strong>
-          <button onClick={() => { setInBookHits([]); setInBookTotal(0); setInBookQ(""); setSearchTerm(""); }}>清除</button>
+          <button onClick={clearSearch}>清除</button>
           <For each={inBookHits()}>
             {(h) => (
               <p>
@@ -349,10 +469,23 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
+      <Show when={inBookMatches().length === 0 && inBookHits().length === 0 && searchDone() && inBookQ().trim() !== ""}>
+        <div class="card">
+          <span class="muted">没有找到「{inBookQ()}」</span>
+          <button onClick={clearSearch}>清除</button>
+        </div>
+      </Show>
+
       <Show when={searchTerm()}>
         <div class="card row">
-          <span>搜索「{searchTerm()}」：本章 {searchMatchCount()} 处</span>
-          <button onClick={() => setSearchTerm("")}>清除标亮</button>
+          <Show when={currentMatch() >= 0} fallback={
+            <span>搜索「{searchTerm()}」：本章 {(chapter()?.paragraphs ?? []).reduce((n, p) => n + (p.text ?? "").split(searchTerm()).length - 1, 0)} 处</span>
+          }>
+            <span>搜索「{searchTerm()}」：第 {currentMatch() + 1} / 共 {inBookMatchTotal()} 处</span>
+            <button onClick={() => stepMatch(-1)}>‹ 上一处</button>
+            <button onClick={() => stepMatch(1)}>下一处 ›</button>
+          </Show>
+          <button onClick={() => { setSearchTerm(""); setCurrentMatch(-1); setCurrentOccurrence(-1); }}>清除标亮</button>
         </div>
       </Show>
 

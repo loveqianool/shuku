@@ -5,6 +5,7 @@
 ## 书库
 - `GET /api/books?q=&author=&tag=&sort=updated|title|author&page=&page_size=` — 分页筛选；q 同时匹配书名拼音（音节/连写/首字母，如 `wlcl` 命中《武林沉沦》）
 - `GET /api/books/recent` — 最近阅读：最近打开的 100 本书（按阅读进度更新时间倒序；`{items:[{...书目, last_read_at, last_chapter_idx}]}`，点开续读上次章节）
+- `GET /api/books/:id/matches?q=&page=&page_size=500` — 本书内逐处匹配：该词在本书里的每一次字面出现，按章节+位置排序（`{items:[{chapter_idx, chapter_title, offset, snippet}], total}`）；只含字面出现处，拼音查询返回空（回退到按章节分组的 `/api/search`）
 - `GET /api/books/:id` — 书籍详情（含章节数、来源 local|cached、状态）
 - `GET /api/books/:id/chapters?page=&page_size=200` — 目录（仅标题+索引，不含正文）
 - `GET /api/books/:id/chapters/:idx` — 正文：`{book_id, chapter_idx, title, paragraphs:[{text?:string, img?:string}]}`；本地书从文件按需解析，网络书走缓存/爬取；epub 章节里的 `<img>` 变成 `img` 段落（URL 形如 `/api/books/:id/images/<epub 内路径>`）

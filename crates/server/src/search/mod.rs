@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
@@ -62,6 +62,19 @@ pub struct SearchHit {
     pub match_count: i64,
 }
 
+/// One literal occurrence of the query in a chapter, for the flat
+/// in-book match list (the other reader's interaction: every match
+/// numbered, tap one to jump to that exact spot).
+#[derive(Debug, Clone, Serialize)]
+pub struct BookMatch {
+    pub chapter_idx: i64,
+    pub chapter_title: String,
+    /// Char offset of the occurrence in the chapter's content.
+    pub offset: i64,
+    /// Context window (60 before / 90 after) with the term in `<em>`.
+    pub snippet: String,
+}
+
 /// HTML-escape one char into `out` (fragments are rendered as HTML).
 fn escape_char(out: &mut String, c: char) {
     match c {
@@ -72,6 +85,65 @@ fn escape_char(out: &mut String, c: char) {
         '\'' => out.push_str("&#39;"),
         _ => out.push(c),
     }
+}
+
+/// All literal occurrences of `terms` in `chars`, in document order:
+/// (char_pos, term_char_len). `term_chars` must be sorted longest-first
+/// so a longer match wins over a shorter one starting at the same place.
+/// Shared by content_fragments and the per-match list (list_matches).
+fn find_occurrences(chars: &[char], term_chars: &[Vec<char>]) -> Vec<(usize, usize)> {
+    let mut occs: Vec<(usize, usize)> = vec![];
+    for tc in term_chars {
+        let mut i = 0;
+        while i + tc.len() <= chars.len() {
+            if chars[i..i + tc.len()] == tc[..] {
+                occs.push((i, tc.len()));
+                i += tc.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    occs.sort();
+    occs
+}
+
+/// One HTML fragment for the char range [s, e) of `chars`, with the
+/// terms wrapped in `<em>` (single chars HTML-escaped).
+fn highlight_window(chars: &[char], s: usize, e: usize, term_chars: &[Vec<char>]) -> String {
+    let mut out = String::new();
+    let mut i = s;
+    while i < e {
+        let mut matched: Option<usize> = None;
+        for tc in term_chars {
+            if i + tc.len() <= e && chars[i..i + tc.len()] == tc[..] {
+                matched = Some(tc.len());
+                break;
+            }
+        }
+        if let Some(len) = matched {
+            out.push_str("<em>");
+            for c in &chars[i..i + len] {
+                escape_char(&mut out, *c);
+            }
+            out.push_str("</em>");
+            i += len;
+        } else {
+            escape_char(&mut out, chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// One snippet window around a single occurrence (60 chars before,
+/// 90 after), with the terms wrapped in `<em>`.
+fn occurrence_snippet(chars: &[char], pos: usize, len: usize, term_chars: &[Vec<char>]) -> String {
+    const BEFORE: usize = 60;
+    const AFTER: usize = 90;
+    let s = pos.saturating_sub(BEFORE);
+    let e = (pos + len + AFTER).min(chars.len());
+    highlight_window(chars, s, e, term_chars)
 }
 
 /// Build up to `max_fragments` windows around literal occurrences of
@@ -96,24 +168,11 @@ fn content_fragments(content: &str, terms: &[&str], max_fragments: usize) -> (Ve
     if term_chars.is_empty() || chars.is_empty() {
         return (vec![], 0);
     }
-    // All occurrences, in document order: (char_pos, term_char_len).
-    let mut occs: Vec<(usize, usize)> = vec![];
-    for tc in &term_chars {
-        let mut i = 0;
-        while i + tc.len() <= chars.len() {
-            if chars[i..i + tc.len()] == tc[..] {
-                occs.push((i, tc.len()));
-                i += tc.len();
-            } else {
-                i += 1;
-            }
-        }
-    }
+    let occs = find_occurrences(&chars, &term_chars);
     let match_count = occs.len();
     if occs.is_empty() {
         return (vec![], 0);
     }
-    occs.sort();
     // Merge occurrences into windows: 60 chars before, 90 after.
     const BEFORE: usize = 60;
     const AFTER: usize = 90;
@@ -132,31 +191,7 @@ fn content_fragments(content: &str, terms: &[&str], max_fragments: usize) -> (Ve
     windows.truncate(max_fragments);
     let fragments = windows
         .iter()
-        .map(|&(s, e)| {
-            let mut out = String::new();
-            let mut i = s;
-            while i < e {
-                let mut matched: Option<usize> = None;
-                for tc in &term_chars {
-                    if i + tc.len() <= e && chars[i..i + tc.len()] == tc[..] {
-                        matched = Some(tc.len());
-                        break;
-                    }
-                }
-                if let Some(len) = matched {
-                    out.push_str("<em>");
-                    for c in &chars[i..i + len] {
-                        escape_char(&mut out, *c);
-                    }
-                    out.push_str("</em>");
-                    i += len;
-                } else {
-                    escape_char(&mut out, chars[i]);
-                    i += 1;
-                }
-            }
-            out
-        })
+        .map(|&(s, e)| highlight_window(&chars, s, e, &term_chars))
         .collect();
     (fragments, match_count)
 }
@@ -567,6 +602,89 @@ impl SearchIndex {
         }
         Ok((hits, total))
     }
+
+    /// Every literal occurrence of `query_str` in one book, in document
+    /// order (chapter_idx, then offset). Returns the page and the total.
+    /// Pinyin-only matches have no literal occurrence, so they contribute
+    /// nothing here (the chapter-grouped search still covers them, and
+    /// the reader falls back to it when this list is empty).
+    pub fn list_matches(
+        &self,
+        book_id: u64,
+        query_str: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<BookMatch>, usize)> {
+        let terms: Vec<&str> = query_str.split_whitespace().collect();
+        let mut term_chars: Vec<Vec<char>> = terms
+            .iter()
+            .filter(|t| !t.is_empty())
+            .map(|t| t.chars().collect())
+            .collect();
+        term_chars.sort_by(|a, b| b.len().cmp(&a.len()));
+        if term_chars.is_empty() {
+            return Ok((vec![], 0));
+        }
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let schema = self.index.schema();
+        let mut parser = QueryParser::new(
+            schema,
+            vec![self.f_book_title, self.f_author, self.f_chapter_title, self.f_content, self.f_pinyin],
+            self.index.tokenizers().clone(),
+        );
+        parser.set_conjunction_by_default();
+        let expanded = expand_pinyin_query(query_str);
+        let base_query = parser.parse_query(&expanded)?;
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, base_query),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(self.f_book_id, book_id),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn tantivy::query::Query>,
+            ),
+        ]);
+        // All matching chapters (a book has at most a few thousand);
+        // document order comes from sorting by chapter_idx below.
+        let n_chapters = searcher.search(&query, &Count)?;
+        if n_chapters == 0 {
+            return Ok((vec![], 0));
+        }
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(n_chapters).order_by_score())?;
+        let mut all: Vec<BookMatch> = vec![];
+        for (_score, addr) in top_docs {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            let content = doc
+                .get_first(self.f_content)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let chars: Vec<char> = content.chars().collect();
+            let occs = find_occurrences(&chars, &term_chars);
+            if occs.is_empty() {
+                continue;
+            }
+            let chapter_idx = doc.get_first(self.f_chapter_idx).and_then(|v| v.as_u64()).unwrap_or(0) as i64;
+            let chapter_title = doc
+                .get_first(self.f_chapter_title)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            for (pos, len) in occs {
+                all.push(BookMatch {
+                    chapter_idx,
+                    chapter_title: chapter_title.clone(),
+                    offset: pos as i64,
+                    snippet: occurrence_snippet(&chars, pos, len, &term_chars),
+                });
+            }
+        }
+        all.sort_by_key(|m| (m.chapter_idx, m.offset));
+        let total = all.len();
+        let page = all.into_iter().skip(offset).take(limit).collect();
+        Ok((page, total))
+    }
 }
 
 #[cfg(test)]
@@ -712,6 +830,47 @@ mod tests {
         let (hits, _) = idx.search("修仙", Some(&[2]), 10, 0).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].book_id, "2");
+    }
+
+    #[test]
+    fn list_matches_returns_every_occurrence() {
+        let idx = SearchIndex::open_in_ram().unwrap();
+        idx.index_book(
+            1,
+            "武林沉沦番外",
+            "佚名",
+            &[
+                ("番外（1）".into(), "李茉进了屋，李茉又出来了。".into()),
+                ("第一章".into(), "他想起李茉，想起李茉，想起李茉。".into()),
+            ],
+        )
+        .unwrap();
+        idx.index_book(2, "另一本", "作者乙", &[("序".into(), "李茉也在别处。".into())])
+            .unwrap();
+        // 2 + 3 = 5 occurrences, document order (chapter, then offset).
+        let (items, total) = idx.list_matches(1, "李茉", 10, 0).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(items.len(), 5);
+        assert!(items.iter().all(|m| m.snippet.contains("<em>李茉</em>")), "snippets must highlight");
+        assert_eq!(items[0].chapter_idx, 0);
+        assert_eq!(items[0].chapter_title, "番外（1）");
+        assert_eq!(items[2].chapter_idx, 1);
+        assert_eq!(items[2].chapter_title, "第一章");
+        assert!(items.windows(2).all(|w| (w[0].chapter_idx, w[0].offset) < (w[1].chapter_idx, w[1].offset)), "must be in document order");
+        // Pagination.
+        let (page, total) = idx.list_matches(1, "李茉", 2, 0).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(page.len(), 2);
+        let (page, _) = idx.list_matches(1, "李茉", 2, 4).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].chapter_idx, 1);
+        // Scoped to one book: book 2's single occurrence is not included.
+        let (_, total) = idx.list_matches(2, "李茉", 10, 0).unwrap();
+        assert_eq!(total, 1);
+        // Pinyin has no literal occurrence: empty (the chapter-grouped
+        // search still covers it, and the reader falls back to it).
+        let (_, total) = idx.list_matches(1, "limo", 10, 0).unwrap();
+        assert_eq!(total, 0);
     }
 
     /// Perf probe: what pinyin + first-letter search actually costs, on the

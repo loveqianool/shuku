@@ -223,3 +223,11 @@
 - 只用来搜索打开：Bookshelf 剥走管理操作——工具栏「检查更新」按钮、每本缓存书的「检查」「换源」按钮与换源下拉对话框（及 `sources` / `changingId` / `changeSourceId` / `notice` 状态）。后端接口（check-update / check-updates / change-source）保留不动；「有更新」徽标仍显示（只是状态提示）。
 - 最近阅读：新接口 `GET /api/books/recent`（db `recent_books(100)`：books JOIN reading_progress 按 updated_at 倒序，LIMIT 100；打开书时阅读器 loadChapter 会写进度，所以 updated_at 就是上次打开时间）。前端书库页工具栏下方加「最近阅读」区块（可点标题折叠/展开，默认展开），每行书名+作者+「第 X 章」，点开直接续读上次章节。无最近阅读时区块不显示。
 - 测试：新增 `recent_books_orders_by_last_opened`（排序、last_chapter_idx/last_read_at、limit、未打开的书不出现；时间戳用 SQL 固定，避免同一秒写进度导致排序不稳）。全量 `cargo test --release` 103 单元 + 2 端到端全绿，前端构建通过。
+
+## 本书内搜索改成逐处列出（2026-11-11）
+
+- Ye 拍了另一家阅读器的录屏：书内搜「李茉」逐个列出全部 180 处（编号+片段+位置百分比），点一个跳去那一处。要求书库按同样的交互逻辑做。
+- 先对数：那本 `【武林沉沦番外】（1-2）李茉.txt` 全文「李茉」共 177 处（直接 grep 数的），书库之前显示的 60+16+100+1=177 是对的；另一家显示 180，多出的 3 处很可能是把章节标题/目录也计了进去（内容本身只有 177 处）。
+- 后端：search/mod.rs 抽出 `find_occurrences` + `highlight_window` 两个共用函数（content_fragments 改用它们，行为不变）；新增 `BookMatch {chapter_idx, chapter_title, offset, snippet}` 与 `SearchIndex::list_matches(book_id, q, limit, offset)`——同款 tantivy 查询按书过滤，取全部匹配章节，按章排序后对每章正文找全部字面出现处，每处一条（前后 60/90 字窗口，词包 `<em>`），分页返回；新接口 `GET /api/books/:id/matches`（PageQuery 上限 500/页）。拼音查询无字面出现处，返回空。
+- 前端：Reader 的书内搜索改走 `api.listMatches`，结果逐个编号列出（序号+片段+章名），点一个跳去那一处：加载该章、标亮全部出现处、再把选中的那一处单独标红（`mark.search-hit-current`）并滚到它；顶栏变「第 N / 共 total 处」+ 上一处/下一处（跨章也行，超出已加载时自动加载下一页）；超过 500 处时列表底有「加载更多」。无字面结果时回退到按章节分组的旧搜索（拼音还能用）。另把阅读器左上角「‹ 书架」改成「‹ 书库」。
+- 测试：新增 `list_matches_returns_every_occurrence`（总数、章节+位置排序、片段高亮、分页、按书过滤、拼音返回空）。全量 `cargo test --release` 104 单元 + 2 端到端全绿，前端构建通过。
