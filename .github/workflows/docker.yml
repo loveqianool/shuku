@@ -93,6 +93,13 @@ jobs:
           name: shuku-arm64
           path: bin-arm64
 
+      # download-artifact does not reliably restore the executable bit
+      # (the published image once shipped /shuku as 0644 and crun
+      # refused to start it); make it explicit here and in the
+      # Dockerfile COPY --chmod as well.
+      - name: Make binaries executable
+        run: chmod +x bin-amd64/shuku bin-arm64/shuku
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 

@@ -11,7 +11,7 @@
 FROM alpine:3.21
 ARG TARGETARCH
 RUN mkdir -p /tmp /data /books
-COPY bin-${TARGETARCH}/shuku /shuku
+COPY --chmod=755 bin-${TARGETARCH}/shuku /shuku
 EXPOSE 8080
 ENV SHUKU_HOME=/ \
     SHUKU_ADDR=0.0.0.0:8080
