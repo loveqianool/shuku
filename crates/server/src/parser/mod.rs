@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn broken_epub_errors() {
-        let dir = std::env::temp_dir().join("legado-test-broken.epub");
+        let dir = std::env::temp_dir().join("shuku-test-broken.epub");
         std::fs::write(&dir, b"not a zip at all").unwrap();
         assert!(parse_epub_file(&dir).is_err());
         let _ = std::fs::remove_file(&dir);
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn epub_image_paragraphs() {
         let zip = test_epub_with_cover();
-        let path = std::env::temp_dir().join("legado-test-img.epub");
+        let path = std::env::temp_dir().join("shuku-test-img.epub");
         std::fs::write(&path, &zip).unwrap();
         let book = parse_epub_file(&path).unwrap();
         let _ = std::fs::remove_file(&path);

@@ -1,4 +1,5 @@
-// 阅读设置：localStorage 持久化（key: legado.reader.settings）
+// 阅读设置：localStorage 持久化（key: shuku.reader.settings）
+// 2026-11-11 改名 legado-server -> shuku：旧键 legado.* 仍读一次并迁移。
 export type ReaderMode = "scroll" | "page";
 export type ReaderTheme = "light" | "dark" | "sepia";
 export type ReaderScript = "orig" | "trad" | "simp";
@@ -12,7 +13,8 @@ export interface ReaderSettings {
   script: ReaderScript;
 }
 
-const KEY = "legado.reader.settings";
+const KEY = "shuku.reader.settings";
+const LEGACY_KEY = "legado.reader.settings";
 
 export const DEFAULT_SETTINGS: ReaderSettings = {
   fontSize: 18,
@@ -25,9 +27,18 @@ export const DEFAULT_SETTINGS: ReaderSettings = {
 
 export function loadSettings(): ReaderSettings {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = localStorage.getItem(KEY) ?? localStorage.getItem(LEGACY_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
-    return { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<ReaderSettings>) };
+    const s = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<ReaderSettings>) };
+    if (localStorage.getItem(KEY) === null) {
+      try {
+        localStorage.setItem(KEY, JSON.stringify(s));
+        localStorage.removeItem(LEGACY_KEY);
+      } catch {
+        /* 忽略 */
+      }
+    }
+    return s;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -49,12 +60,27 @@ export interface Highlight {
 }
 
 export function highlightKey(bookId: string, chapterIdx: number) {
+  return `shuku.highlights.${bookId}.${chapterIdx}`;
+}
+
+function legacyHighlightKey(bookId: string, chapterIdx: number) {
   return `legado.highlights.${bookId}.${chapterIdx}`;
 }
 
 export function loadHighlights(bookId: string, chapterIdx: number): Highlight[] {
   try {
-    return JSON.parse(localStorage.getItem(highlightKey(bookId, chapterIdx)) ?? "[]") as Highlight[];
+    const raw = localStorage.getItem(highlightKey(bookId, chapterIdx))
+      ?? localStorage.getItem(legacyHighlightKey(bookId, chapterIdx));
+    const list = JSON.parse(raw ?? "[]") as Highlight[];
+    if (raw !== null && localStorage.getItem(highlightKey(bookId, chapterIdx)) === null) {
+      try {
+        localStorage.setItem(highlightKey(bookId, chapterIdx), JSON.stringify(list));
+        localStorage.removeItem(legacyHighlightKey(bookId, chapterIdx));
+      } catch {
+        /* 忽略 */
+      }
+    }
+    return list;
   } catch {
     return [];
   }

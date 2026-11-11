@@ -17,18 +17,18 @@ fn env_i64(name: &str, default: i64, min: i64) -> i64 {
 /// Directory layout (unified under one root):
 ///
 /// ```text
-/// $LEGADO_HOME/
+/// $SHUKU_HOME/
 ///   books/      local library (epub/txt), scanned by the watcher
 ///   data/
-///     legado.db     SQLite metadata (books/sources/tasks/progress/...)
+///     shuku.db     SQLite metadata (books/sources/tasks/progress/...)
 ///     index/        tantivy chapter index
 ///     chapters/     cached network-book chapter text (<book_id>/<idx>.txt)
 ///     covers/       epub cover bytes (<book_id>)
 /// ```
 ///
-/// `LEGADO_HOME` defaults to `.` (current directory), so a bare launch
-/// behaves exactly as before (`./books`, `./data`). `LEGADO_BOOKS_DIR`
-/// and `LEGADO_DATA_DIR` still override each directory individually.
+/// `SHUKU_HOME` defaults to `.` (current directory), so a bare launch
+/// behaves exactly as before (`./books`, `./data`). `SHUKU_BOOKS_DIR`
+/// and `SHUKU_DATA_DIR` still override each directory individually.
 /// The scanner's staging dirs under the OS temp dir stay ephemeral.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -86,33 +86,33 @@ impl Default for Config {
 impl Config {
     pub fn from_env() -> Self {
         let d = Self::default();
-        let home = std::env::var("LEGADO_HOME").map(PathBuf::from).unwrap_or(d.home);
+        let home = std::env::var("SHUKU_HOME").map(PathBuf::from).unwrap_or(d.home);
         Self {
             home: home.clone(),
-            books_dir: std::env::var("LEGADO_BOOKS_DIR")
+            books_dir: std::env::var("SHUKU_BOOKS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| home.join("books")),
-            data_dir: std::env::var("LEGADO_DATA_DIR")
+            data_dir: std::env::var("SHUKU_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| home.join("data")),
-            addr: std::env::var("LEGADO_ADDR").unwrap_or(d.addr),
-            rate_per_sec: env_f64("LEGADO_RATE_PER_SEC", d.rate_per_sec, 0.1),
-            rate_burst: env_f64("LEGADO_RATE_BURST", d.rate_burst, 1.0),
-            breaker_failures: env_u64("LEGADO_BREAKER_FAILURES", d.breaker_failures as u64, 1) as u32,
-            breaker_cooldown_secs: env_u64("LEGADO_BREAKER_COOLDOWN_SECS", d.breaker_cooldown_secs, 1),
-            cache_ttl_search_secs: env_i64("LEGADO_CACHE_TTL_SEARCH_SECS", d.cache_ttl_search_secs, 0),
-            cache_ttl_toc_secs: env_i64("LEGADO_CACHE_TTL_TOC_SECS", d.cache_ttl_toc_secs, 0),
-            cache_ttl_content_secs: env_i64("LEGADO_CACHE_TTL_CONTENT_SECS", d.cache_ttl_content_secs, 0),
-            update_check_interval_secs: env_u64("LEGADO_UPDATE_CHECK_INTERVAL_SECS", d.update_check_interval_secs, 60),
-            source_health_interval_secs: env_u64("LEGADO_SOURCE_HEALTH_INTERVAL_SECS", d.source_health_interval_secs, 3600),
-            cache_max_mb: env_i64("LEGADO_CACHE_MAX_MB", d.cache_max_mb, 16),
-            cache_max_rows: env_i64("LEGADO_CACHE_MAX_ROWS", d.cache_max_rows, 100),
-            cache_prune_interval_secs: env_u64("LEGADO_CACHE_PRUNE_INTERVAL_SECS", d.cache_prune_interval_secs, 3600),
+            addr: std::env::var("SHUKU_ADDR").unwrap_or(d.addr),
+            rate_per_sec: env_f64("SHUKU_RATE_PER_SEC", d.rate_per_sec, 0.1),
+            rate_burst: env_f64("SHUKU_RATE_BURST", d.rate_burst, 1.0),
+            breaker_failures: env_u64("SHUKU_BREAKER_FAILURES", d.breaker_failures as u64, 1) as u32,
+            breaker_cooldown_secs: env_u64("SHUKU_BREAKER_COOLDOWN_SECS", d.breaker_cooldown_secs, 1),
+            cache_ttl_search_secs: env_i64("SHUKU_CACHE_TTL_SEARCH_SECS", d.cache_ttl_search_secs, 0),
+            cache_ttl_toc_secs: env_i64("SHUKU_CACHE_TTL_TOC_SECS", d.cache_ttl_toc_secs, 0),
+            cache_ttl_content_secs: env_i64("SHUKU_CACHE_TTL_CONTENT_SECS", d.cache_ttl_content_secs, 0),
+            update_check_interval_secs: env_u64("SHUKU_UPDATE_CHECK_INTERVAL_SECS", d.update_check_interval_secs, 60),
+            source_health_interval_secs: env_u64("SHUKU_SOURCE_HEALTH_INTERVAL_SECS", d.source_health_interval_secs, 3600),
+            cache_max_mb: env_i64("SHUKU_CACHE_MAX_MB", d.cache_max_mb, 16),
+            cache_max_rows: env_i64("SHUKU_CACHE_MAX_ROWS", d.cache_max_rows, 100),
+            cache_prune_interval_secs: env_u64("SHUKU_CACHE_PRUNE_INTERVAL_SECS", d.cache_prune_interval_secs, 3600),
         }
     }
 
     pub fn db_path(&self) -> PathBuf {
-        self.data_dir.join("legado.db")
+        self.data_dir.join("shuku.db")
     }
 
     pub fn index_path(&self) -> PathBuf {
@@ -135,15 +135,15 @@ mod tests {
     #[test]
     fn env_overrides_and_invalid_falls_back() {
         // No other test reads these vars, so set/remove here is safe.
-        std::env::set_var("LEGADO_RATE_PER_SEC", "10");
-        std::env::set_var("LEGADO_RATE_BURST", "bogus");
-        std::env::set_var("LEGADO_BREAKER_FAILURES", "3");
-        std::env::set_var("LEGADO_CACHE_TTL_SEARCH_SECS", "5");
+        std::env::set_var("SHUKU_RATE_PER_SEC", "10");
+        std::env::set_var("SHUKU_RATE_BURST", "bogus");
+        std::env::set_var("SHUKU_BREAKER_FAILURES", "3");
+        std::env::set_var("SHUKU_CACHE_TTL_SEARCH_SECS", "5");
         let c = Config::from_env();
-        std::env::remove_var("LEGADO_RATE_PER_SEC");
-        std::env::remove_var("LEGADO_RATE_BURST");
-        std::env::remove_var("LEGADO_BREAKER_FAILURES");
-        std::env::remove_var("LEGADO_CACHE_TTL_SEARCH_SECS");
+        std::env::remove_var("SHUKU_RATE_PER_SEC");
+        std::env::remove_var("SHUKU_RATE_BURST");
+        std::env::remove_var("SHUKU_BREAKER_FAILURES");
+        std::env::remove_var("SHUKU_CACHE_TTL_SEARCH_SECS");
         assert_eq!(c.rate_per_sec, 10.0);
         assert_eq!(c.rate_burst, 5.0, "unparseable value falls back to default");
         assert_eq!(c.breaker_failures, 3);
@@ -153,20 +153,20 @@ mod tests {
 
     #[test]
     fn home_derivation_and_precedence() {
-        // LEGADO_HOME alone derives both dirs under it.
-        std::env::set_var("LEGADO_HOME", "/srv/legado");
+        // SHUKU_HOME alone derives both dirs under it.
+        std::env::set_var("SHUKU_HOME", "/srv/shuku");
         let c = Config::from_env();
-        assert_eq!(c.home, PathBuf::from("/srv/legado"));
-        assert_eq!(c.books_dir, PathBuf::from("/srv/legado/books"));
-        assert_eq!(c.data_dir, PathBuf::from("/srv/legado/data"));
+        assert_eq!(c.home, PathBuf::from("/srv/shuku"));
+        assert_eq!(c.books_dir, PathBuf::from("/srv/shuku/books"));
+        assert_eq!(c.data_dir, PathBuf::from("/srv/shuku/data"));
         // Per-dir vars win over the home derivation.
-        std::env::set_var("LEGADO_BOOKS_DIR", "/mnt/books");
+        std::env::set_var("SHUKU_BOOKS_DIR", "/mnt/books");
         let c = Config::from_env();
         assert_eq!(c.books_dir, PathBuf::from("/mnt/books"));
-        assert_eq!(c.data_dir, PathBuf::from("/srv/legado/data"));
-        std::env::remove_var("LEGADO_HOME");
-        std::env::remove_var("LEGADO_BOOKS_DIR");
-        // No vars at all: defaults, identical to before LEGADO_HOME.
+        assert_eq!(c.data_dir, PathBuf::from("/srv/shuku/data"));
+        std::env::remove_var("SHUKU_HOME");
+        std::env::remove_var("SHUKU_BOOKS_DIR");
+        // No vars at all: defaults, identical to before SHUKU_HOME.
         let c = Config::from_env();
         assert_eq!(c.home, PathBuf::from("."));
         assert_eq!(c.books_dir, PathBuf::from("./books"));

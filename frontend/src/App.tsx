@@ -37,7 +37,7 @@ function parseHash(): Route {
 const App: Component = () => {
   const [route, setRoute] = createSignal<Route>(parseHash());
   const [dark, setDark] = createSignal(
-    (localStorage.getItem("legado.ui.theme") ?? "dark") === "dark",
+    (localStorage.getItem("shuku.ui.theme") ?? localStorage.getItem("legado.ui.theme") ?? "dark") === "dark",
   );
   const onHash = () => setRoute(parseHash());
   window.addEventListener("hashchange", onHash);
@@ -46,7 +46,8 @@ const App: Component = () => {
   const applyTheme = (d: boolean) => {
     setDark(d);
     document.documentElement.dataset.theme = d ? "dark" : "light";
-    localStorage.setItem("legado.ui.theme", d ? "dark" : "light");
+    localStorage.setItem("shuku.ui.theme", d ? "dark" : "light");
+    localStorage.removeItem("legado.ui.theme");
   };
   document.documentElement.dataset.theme = dark() ? "dark" : "light";
 
@@ -59,7 +60,7 @@ const App: Component = () => {
   return (
     <div class="app">
       <nav class="nav">
-        <span class="brand">📚 legado</span>
+        <span class="brand">📚 书库</span>
         <a href="#/" class={route().name === "books" ? "active" : ""}>书架</a>
         <a href="#/search" class={route().name === "search" ? "active" : ""}>检索</a>
         <a href="#/sources" class={route().name === "sources" || route().name === "test" ? "active" : ""}>书源</a>

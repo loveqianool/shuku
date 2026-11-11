@@ -13,8 +13,8 @@ use axum::response::{IntoResponse, Response};
 static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../frontend/dist");
 
 #[allow(dead_code)]
-const PLACEHOLDER: &str = r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>legado-server</title></head>
-<body><h1>legado-server</h1><p>Frontend dist not embedded in this build (placeholder). API is live at <code>/api/health</code>.</p></body></html>"#;
+const PLACEHOLDER: &str = r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>shuku</title></head>
+<body><h1>shuku</h1><p>Frontend dist not embedded in this build (placeholder). API is live at <code>/api/health</code>.</p></body></html>"#;
 
 fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {

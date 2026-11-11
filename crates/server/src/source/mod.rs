@@ -1710,11 +1710,11 @@ impl HttpPool {
         }
         let mut b = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent("legado-server/0.1 (compatible; Reading3)")
+            .user_agent("shuku/0.1 (compatible; Reading3)")
             .pool_max_idle_per_host(8)
             .pool_idle_timeout(Duration::from_secs(30))
             .cookie_store(source.enabled_cookie_jar);
-        if let Ok(proxy) = std::env::var("LEGADO_HTTP_PROXY").or_else(|_| std::env::var("LEGADO_SOCKS_PROXY")) {
+        if let Ok(proxy) = std::env::var("SHUKU_HTTP_PROXY").or_else(|_| std::env::var("SHUKU_SOCKS_PROXY")) {
             if !proxy.is_empty() {
                 b = b.proxy(reqwest::Proxy::all(&proxy).map_err(|e| anyhow!("bad proxy: {e}"))?);
             }
@@ -2992,7 +2992,7 @@ mod tests {
         let db = crate::db::Database::open_in_memory().await.unwrap();
         let engine = Arc::new(Engine::new(Cache::new(db.clone())));
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
-        let tmp = std::env::temp_dir().join(format!("legado-sub-test-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-sub-test-{}", uuid::Uuid::new_v4()));
         let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), tmp.join("data")));
         let url = format!("http://127.0.0.1:{port}/subscription");
         let msg = crate::scheduler::process_refresh_subscription(&sched, &url).await.unwrap();
@@ -3027,7 +3027,7 @@ mod tests {
         db.upsert_source(&raw).await.unwrap();
         let engine = Arc::new(Engine::new(Cache::new(db.clone())));
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
-        let tmp = std::env::temp_dir().join(format!("legado-health-test-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-health-test-{}", uuid::Uuid::new_v4()));
         let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), tmp.join("data")));
         let msg = crate::scheduler::process_health_check(&sched, &source.id).await.unwrap();
         assert!(msg.contains("healthy"), "msg: {msg}");
@@ -3063,7 +3063,7 @@ mod tests {
         db.upsert_source(&source.raw).await.unwrap();
         let engine = Arc::new(Engine::new(Cache::new(db.clone())));
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
-        let tmp = std::env::temp_dir().join(format!("legado-change-test-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-change-test-{}", uuid::Uuid::new_v4()));
         let data_dir = tmp.join("data");
         let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), data_dir.clone()));
         // Explicit book_url: old book has 5 chapters (one more than the new
@@ -3113,7 +3113,7 @@ mod tests {
         db.upsert_source(&source.raw).await.unwrap();
         let engine = Arc::new(Engine::new(Cache::new(db.clone())));
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
-        let tmp = std::env::temp_dir().join(format!("legado-update-test-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-update-test-{}", uuid::Uuid::new_v4()));
         let data_dir = tmp.join("data");
         std::fs::create_dir_all(data_dir.join("chapters")).unwrap();
         let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), data_dir.clone()));

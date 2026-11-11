@@ -94,6 +94,15 @@ pub struct TaskRow {
 
 impl Database {
     pub async fn open(path: &Path) -> Result<Self> {
+        // Rename 2026-11-11 (legado-server -> shuku): the database file was
+        // legado.db. On first open, move it to shuku.db so existing
+        // deployments keep their data; a fresh install just creates shuku.db.
+        if path.file_name().map(|n| n == "shuku.db").unwrap_or(false) {
+            let old = path.with_file_name("legado.db");
+            if !path.exists() && old.exists() {
+                std::fs::rename(&old, path)?;
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

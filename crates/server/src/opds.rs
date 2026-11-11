@@ -61,7 +61,7 @@ fn feed_open(title: &str, self_href: &str, kind: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\" \
          xmlns:opds=\"http://opds-spec.org/2010/catalog\">\n<title>{}</title>\n\
-         <id>urn:legado:opds{}</id>\n<updated>{}</updated>\n\
+         <id>urn:shuku:opds{}</id>\n<updated>{}</updated>\n\
          <link rel=\"self\" type=\"application/atom+xml;profile=opds-catalog;kind={}\" href=\"{}\"/>\n\
          <link rel=\"start\" type=\"application/atom+xml;profile=opds-catalog;kind=navigation\" href=\"/opds/\"/>\n",
         xml_escape(title),
@@ -74,7 +74,7 @@ fn feed_open(title: &str, self_href: &str, kind: &str) -> String {
 
 fn nav_entry(title: &str, href: &str) -> String {
     format!(
-        "<entry><title>{}</title><id>urn:legado:opds{}</id><updated>{}</updated>\
+        "<entry><title>{}</title><id>urn:shuku:opds{}</id><updated>{}</updated>\
          <link rel=\"subsection\" type=\"application/atom+xml;profile=opds-catalog;kind=navigation\" href=\"{}\"/>\
          <content type=\"text\">{}</content></entry>\n",
         xml_escape(title),
@@ -106,7 +106,7 @@ fn book_entry(book: &BookRow) -> String {
     let mut s = String::new();
     s.push_str("<entry>\n");
     s.push_str(&format!("<title>{}</title>\n", xml_escape(&book.title)));
-    s.push_str(&format!("<id>urn:legado:book:{}</id>\n", xml_escape(&book.id)));
+    s.push_str(&format!("<id>urn:shuku:book:{}</id>\n", xml_escape(&book.id)));
     if !book.author.is_empty() {
         s.push_str(&format!(
             "<author><name>{}</name></author>\n",
@@ -171,7 +171,7 @@ async fn root() -> impl IntoResponse {
     atom(
         NAV_CT,
         navigation_feed(
-            "legado 书库",
+            "书库",
             "/opds/",
             &[
                 ("全部图书".into(), "/opds/books".into()),
@@ -290,7 +290,7 @@ async fn opensearch() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "application/opensearchdescription+xml")],
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">\n\
-         <ShortName>legado</ShortName><Description>legado 书库搜索</Description>\n\
+         <ShortName>书库</ShortName><Description>书库搜索</Description>\n\
          <Url type=\"application/atom+xml\" template=\"/opds/search?q={searchTerms}\"/>\n\
          </OpenSearchDescription>\n",
     )
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn navigation_feed_lists_subsections() {
         let feed = navigation_feed(
-            "legado 书库",
+            "书库",
             "/opds/",
             &[("全部图书".into(), "/opds/books".into())],
         );

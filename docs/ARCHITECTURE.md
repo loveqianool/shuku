@@ -1,4 +1,4 @@
-# legado-server — 自托管小说服务（对标阅读3服务器版）
+# 书库 Shuku — 自托管小说服务（对标阅读3服务器版）
 
 ## 定位
 NAS / 低功耗 x86 / ARM 常驻服务，单静态二进制（musl），前端 dist 由 `include_bytes!` 嵌入。
@@ -56,5 +56,5 @@ books, chapters, sources, source_cache, scan_tasks, crawl_tasks, bookmarks, read
 
 ## 部署
 - `cargo build --release --target x86_64-unknown-linux-musl`
-- 环境变量：`LEGADO_HOME`（默认 `.`，书库在 `$LEGADO_HOME/books`、数据在 `$LEGADO_HOME/data`）、`LEGADO_BOOKS_DIR` / `LEGADO_DATA_DIR`（单独覆盖，优先于 `LEGADO_HOME`）、`LEGADO_ADDR`（默认 0.0.0.0:8080）
+- 环境变量：`SHUKU_HOME`（默认 `.`，书库在 `$SHUKU_HOME/books`、数据在 `$SHUKU_HOME/data`）、`SHUKU_BOOKS_DIR` / `SHUKU_DATA_DIR`（单独覆盖，优先于 `SHUKU_HOME`）、`SHUKU_ADDR`（默认 0.0.0.0:8080）
 - 单 binary + data 目录（sqlite + tantivy index）即可运行，无外部依赖。

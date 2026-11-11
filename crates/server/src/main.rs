@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("legado_server=info,tower_http=info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("shuku=info,tower_http=info")),
         )
         .init();
 
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     let app = api::router(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.addr).await?;
-    info!("legado-server listening on {} (books: {}, data: {})", cfg.addr, cfg.books_dir.display(), cfg.data_dir.display());
+    info!("shuku listening on {} (books: {}, data: {})", cfg.addr, cfg.books_dir.display(), cfg.data_dir.display());
     axum::serve(listener, app).await?;
     Ok(())
 }

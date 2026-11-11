@@ -19,13 +19,13 @@ use tracing::info;
 
 pub const INDEX_VERSION: i64 = 3;
 
-/// tantivy indexing threads: `LEGADO_INDEX_THREADS`, else half the CPU
+/// tantivy indexing threads: `SHUKU_INDEX_THREADS`, else half the CPU
 /// count (1..=8). Writer threads show strongly diminishing returns past 2
 /// (probe: 1 thread 5.7s vs 8 threads 4.8s for 159MB), and scan parse
 /// workers already occupy cores — total compute threads should stay near
 /// core count, so the writer gets half and parsing gets the rest.
 fn writer_threads() -> usize {
-    std::env::var("LEGADO_INDEX_THREADS")
+    std::env::var("SHUKU_INDEX_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.clamp(1, 16))
@@ -38,10 +38,10 @@ fn writer_threads() -> usize {
         })
 }
 
-/// tantivy writer heap: `LEGADO_INDEX_HEAP_MB`, default 150MB (was 50MB:
+/// tantivy writer heap: `SHUKU_INDEX_HEAP_MB`, default 150MB (was 50MB:
 /// too small for big scans, forces constant segment flushes).
 fn writer_heap_bytes() -> usize {
-    std::env::var("LEGADO_INDEX_HEAP_MB")
+    std::env::var("SHUKU_INDEX_HEAP_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|mb| mb.clamp(50, 2048) * 1_000_000)

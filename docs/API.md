@@ -59,5 +59,5 @@
 - `GET /api/tasks/stats` — 队列长度、熔断状态、令牌桶余量、source_cache 行数/字节数（调试用）
 
 ## 环境变量（新增）
-- `LEGADO_UPDATE_CHECK_INTERVAL_SECS`（默认 21600）更新检查周期；`LEGADO_SOURCE_HEALTH_INTERVAL_SECS`（默认 86400）健康检查/订阅刷新周期
-- `LEGADO_CACHE_MAX_MB`（默认 512）/ `LEGADO_CACHE_MAX_ROWS`（默认 20000）source_cache 上限；`LEGADO_CACHE_PRUNE_INTERVAL_SECS`（默认 86400）清理周期（每天清过期行 + 按最旧淘汰到上限内）
+- `SHUKU_UPDATE_CHECK_INTERVAL_SECS`（默认 21600）更新检查周期；`SHUKU_SOURCE_HEALTH_INTERVAL_SECS`（默认 86400）健康检查/订阅刷新周期
+- `SHUKU_CACHE_MAX_MB`（默认 512）/ `SHUKU_CACHE_MAX_ROWS`（默认 20000）source_cache 上限；`SHUKU_CACHE_PRUNE_INTERVAL_SECS`（默认 86400）清理周期（每天清过期行 + 按最旧淘汰到上限内）

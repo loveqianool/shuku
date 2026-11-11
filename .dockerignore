@@ -1,5 +1,5 @@
 # Keep the build context small: only the Dockerfile and the prebuilt
-# binaries (bin-*/legado-server) are needed at image build time.
+# binaries (bin-*/shuku) are needed at image build time.
 .git
 .github
 target/

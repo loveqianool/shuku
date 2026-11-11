@@ -1,4 +1,4 @@
-# legado-server
+# shuku
 
 自托管小说服务（对标阅读3服务器版）：本地书库 + 阅读3 JSON 书源引擎 + tantivy 全文检索 + SolidJS PWA 前端，单静态二进制。
 
@@ -17,21 +17,21 @@ cargo build --release --target x86_64-unknown-linux-musl
 ## 运行
 
 ```bash
-LEGADO_BOOKS_DIR=./books \
-LEGADO_DATA_DIR=./data \
-LEGADO_ADDR=0.0.0.0:8080 \
-./target/release/legado-server
+SHUKU_BOOKS_DIR=./books \
+SHUKU_DATA_DIR=./data \
+SHUKU_ADDR=0.0.0.0:8080 \
+./target/release/shuku
 ```
 
 环境变量：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `LEGADO_BOOKS_DIR` | `./books` | 本地 epub/txt 书库目录（递归扫描） |
-| `LEGADO_DATA_DIR` | `./data` | SQLite + tantivy 索引 + 缓存章节文件 |
-| `LEGADO_ADDR` | `0.0.0.0:8080` | 监听地址 |
-| `LEGADO_HTTP_PROXY` / `LEGADO_SOCKS_PROXY` | — | 书源抓取代理（可选） |
-| `RUST_LOG` | `legado_server=info` | 日志级别 |
+| `SHUKU_BOOKS_DIR` | `./books` | 本地 epub/txt 书库目录（递归扫描） |
+| `SHUKU_DATA_DIR` | `./data` | SQLite + tantivy 索引 + 缓存章节文件 |
+| `SHUKU_ADDR` | `0.0.0.0:8080` | 监听地址 |
+| `SHUKU_HTTP_PROXY` / `SHUKU_SOCKS_PROXY` | — | 书源抓取代理（可选） |
+| `RUST_LOG` | `shuku=info` | 日志级别 |
 
 首次启动会自动增量扫描书库并建索引；后续文件变动由 notify 监听 + 周期扫描补齐。
 

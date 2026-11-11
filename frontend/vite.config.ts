@@ -9,8 +9,8 @@ export default defineConfig({
       registerType: "autoUpdate",
       includeAssets: ["favicon.svg", "icons/icon-192.png", "icons/icon-512.png"],
       manifest: {
-        name: "legado-server",
-        short_name: "legado",
+        name: "书库",
+        short_name: "书库",
         description: "自托管小说服务 · 对标阅读3服务器版",
         start_url: "/",
         display: "standalone",

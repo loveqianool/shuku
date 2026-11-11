@@ -1,4 +1,4 @@
-"""Standalone fixture server for legado-server smoke tests (mirrors the
+"""Standalone fixture server for shuku smoke tests (mirrors the
 in-process Rust fixture in crates/server/src/source/mod.rs).
 
 Usage: python3 smoke-fixture.py 18097   (binds 127.0.0.1:<port>)

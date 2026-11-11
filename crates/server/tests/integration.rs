@@ -28,7 +28,7 @@ fn wait_for_health(port: u16, timeout: Duration) -> bool {
 
 #[test]
 fn end_to_end_txt_book() {
-    let tmp = std::env::temp_dir().join(format!("legado-e2e-{}", uuid::Uuid::new_v4()));
+    let tmp = std::env::temp_dir().join(format!("shuku-e2e-{}", uuid::Uuid::new_v4()));
     let books = tmp.join("books");
     let data = tmp.join("data");
     std::fs::create_dir_all(&books).unwrap();
@@ -39,13 +39,13 @@ fn end_to_end_txt_book() {
     writeln!(f, "他在山洞里打坐修炼，灵气汇聚成河。").unwrap();
     drop(f);
 
-    let bin = env!("CARGO_BIN_EXE_legado-server");
+    let bin = env!("CARGO_BIN_EXE_shuku");
     let port = free_port();
     let mut child: Child = Command::new(bin)
-        .env("LEGADO_BOOKS_DIR", &books)
-        .env("LEGADO_DATA_DIR", &data)
-        .env("LEGADO_ADDR", format!("127.0.0.1:{port}"))
-        .env("RUST_LOG", "legado_server=info")
+        .env("SHUKU_BOOKS_DIR", &books)
+        .env("SHUKU_DATA_DIR", &data)
+        .env("SHUKU_ADDR", format!("127.0.0.1:{port}"))
+        .env("RUST_LOG", "shuku=info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -341,18 +341,18 @@ fn epub_with_image() -> Vec<u8> {
 
 #[test]
 fn end_to_end_epub_images() {
-    let tmp = std::env::temp_dir().join(format!("legado-e2e-epub-{}", uuid::Uuid::new_v4()));
+    let tmp = std::env::temp_dir().join(format!("shuku-e2e-epub-{}", uuid::Uuid::new_v4()));
     let books = tmp.join("books");
     let data = tmp.join("data");
     std::fs::create_dir_all(&books).unwrap();
     std::fs::write(books.join("图册.epub"), epub_with_image()).unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_legado-server");
+    let bin = env!("CARGO_BIN_EXE_shuku");
     let port = free_port();
     let mut child: Child = Command::new(bin)
-        .env("LEGADO_BOOKS_DIR", &books)
-        .env("LEGADO_DATA_DIR", &data)
-        .env("LEGADO_ADDR", format!("127.0.0.1:{port}"))
+        .env("SHUKU_BOOKS_DIR", &books)
+        .env("SHUKU_DATA_DIR", &data)
+        .env("SHUKU_ADDR", format!("127.0.0.1:{port}"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

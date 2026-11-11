@@ -1,4 +1,4 @@
-# legado-server 前端（SolidJS + Vite + PWA）
+# 书库前端（SolidJS + Vite + PWA）
 
 静态阅读器：书架 / 全文检索 / 阅读 / 书源管理与测试 / 任务。**不是主服务**，
 构建产物 `dist/` 最终由 Rust 二进制 `include_bytes!` 嵌入，随单 binary 分发。

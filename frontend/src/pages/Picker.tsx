@@ -223,7 +223,7 @@ const Picker: Component<{ sourceId?: string }> = (props) => {
   }
 
   const postCmd = (cmd: Record<string, unknown>) => {
-    iframeRef?.contentWindow?.postMessage({ type: "legado-picker-cmd", ...cmd }, "*");
+    iframeRef?.contentWindow?.postMessage({ type: "shuku-picker-cmd", ...cmd }, "*");
   };
 
   createEffect(() => {
@@ -234,7 +234,7 @@ const Picker: Component<{ sourceId?: string }> = (props) => {
 
   const onMessage = (e: MessageEvent) => {
     const d = e.data as Record<string, unknown> | null;
-    if (!d || d.type !== "legado-picker") return;
+    if (!d || d.type !== "shuku-picker") return;
     if (iframeRef && e.source !== iframeRef.contentWindow) return;
     if (d.kind === "ready") {
       const a = armed();

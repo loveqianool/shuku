@@ -76,7 +76,7 @@ const Sources: Component = () => {
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = "legado-sources.json";
+      a.download = "shuku-sources.json";
       a.click();
       URL.revokeObjectURL(a.href);
     } catch (e) {

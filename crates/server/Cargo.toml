@@ -1,12 +1,12 @@
 [package]
-name = "legado-server"
+name = "shuku"
 version = "0.1.0"
 edition = "2021"
 description = "Self-hosted novel service compatible with Legado (Reading 3) JSON book sources"
 license = "MIT"
 
 [[bin]]
-name = "legado-server"
+name = "shuku"
 path = "src/main.rs"
 
 [dependencies]

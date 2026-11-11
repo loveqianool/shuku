@@ -68,8 +68,8 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: legado-server-${{ matrix.arch }}
-          path: crates/server/target/${{ matrix.target }}/release/legado-server
+          name: shuku-${{ matrix.arch }}
+          path: crates/server/target/${{ matrix.target }}/release/shuku
           if-no-files-found: error
           retention-days: 1
 
@@ -84,13 +84,13 @@ jobs:
       - name: Download amd64 binary
         uses: actions/download-artifact@v8
         with:
-          name: legado-server-amd64
+          name: shuku-amd64
           path: bin-amd64
 
       - name: Download arm64 binary
         uses: actions/download-artifact@v8
         with:
-          name: legado-server-arm64
+          name: shuku-arm64
           path: bin-arm64
 
       - name: Set up QEMU
@@ -154,4 +154,4 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh api --method PATCH /user/packages/container/legado-server -f visibility=public
+        run: gh api --method PATCH /user/packages/container/shuku -f visibility=public

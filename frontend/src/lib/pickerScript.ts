@@ -8,8 +8,8 @@ export const PICKER_SCRIPT = `(function(){
   var armed = null;
   var listCtx = null;
   var hlEls = [];
-  function post(msg){ msg.type = 'legado-picker'; try { parent.postMessage(msg, '*'); } catch(e){} }
-  function clearHl(){ for (var i=0;i<hlEls.length;i++){ hlEls[i].classList.remove('legado-pick-hover','legado-pick-sel','legado-pick-item'); } hlEls = []; }
+  function post(msg){ msg.type = 'shuku-picker'; try { parent.postMessage(msg, '*'); } catch(e){} }
+  function clearHl(){ for (var i=0;i<hlEls.length;i++){ hlEls[i].classList.remove('shuku-pick-hover','shuku-pick-sel','shuku-pick-item'); } hlEls = []; }
   function mark(el, cls){ if(!el || !el.classList) return; el.classList.add(cls); hlEls.push(el); }
   function qsa(sel, root){ try { return Array.prototype.slice.call((root||document).querySelectorAll(sel)); } catch(e){ return []; } }
   function qsaCount(sel){ return qsa(sel, document).length; }
@@ -23,7 +23,7 @@ export const PICKER_SCRIPT = `(function(){
   }
   function clsOf(el){
     if (!el.className || typeof el.className !== 'string') return [];
-    return el.className.trim().split(/\\s+/).filter(function(c){ return c && c.indexOf('legado-pick') !== 0; });
+    return el.className.trim().split(/\\s+/).filter(function(c){ return c && c.indexOf('shuku-pick') !== 0; });
   }
   function seg(el){
     var s = el.tagName.toLowerCase();
@@ -120,7 +120,7 @@ export const PICKER_SCRIPT = `(function(){
     if (!armed) return;
     var t = e.target;
     if (!t || t === document.documentElement || t === document.body) return;
-    clearHl(); mark(t, 'legado-pick-hover');
+    clearHl(); mark(t, 'shuku-pick-hover');
   }, true);
   document.addEventListener('click', function(e){
     if (!armed) return;
@@ -135,7 +135,7 @@ export const PICKER_SCRIPT = `(function(){
       var rule = FORMAT === 'xpath' ? ls.xpath : ls.css;
       listCtx = { css: ls.css, xpath: ls.xpath };
       var items = qsa(ls.css, document);
-      for (var i=0;i<items.length;i++) mark(items[i], 'legado-pick-item');
+      for (var i=0;i<items.length;i++) mark(items[i], 'shuku-pick-item');
       post({ kind:'pick', mode:mode, field:field, rule:rule, count:ls.count, value:textOf(t).slice(0,80) });
       return;
     }
@@ -162,7 +162,7 @@ export const PICKER_SCRIPT = `(function(){
       if (FORMAT === 'xpath') base = inside ? relXpath(scope, t) : xpathFor(t);
       value = textOf(t).slice(0, 80);
     }
-    mark(t, 'legado-pick-sel');
+    mark(t, 'shuku-pick-sel');
     post({ kind:'pick', mode:mode, field:field, rule: base + suf, value:value, scoped: inside });
   }, true);
   function evalRule(rule, ctx){
@@ -224,14 +224,14 @@ export const PICKER_SCRIPT = `(function(){
   }
   window.addEventListener('message', function(e){
     var d = e.data || {};
-    if (d.type !== 'legado-picker-cmd') return;
+    if (d.type !== 'shuku-picker-cmd') return;
     if (d.cmd === 'arm') { armed = d.armed; if (d.format) FORMAT = d.format; }
     if (d.cmd === 'disarm') { armed = null; clearHl(); }
     if (d.cmd === 'clear') { armed = null; listCtx = null; clearHl(); }
     if (d.cmd === 'preview') { doPreview(d.rules || {}, d.mode); }
   });
   var st = document.createElement('style');
-  st.textContent = '.legado-pick-hover{outline:2px solid #f59e0b !important;outline-offset:1px;cursor:pointer} .legado-pick-sel{outline:2px solid #22c55e !important} .legado-pick-item{outline:2px dashed #3b82f6 !important}';
+  st.textContent = '.shuku-pick-hover{outline:2px solid #f59e0b !important;outline-offset:1px;cursor:pointer} .shuku-pick-sel{outline:2px solid #22c55e !important} .shuku-pick-item{outline:2px dashed #3b82f6 !important}';
   document.head.appendChild(st);
   post({ kind:'ready' });
 })();`;

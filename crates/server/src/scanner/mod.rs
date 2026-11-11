@@ -75,12 +75,12 @@ fn is_book_file(path: &Path) -> bool {
     )
 }
 
-/// Parallel scan width: `LEGADO_SCAN_WORKERS`, else half the CPU count
+/// Parallel scan width: `SHUKU_SCAN_WORKERS`, else half the CPU count
 /// (1..=8). Parse workers and tantivy writer threads share the same cores,
 /// so both default to half: total compute threads stay near core count
 /// (measured best on 4 cores: 2 parse + 2 index; 4+4 was slower).
 pub fn scan_workers() -> usize {
-    std::env::var("LEGADO_SCAN_WORKERS")
+    std::env::var("SHUKU_SCAN_WORKERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.clamp(1, 32))
@@ -476,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn incremental_scan_by_mtime() {
-        let tmp = std::env::temp_dir().join(format!("legado-scan-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-scan-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = Database::open_in_memory().await.unwrap();
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
@@ -500,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_extracts_epub_cover() {
-        let tmp = std::env::temp_dir().join(format!("legado-scan-cover-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-scan-cover-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = Database::open_in_memory().await.unwrap();
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
@@ -526,7 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn broken_book_does_not_block_queue() {
-        let tmp = std::env::temp_dir().join(format!("legado-scan-broken-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-scan-broken-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = Database::open_in_memory().await.unwrap();
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
@@ -543,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_scan_many_txt_books() {
-        let tmp = std::env::temp_dir().join(format!("legado-scan-par-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!("shuku-scan-par-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = Database::open_in_memory().await.unwrap();
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
@@ -615,7 +615,7 @@ mod tests {
 
     /// Perf probe (not a correctness test): splits a big scan into parse
     /// time vs index time vs DB time so a bottleneck can be located instead
-    /// of guessed. Reads /tmp/legado-perf/books when present, otherwise skips.
+    /// of guessed. Reads /tmp/shuku-perf/books when present, otherwise skips.
     #[tokio::test]
     async fn probe_scan_split() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("perf-books");

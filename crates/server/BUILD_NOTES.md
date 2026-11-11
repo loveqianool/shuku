@@ -1,4 +1,4 @@
-# BUILD_NOTES — legado-server 后端
+# BUILD_NOTES — shuku 后端
 
 ## 依赖版本决策（已验证可编译）
 
@@ -12,8 +12,8 @@
 
 ## 构建结果
 
-- `cargo build --release`：通过，`target/release/legado-server`（~26MB）。
-- `cargo build --release --target x86_64-unknown-linux-musl`：通过，`target/x86_64-unknown-linux-musl/release/legado-server`（~26MB，`static-pie linked`，已实测启动 + 检索 + 前端 200）。
+- `cargo build --release`：通过，`target/release/shuku`（~26MB）。
+- `cargo build --release --target x86_64-unknown-linux-musl`：通过，`target/x86_64-unknown-linux-musl/release/shuku`（~26MB，`static-pie linked`，已实测启动 + 检索 + 前端 200）。
 - `cargo test`：25 个测试全绿（24 单元 + 1 端到端），零警告。
 
 ## 架构要点（与 docs/ARCHITECTURE.md 一致）
@@ -45,13 +45,13 @@
 
 ## 并行扫描（2026-11-06）
 
-- 结构：stat 筛选（mtime）→ 解析并发（`LEGADO_SCAN_WORKERS`，默认核数，上限 16，信号量限流 + JoinSet）→ mpsc → 单索引器批量提交（64 本或 64MB 一批，一次 tantivy commit）→ 整批一个 SQLite 事务入库。先索引后写库的不变式按本保持；坏书只坏自己。
+- 结构：stat 筛选（mtime）→ 解析并发（`SHUKU_SCAN_WORKERS`，默认核数，上限 16，信号量限流 + JoinSet）→ mpsc → 单索引器批量提交（64 本或 64MB 一批，一次 tantivy commit）→ 整批一个 SQLite 事务入库。先索引后写库的不变式按本保持；坏书只坏自己。
 - 找到的三处瓶颈（200 本 txt / 159MB / 1 万章，4 核机实测）：
   1. 每本一次 tantivy commit：串行 20.9s → 批量提交后 16.7s。
-  2. writer 线程数：`writer_with_num_threads(1)` 改多线程几乎无收益（probe：1 线程 5.7s vs 8 线程 4.8s）；jieba 分词本身只要 2.1s，大头在 tantivy 建段/存正文的单线程部分。默认改为核数一半（`LEGADO_INDEX_THREADS`，1..8），堆默认 150MB（`LEGADO_INDEX_HEAP_MB`）。
+  2. writer 线程数：`writer_with_num_threads(1)` 改多线程几乎无收益（probe：1 线程 5.7s vs 8 线程 4.8s）；jieba 分词本身只要 2.1s，大头在 tantivy 建段/存正文的单线程部分。默认改为核数一半（`SHUKU_INDEX_THREADS`，1..8），堆默认 150MB（`SHUKU_INDEX_HEAP_MB`）。
   3. 每本两次 SQLite 提交：400 次 fsync 曾被怀疑是瓶颈，实测改成整批一事务后无变化（内存库入库只要 0.1s），遂保留批量事务（仍是正确做法），不再归因于 fsync。
 - 最终成绩：串行 20.9s → 并行 15.0s（约 1.4 倍，2 解析线程 + 2 索引线程、批量 64 时最优）；线程总数远超核数反而变慢（4+4 要 17.2s）。probe 拆分：解析 4.3s / 索引（磁盘、批量）5.2s / 入库 0.1s。
-- 性能探针：`cargo test --release probe_scan_split / probe_jieba_modes`（读 /tmp/legado-perf/books，缺失则跳过）。
+- 性能探针：`cargo test --release probe_scan_split / probe_jieba_modes`（读 /tmp/shuku-perf/books，缺失则跳过）。
 
 ## 分页反序列化 bug（2026-11-06，实测发现）
 
@@ -86,7 +86,7 @@
 - 拾取脚本：悬停描边高亮；点字段旁「选」再点元素即生成规则。列表字段（bookList/chapterList）点一个条目生成匹配全部同类条目的选择器（并虚线标出所有命中项），之后的名称/作者/链接在第一个条目内相对生成（`a.title@text`、`a.title@href` 这类）；正文 content 点容器本身。格式开关：CSS / XPath。预览按钮在页面内即时算前 3 条提取结果（最终以服务端测试面板为准）。
 - JSON 响应：不走 iframe，渲染可折叠 JSON 树；点数组节点生成 `$.data[*]` 列表规则，点标量节点生成 `@json:` 规则（已设列表时自动相对到条目，如 `$.title`）。
 - 回填：复制规则 JSON，或保存到书源（已选书源则合并 ruleSearch/ruleToc/ruleContent 后 PUT；没选则按站点 origin 新建一个），随后去测试面板验证。
-- 测试：51 单元 + 1 端到端全绿；新增 `engine_picker_fetch`（POST 搜索模板抓回含「书一」的页、非法 URL 报错）；前端 `npm run build` 通过，拾取脚本已打进 bundle（`legado-picker` 标记在列）；musl 二进制冒烟全通（picker 抓 HTML 页 200 含「书一」、抓 JSON 接口 200、非法 URL 明确报错，前端 200）。
+- 测试：51 单元 + 1 端到端全绿；新增 `engine_picker_fetch`（POST 搜索模板抓回含「书一」的页、非法 URL 报错）；前端 `npm run build` 通过，拾取脚本已打进 bundle（`shuku-picker` 标记在列）；musl 二进制冒烟全通（picker 抓 HTML 页 200 含「书一」、抓 JSON 接口 200、非法 URL 明确报错，前端 200）。
 - 未做：拾取器不处理登录后页面（需登录的站先在书源里配好 loginUrl 再用测试面板）；JS 渲染的站（内容不在首屏 HTML 里）抓回来是空壳，拾取器帮不上；iframe 里页面自带样式可能遮挡高亮。
 
 ## 剩余规则补齐（2026-11-10）
@@ -105,13 +105,13 @@
 - epub 图片段落：epub 解析时 `<img>` 产出 `\x01IMG:{epub 内路径}` 标记行（src 相对当前 xhtml 路径解析，`..`、开头的 `/`、百分号编码都处理）；`get_chapter` 两条路径（本地按需解析/缓存文本）都走 `paragraphs_from_text` 转成 `{img}` 段落（前端 Reader 已原生渲染）；新增 `GET /api/books/:id/images/*path`（axum 通配符语法是 `{*path}`；仅 epub，`..` 拒绝，mime 按 epub 内记录）；扫描索引前 `strip_img_markers` 去标记行，不污染检索。
 - 测试：69 单元 + 2 端到端全绿（含新增：XPath 轴、JSONPath 递归/过滤器、epub 图片解析 + 端到端 images 200/防穿越/检索不污染、fixture explore/loginUi 表单全链路/ruleBookInfo 回退）。fixture 站（Rust 内嵌 + `smoke-fixture.py` 镜像）新增 `/explore`、`/login-form`（GET 表单 + POST 校验 alice/s3cret 种 cookie）、`/bookinfo`。
 - 仍未做（有意不做，见下）：`java.ajax/get/post`、`kv_*`、`cache`、`cookie` 这类带网络/持久化的 JS API（与沙箱禁网络约束冲突）；`@put`/`@get`/`init` 跨规则变量作用域（单独工程量）；JS 渲染站（首屏 HTML 是空壳，需真浏览器引擎，违反 musl 单二进制约束）；`nextTocUrl` 返回多个分页 URL（仅跟单个）；loginUi 选择器子集限制（见上）。
-- 限流参数可配：`LEGADO_RATE_PER_SEC`（默认 2）/`LEGADO_RATE_BURST`（默认 5）每域名令牌桶；`LEGADO_BREAKER_FAILURES`（默认 5）/`LEGADO_BREAKER_COOLDOWN_SECS`（默认 60）熔断；`LEGADO_CACHE_TTL_SEARCH_SECS`/`LEGADO_CACHE_TTL_TOC_SECS`/`LEGADO_CACHE_TTL_CONTENT_SECS`（默认 60/600/86400）三级缓存 TTL。`Config::from_env` 读环境变量，非法值回退默认、不影响启动；`Cache::with_ttls` + `Engine::with_limits` 接线，`main.rs` 用配置值，`Engine::new`/`Cache::new` 保留默认值供测试用。
+- 限流参数可配：`SHUKU_RATE_PER_SEC`（默认 2）/`SHUKU_RATE_BURST`（默认 5）每域名令牌桶；`SHUKU_BREAKER_FAILURES`（默认 5）/`SHUKU_BREAKER_COOLDOWN_SECS`（默认 60）熔断；`SHUKU_CACHE_TTL_SEARCH_SECS`/`SHUKU_CACHE_TTL_TOC_SECS`/`SHUKU_CACHE_TTL_CONTENT_SECS`（默认 60/600/86400）三级缓存 TTL。`Config::from_env` 读环境变量，非法值回退默认、不影响启动；`Cache::with_ttls` + `Engine::with_limits` 接线，`main.rs` 用配置值，`Engine::new`/`Cache::new` 保留默认值供测试用。
 
 ## 第二批功能（2026-11-10 晚，Ye 选的 17 项）
 
-- ① 书架更新检查：`update_check` crawl 任务 + `run_update_worker`（启动 60s 后首轮，每 6h，`LEGADO_UPDATE_CHECK_INTERVAL_SECS`）；`due_update_books`/`mark_update_checked`/`set_has_update`；只抓新增章、重建索引；`POST /api/tasks/check-updates`、`POST /api/books/:id/check-update`；前端书架「检查更新」+「有更新」徽章。坑：fixture `/toc` 的 starts_with 曾吞掉 `/toc-update`。
+- ① 书架更新检查：`update_check` crawl 任务 + `run_update_worker`（启动 60s 后首轮，每 6h，`SHUKU_UPDATE_CHECK_INTERVAL_SECS`）；`due_update_books`/`mark_update_checked`/`set_has_update`；只抓新增章、重建索引；`POST /api/tasks/check-updates`、`POST /api/books/:id/check-update`；前端书架「检查更新」+「有更新」徽章。坑：fixture `/toc` 的 starts_with 曾吞掉 `/toc-update`。
 - ② 换源：`change_source` 任务（搜索找书或显式 book_url，全量重抓、删多余旧章节文件、book id 不变、进度保留）；`POST /api/books/:id/change-source`；前端缓存书行内换源下拉。顺带修了旧 crawl 单章失败跳过导致章节序号错位的 bug（现改为一一对应，失败写空文件）。
-- ③ 书源健康检查：`health_check` 任务（checkKeyWord 搜索或 explore 探针）+ `run_health_worker`（启动 300s 后首轮，每天，`LEGADO_SOURCE_HEALTH_INTERVAL_SECS`）；`health`/`health_error` 列；前端徽章 + 每源检查按钮。
+- ③ 书源健康检查：`health_check` 任务（checkKeyWord 搜索或 explore 探针）+ `run_health_worker`（启动 300s 后首轮，每天，`SHUKU_SOURCE_HEALTH_INTERVAL_SECS`）；`health`/`health_error` 列；前端徽章 + 每源检查按钮。
 - ④ 书源规则订阅：`refresh_subscription` 任务（`fetch_picker` 抓订阅 URL，数组或单个对象，逐条校验入库、坏条目跳过）；`POST /api/sources/subscribe`；前端订阅输入框 + 徽章。顺带修了 `validate_source` 不校验对象/必填字段的真 bug（裸字符串曾被 upsert 成随机源）。
 - ⑤ epub 封面：`parse_epub_file` 取 `doc.get_cover()`（≤5MB、image/*）；字节存 `data/covers/<id>`，DB 只存 mime；`GET /api/books/:id/cover`；前端书架缩略图。`scan_once` 签名改成 `scan_once(db, search, dir, data_dir)`。
 - ⑥ 本内搜索：`GET /api/search?book_id=`（book_id 优先于 scope，非法 id 返回空）；前端 Reader 搜索框 + 结果跳章。
@@ -123,7 +123,7 @@
 - ⑫ 朗读：纯前端——`speechSynthesis`，优先中文语音，语速 0.5–2，切章/退出停；读显示文本（含繁简转换后）。
 - ⑬ 繁简转换：纯前端——`opencc-js`（`cn2t`/`t2cn` 分入口，动态 import 按需加载；`to: "t"` 通用繁体）；阅读设置 `script: orig|trad|simp`（localStorage）；按批注分段后逐段转（批注按原文分段不受影响）；词典 chunk 已从 SW 预缓存排除（`globIgnores`），否则首次访问就下 1.1MB。
 - ⑭ 整本离线：章节缓存放宽到 5000 条/30 天（`recent-chapters`），新增 `book-images`（封面/插图 1000 条/30 天）；`src/lib/offline.ts`（`downloadBook` 4 并发预取全部章节 + 书详情/目录/封面，`offlineChapterCount` 实查 Cache Storage，`deleteOfflineBook`）；Reader「下载整本离线读」+ 实际缓存数 + 删除。
-- ⑮ 缓存自动清理：`prune_source_cache`（先删过期行，再按行数/字节上限删最旧行；字节超限按平均大小估算条数，循环复核，绝不整表删）；`run_cache_worker`（启动 60s 后首轮，每天，`LEGADO_CACHE_MAX_MB`=512/`LEGADO_CACHE_MAX_ROWS`=20000/`LEGADO_CACHE_PRUNE_INTERVAL_SECS`=86400）；`GET /api/tasks/stats` 加 `cache{rows,bytes}`。教训：LIMIT 固定 100 会一次删光超限不多的表；字节估算必须按平均大小算条数。
+- ⑮ 缓存自动清理：`prune_source_cache`（先删过期行，再按行数/字节上限删最旧行；字节超限按平均大小估算条数，循环复核，绝不整表删）；`run_cache_worker`（启动 60s 后首轮，每天，`SHUKU_CACHE_MAX_MB`=512/`SHUKU_CACHE_MAX_ROWS`=20000/`SHUKU_CACHE_PRUNE_INTERVAL_SECS`=86400）；`GET /api/tasks/stats` 加 `cache{rows,bytes}`。教训：LIMIT 固定 100 会一次删光超限不多的表；字节估算必须按平均大小算条数。
 - ⑯ 缺章/乱章检测：`src/chapter_check.rs`（`chapter_number`：阿拉伯数字 + 中文数字到万；`detect_gaps`：跳号、重复、倒序、开头缺章；`卷` 换卷重置，不误报；章节号正则排除「卷」，否则「第一卷 第二章」会被当成第 1 章）；`chapter_issues` 表；`POST /api/tasks/chapter-check` 全库扫（标题缺口 + 缓存书空章节文件；本地书正文不解析）；`GET /api/books/:id/chapter-issues` 单本即时检查（本地书解析一次查空章节）；前端 Reader「检查缺章」+ 任务页「全库缺章检查」与问题书列表。
 - ⑰ 搜索联想：`GET /api/suggest?q=`（书名/作者 instr 子串，书名优先；不足 8 条时 tantivy 补足，覆盖拼音如 `xiuxian`）；前端搜索框防抖 200ms 下拉，点条目直接进书。
 - 测试：97 单元 + 2 端到端全绿；musl 二进制 29.5MB + fixture 冒烟全通（搜索高亮、拼音联想、OPDS feed、下载正文）。新增依赖：`pinyin 0.10`（后端）、`opencc-js 1.4.2`（前端，词典按需加载）。
@@ -151,9 +151,9 @@
 
 ## Docker CI（2026-11-11，Ye 要求）
 
-- `Dockerfile`（仓库根）：alpine:3.21 + 预编的 musl 静态二进制（CI 每架构编一个，`bin-<arch>/legado-server`），建 `/tmp`（扫描暂存用）`/data` `/books`；默认 `LEGADO_BOOKS_DIR=/books`、`LEGADO_DATA_DIR=/data`、`LEGADO_ADDR=0.0.0.0:8080`，端口 8080。reqwest 用 rustls 自带根证书，镜像里不需要 CA 证书包。
+- `Dockerfile`（仓库根）：alpine:3.21 + 预编的 musl 静态二进制（CI 每架构编一个，`bin-<arch>/shuku`），建 `/tmp`（扫描暂存用）`/data` `/books`；默认 `SHUKU_BOOKS_DIR=/books`、`SHUKU_DATA_DIR=/data`、`SHUKU_ADDR=0.0.0.0:8080`，端口 8080。reqwest 用 rustls 自带根证书，镜像里不需要 CA 证书包。
 - `.github/workflows/docker.yml`：push 到 main 或 `v*` 标签时跑；`binary` 任务在 amd64（ubuntu-24.04）与 arm64（ubuntu-24.04-arm）原生 runner 上各编前端 + musl 二进制，**先跑全量测试，通过才推镜像**；`docker` 任务（PR 不跑）用 buildx 各推 `amd64-<sha>` / `arm64-<sha>` 镜像，再 `imagetools create` 合成多架构清单 `:latest`、`:sha-<sha>`（打标签时另加 `:<版本号>`）。GHCR 包默认私有，工作流最后一步用 `gh api` 把它改公开（best-effort，失败不影响构建）。
-- 本地编镜像：先编 musl 二进制，放进 `bin-amd64/legado-server`，再 `docker build -t legado-server .`（本机无 docker，未本地验证，靠 CI 首跑验证）。
+- 本地编镜像：先编 musl 二进制，放进 `bin-amd64/shuku`，再 `docker build -t shuku .`（本机无 docker，未本地验证，靠 CI 首跑验证）。
 
 ## 发布（PAT 推送，2026-11-11，Ye 要求）
 
@@ -167,7 +167,17 @@
 
 ## 数据目录统一（2026-11-11，Ye 要求）
 
-- 新增 `LEGADO_HOME`（默认 `.`）：书库固定在 `$LEGADO_HOME/books`，全部服务数据固定在 `$LEGADO_HOME/data`（legado.db、index/、chapters/、covers/）。`LEGADO_BOOKS_DIR` / `LEGADO_DATA_DIR` 保留，单独覆盖时优先于 `LEGADO_HOME`。
-- 不设 `LEGADO_HOME` 时行为与以前完全一致（`./books`、`./data`），已有部署不用搬数据；Docker 镜像改设 `LEGADO_HOME=/`，对应原来的 `/books`、`/data`。
-- 扫描暂存目录仍在系统临时目录（`legado-scan-*`，用完即删），不进数据目录。
+- 新增 `SHUKU_HOME`（默认 `.`）：书库固定在 `$SHUKU_HOME/books`，全部服务数据固定在 `$SHUKU_HOME/data`（shuku.db、index/、chapters/、covers/）。`SHUKU_BOOKS_DIR` / `SHUKU_DATA_DIR` 保留，单独覆盖时优先于 `SHUKU_HOME`。
+- 不设 `SHUKU_HOME` 时行为与以前完全一致（`./books`、`./data`），已有部署不用搬数据；Docker 镜像改设 `SHUKU_HOME=/`，对应原来的 `/books`、`/data`。
+- 扫描暂存目录仍在系统临时目录（`shuku-scan-*`，用完即删），不进数据目录。
 - 修复经过：config 单元测试新增 `home_derivation_and_precedence`（派生 + 优先级 + 默认），全量测试 100 单元 + 2 端到端全绿。
+
+## 改名 shuku（2026-11-11）
+
+- 项目名 legado-server → **书库 Shuku**（仓库、crate、二进制、镜像、前端标题、PWA 名均为 shuku；中文名「书库」）。
+- 环境变量前缀 `LEGADO_*` → `SHUKU_*`（`SHUKU_HOME` / `SHUKU_BOOKS_DIR` / `SHUKU_DATA_DIR` / `SHUKU_ADDR` 等全部 19 个）。**破坏性变更**：已有部署（NAS 的 docker run/compose）须把旧变量名改掉，否则用默认路径。
+- 数据库文件 `legado.db` → `shuku.db`；`Database::open` 首次打开时若只有旧文件，自动改名迁移，数据不丢。
+- 浏览器侧 localStorage 键 `legado.*` → `shuku.*`（阅读设置、高亮、主题），读不到新键时读一次旧键并迁移。
+- OPDS feed id 从 `urn:legado:*` 改为 `urn:shuku:*`；User-Agent `shuku/0.1 (compatible; Reading3)`。
+- 不改：对「Legado（阅读3）JSON 书源格式」的兼容描述仍保留（那是格式名，不是项目名）；PAT「legado-server Muse」与连接器 custom.github-legado-pat 是凭据侧的既有名字，也不动。
+- 旧仓库名历史：此前 BUILD_NOTES 条目里的 legado-server 指同一项目改名前。
