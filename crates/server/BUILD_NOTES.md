@@ -398,3 +398,12 @@
 - 根因：`jumpToMatch` 会 `setShowSearch(false)`，结果列表 DOM 被卸载；再开搜索时重新挂载，滚动位置归零。
 - 修法（`frontend/src/pages/Reader.tsx`）：`openSearch` 里等一帧后，若已有当前匹配项（`currentMatch() >= 0`），将 `.match-row.current` 那行 `scrollIntoView({ block: "nearest" })` 滚回视野；聚焦输入框改 `preventScroll: true`，免得聚焦把页面拉回顶栏。首次搜索（无当前匹配项）行为不变，仍聚焦输入框。
 - 测试：109 单元 + 2 端到端全绿；前端构建通过。
+
+## 待定项 #20、#21 实测（2026-11-12）
+
+- Ye 问 20、21 能否由 Muse 自己测：可以，全部本地实测。
+- #20 watcher 回调 `tokio::spawn`：**证实是真 bug**。notify 回调跑在 notify 自己的 inotify 线程（不在 Tokio runtime 内），`tokio::spawn` 一叫就 panic（"there is no reactor running"），watcher 线程死掉，文件变化再也探测不到（定期扫描兜底，所以一直没察觉）。修法（`src/scanner/mod.rs`）：起 watcher 时用 `tokio::runtime::Handle::current()` 攞定 Handle，回调用 `handle.spawn`。新增回归测试 `watcher_enqueues_scan_on_new_book_file`（起 watcher、写新书文件、断言扫描任务入队）。
+- #21 之 QuickJS 正则 ReDoS：**证实不是漏洞**。新增测试 `js_redos_regex_is_interrupted`（`(a+)+$` 配 25 个 a + b，2 秒 deadline），2.00 秒准时中断返回错误——QuickJS 中断处理器在正則执行时也会被轮询。无需修。
+- #21 之 OPDS 非法头值：**找到真缺口并修了**。`sanitize_filename` 只在缓存书（书名拼文件名）那支用过，本地文件那支直接用磁盘文件名拼 `Content-Disposition`，Linux 文件名可含换行符，会污染头。修法（`src/opds.rs`）：本地文件名也过 `sanitize_filename`。
+- #21 之 reqwest 307/308 body 重发：**代码核实无问题**。请求 body 是 `String`（可重发），客户端没自定义 redirect 策略（用默认：跟随重定向，307/308 保留方法与 body 重发）。无需修，未做 live 测试。
+- #21 之 `get_book_image` 双重解码：**边缘情况，不改**。axum 已解码一次路径后 `percent_decode` 再解一次，正常路径（含空格）下是 no-op；只有 epub 内图片路径字面含 `%20` 时会查不到，该情况极罕见，改动反而可能破坏正常路径。保持现状。

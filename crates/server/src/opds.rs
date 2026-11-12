@@ -342,8 +342,11 @@ async fn download(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
         let filename = std::path::Path::new(&path)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("book.txt")
-            .to_string();
+            .unwrap_or("book.txt");
+        // Disk filenames may contain control characters (\n, \r, ...) which
+        // would corrupt the Content-Disposition header value (header
+        // injection) — sanitize the same way as the cached-book title.
+        let filename = sanitize_filename(filename);
         (bytes, mime.to_string(), filename)
     };
     Ok((

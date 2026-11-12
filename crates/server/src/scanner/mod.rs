@@ -450,6 +450,11 @@ pub async fn reindex_cached_books(db: &Database, search: &Arc<SearchIndex>, data
 /// Start a notify watcher: file create/modify under the books dir enqueues
 /// an incremental scan task (best-effort; the periodic scan is the fallback).
 pub fn start_watcher(db: Database, dir: &Path) -> Result<RecommendedWatcher> {
+    // The notify callback runs on notify's own thread, outside any Tokio
+    // runtime, so `tokio::spawn` there panics ("there is no reactor
+    // running") and kills the watcher thread. Capture the runtime Handle
+    // here (inside the runtime) and spawn through it instead.
+    let handle = tokio::runtime::Handle::current();
     let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
         let Ok(event) = res else { return };
         use notify::EventKind;
@@ -461,7 +466,7 @@ pub fn start_watcher(db: Database, dir: &Path) -> Result<RecommendedWatcher> {
             if is_book_file(p) {
                 let db2 = db.clone();
                 let path = p.to_string_lossy().into_owned();
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     let payload = serde_json::json!({"path": path}).to_string();
                     let _ = db2.enqueue_task("scan_tasks", "scan", &payload).await;
                 });
@@ -732,6 +737,33 @@ mod tests {
             files.len()
         );
         let _ = std::fs::remove_dir_all(&idx_dir);
+    }
+
+    #[tokio::test]
+    async fn watcher_enqueues_scan_on_new_book_file() {
+        // Regression (#20): the notify callback runs on notify's own thread,
+        // outside any Tokio runtime. `tokio::spawn` there panics ("there is
+        // no reactor running"), killing the watcher thread, so no scan task
+        // is ever enqueued. The callback must spawn via a captured Handle.
+        let tmp = std::env::temp_dir().join(format!("shuku-scan-watch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let _watcher = start_watcher(db.clone(), &tmp).unwrap();
+        // Give the watcher a moment to start watching.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        write_txt(&tmp, "new.txt", "第一章 新书\n内容。\n");
+        // Poll for the enqueued scan task (notify delivery is async).
+        let mut found = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let (_, total) = db.list_all_tasks(None, 1, 10).await.unwrap();
+            if total > 0 {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "watcher must enqueue a scan task for a new book file");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn filetime_set(p: &Path, t: SystemTime) {

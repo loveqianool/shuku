@@ -2517,6 +2517,21 @@ mod tests {
     }
 
     #[test]
+    fn js_redos_regex_is_interrupted() {
+        // (#21) Classic catastrophic backtracking: (a+)+$ on 25 a's + b.
+        // The interrupt handler is polled by the bytecode interpreter; if
+        // the regex engine runs in native code without polling, this runs
+        // past the deadline instead of erroring promptly. 25 a's is slow
+        // enough to prove the point (~seconds uninterruptible) without
+        // hanging the suite if the interrupt does not fire.
+        let t0 = std::time::Instant::now();
+        let input = format!("{}b", "a".repeat(25));
+        let r = run_js("/(a+)+$/.test(result)", &input, "", Duration::from_secs(2));
+        assert!(r.is_err(), "ReDoS regex must be interrupted, got {r:?}");
+        assert!(t0.elapsed() < Duration::from_secs(10), "interrupt must be prompt, took {:?}", t0.elapsed());
+    }
+
+    #[test]
     fn js_memory_bomb_is_limited() {
         // 16MB limit: allocating a huge string must fail, not OOM the process.
         let r = run_js("let a=''; while(true){ a += 'xxxxxxxxxx'; }", "x", "", Duration::from_secs(5));
