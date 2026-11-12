@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, Show, type Component } from "solid-js";
+import { createSignal, onCleanup, onMount, Show, type Component } from "solid-js";
 import { readerChrome } from "./lib/readerChrome";
 import Bookshelf from "./pages/Bookshelf";
 import SearchPage from "./pages/SearchPage";
@@ -43,6 +43,25 @@ const App: Component = () => {
   const onHash = () => setRoute(parseHash());
   window.addEventListener("hashchange", onHash);
   onCleanup(() => window.removeEventListener("hashchange", onHash));
+
+  // 定期检查 Service Worker 更新（2026-11-12）：阅读器翻页是 hash 跳转，
+  // 不触发浏览器的 SW 更新检查，旧 SW 会一直钉住（导致章节一直吃旧版
+  // 缓存）。每 30 分钟 + 每次切回前台时手动调 registration.update()，
+  // 有新版时 autoUpdate 会自动接管并刷新。
+  onMount(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const checkSW = () => {
+      navigator.serviceWorker.getRegistration().then((reg) => reg?.update()).catch(() => {});
+    };
+    checkSW();
+    const timer = setInterval(checkSW, 30 * 60 * 1000);
+    const onVisible = () => { if (!document.hidden) checkSW(); };
+    document.addEventListener("visibilitychange", onVisible);
+    onCleanup(() => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    });
+  });
 
   const applyTheme = (d: boolean) => {
     setDark(d);
