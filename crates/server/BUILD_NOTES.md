@@ -264,3 +264,11 @@
 - 智能排版：中文排版库用 pangu.js（v10.4.1，`pangu/browser` 入口——默认入口是 Node 版，用了 `node:fs`，Vite 打包会炸；方法名是 `spaceText` 不是旧版 `spacingText`）。`disp` 里繁简转换后过 `pangu.spaceText`，中英文/数字间自动加空格（「我爱iPhone」→「我爱 iPhone」）。高亮切分（splitOnTerm/renderTextWithHighlights）在 disp 之前按原文做，pangu 只在每段切分后加空格，不整坏搜索定位与批注。
 - CSS 中文排版：`.reader-content p` 加 `text-align: justify; line-break: strict; hanging-punctuation: first; text-justify: inter-ideograph`（两端对齐、严格断行、标点悬挂）。
 - 测试：前端构建通过；104 单元 + 2 端到端全绿。竖向滑杆方向（往下拖=往后翻）待线上实测确认，若反了再调 direction。
+
+## 竖向滑杆方向反了 + 顶栏重叠（2026-11-12，run #20 线上实测）
+
+- 线上实测（run #20 部署后，全新 shuku-test profile）：(a) 底栏本章滚动通过；(b) 竖向滑杆 88vh、跳章、拖动提示「第 X 章 / 共 N 章 · NN%」格式对、2 秒内淡出，基本通过（提示 % 是拖动位置而非落章章首进度，属正常）；(f) 数字间空格与两端对齐通过；英文单词混排因书库正文里找不到英文样本，未能验证。
+- (c) 失败——竖向滑杆方向反了：往下拖是从第 27 章回第 20 章（往前翻），滑块 0% 在底部、100% 在顶部。根因：竖向 range 在这套 CSS（writing-mode: vertical-lr; direction: rtl）下 0 在底、100 在顶，value 直接等于全书进度就是反的。修：value/事件里用 `100 - pct` 反一下（onInput/onChange 里的 tip 与跳章都走反后的值），CSS 不动；往下拖=往后翻，滑块位置与全书进度一致。
+- (d)(e) 失败——点正文重显顶栏后，App 导航与阅读器顶栏挤在同一行重叠（导航只剩「📚 书库 检」）。根因：导航是 sticky top:0，阅读器顶栏是 fixed top:0，两栏都贴在视口顶部；`.reader.chrome-on` 的 padding-top: 52px 只给一栏留了位置。修：Reader 量导航实高（offsetHeight，换行时变高也算到，resize 时重测），阅读器顶栏 style top 顶到导航下方，正文 padding-top 改为导航高 + 顶栏高（内联样式，chrome 收起时撤掉）。
+- 另：章内标题编号与顶栏差两章（如顶栏第 27 章、章内标题「第二十五章」），是书本身目录里多了两章非正文章（前言类），不是代码问题，不修。
+- 测试：前端构建通过；后端无改动。方向与重叠待线上复测确认。
