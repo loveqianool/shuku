@@ -75,18 +75,261 @@ fn resolve_epub_path(base_dir: &Path, src: &str) -> String {
 /// Turn chapter text (plain lines + `\x01IMG:` marker lines) into the
 /// paragraphs the reader renders. `img_base` is the images endpoint
 /// prefix, e.g. `/api/books/{id}/images/`.
-pub fn paragraphs_from_text(text: &str, img_base: &str) -> Vec<crate::source::Paragraph> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            if let Some(p) = l.strip_prefix(IMG_MARKER) {
-                crate::source::Paragraph { text: None, img: Some(format!("{}{}", img_base, url_encode_path(p))) }
+
+// ---- vvsolo 通用规则移植（展示层，仅 paragraphs_from_text 用） ----
+// 来源：typeset-web/packages/core/src/transforms/{punctuation,space,number,letter}.ts
+// 与 pipelines.ts cleanup。只用于展示分段，不改存档正文与搜索索引。
+// 不搬的：Quote（跨调用 stateful masking，搬到无状态 Rust 不稳阵）、
+// Variant（改中文字形，有搜索风险）、Unicode 转义（txt 里罕见）、
+// Chapter/Separator/SerialNumber/English/End（结构类，与段落展示无关）。
+
+static PUNCT_MAP: &[(char, char)] = &[('-', '—'), ('︐', '，'), ('︑', '、'), ('︒', '。'), ('︓', '：'), ('︔', '；'), ('︕', '！'), ('︖', '？'), ('‛', '`'), ('｀', '`'), ('‐', '—'), ('━', '—'), ('―', '—'), ('─', '—'), ('ー', '—'), ('ˉ', '—'), ('﹣', '－'), ('~', '～'), ('〜', '～'), ('∽', '～'), ('∼', '～'), ('⁓', '～'), ('﹗', '！'), ('!', '！'), ('﹫', '@'), ('＠', '@'), ('﹟', '#'), ('＃', '#'), ('﹩', '$'), ('＄', '$'), ('﹪', '%'), ('％', '%'), ('﹠', '&'), ('＆', '&'), ('﹡', '＊'), ('ꁘ', '＊'), ('(', '（'), ('﹙', '（'), ('﹚', '）'), (')', '）'), ('﹐', '，'), (',', '，'), ('｡', '。'), ('.', '。'), ('．', '。'), ('∶', '：'), ('﹕', '：'), ('︰', '：'), (':', '：'), ('﹔', '；'), (';', '；'), ('､', '、'), ('丶', '、'), ('﹑', '、'), ('﹖', '？'), ('?', '？'), ('⋯', '…'), ('┅', '…'), ('¨', '…'), ('▪', '·'), ('•', '·'), ('‧', '·'), ('・', '·'), ('﹒', '·'), ('ꔷ', '·'), ('︳', '〉'), ('﹛', '｛'), ('﹜', '｝'), ('{', '｛'), ('}', '｝'), ('〝', '“'), ('〞', '”'), ('｢', '“'), ('″', '”'), ('〃', '”'), ('｣', '”'), ('‴', '”'), ('⌈', '「'), ('⌋', '」'), ('﹤', '＜'), ('﹥', '＞'), ('︿', '∧'), ('﹀', '∨'), ('＾', '^'), ('﹦', '='), ('＝', '='), ('﹢', '+'), ('＋', '+'), ('／', '/'), ('﹨', '\\'), ('＼', '\\'), ('｜', '|'), ('︱', '|'), ('¦', '|'), ('‖', '|'), ('＂', '"'), ('‟', '"'), ('′', '\''), ('＇', '\''), ];
+
+/// 全角数字字母 → 半角（vvsolo NumberLetter；全角区与半角区固定差 0xFEE0）。
+fn fullwidth_alnum_to_half(c: char) -> char {
+    let u = c as u32;
+    if (0xFF10..=0xFF19).contains(&u) || (0xFF21..=0xFF3A).contains(&u) || (0xFF41..=0xFF5A).contains(&u) {
+        char::from_u32(u - 0xFEE0).unwrap_or(c)
+    } else {
+        c
+    }
+}
+
+fn normalize_number_letter(text: &str) -> String {
+    text.chars().map(fullwidth_alnum_to_half).collect()
+}
+
+static PUNCT_MAP_LOOKUP: LazyLock<std::collections::HashMap<char, char>> =
+    LazyLock::new(|| PUNCT_MAP.iter().copied().collect());
+
+static PUNCT_R2A: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"…[，；：、。·`～—？！]+").unwrap()
+});
+static PUNCT_R2B: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[，；。·`～—？！]+…").unwrap()
+});
+static PUNCT_R2C: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"。。+|，，+").unwrap()
+});
+static PUNCT_R3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"…+").unwrap());
+static PUNCT_R4: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"……(等[，。！？、])").unwrap());
+static PUNCT_R6: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"“：|：“”").unwrap());
+static PUNCT_R7: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"、”“").unwrap());
+static PUNCT_R8: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"。）。").unwrap());
+static PUNCT_R9: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([…。，！？])”[，；：、。·`～—？！]").unwrap()
+});
+static PUNCT_R10: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([，；：、。·`])[，；：、。·`～—？！]+").unwrap()
+});
+static PUNCT_R11: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([？！])[，；：、。·`～—]+").unwrap()
+});
+static PUNCT_R12: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"～[，；：、。·`—？！]+").unwrap()
+});
+static PUNCT_R13: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[？！]{2,}").unwrap());
+
+/// vvsolo Punctuation R1：连续相同的标点（·、`°—－～：；（）［］｛｝%∧∨〈〉《》）
+/// 合并———－～ 成对化，·、`° → ……，其余留单个。
+fn merge_repeated_punct(text: &str) -> String {
+    let set = "·、`°—－～：；（）［］｛｝%∧∨〈〉《》";
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if set.contains(c) {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] == c {
+                j += 1;
+            }
+            if j - i > 1 {
+                if "—－～".contains(c) {
+                    out.push(c);
+                    out.push(c);
+                } else if "·、`°".contains(c) {
+                    out.push_str("……");
+                } else {
+                    out.push(c);
+                }
             } else {
-                crate::source::Paragraph { text: Some(l.to_string()), img: None }
+                out.push(c);
+            }
+            i = j;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// vvsolo Punctuation：先按 PUNCT_MAP 把半角/异体标点逐字映射为全角，
+/// 再跑 13 组 rps（合并重复标点、省略号/破折号后缀清理、?! 连用规范化）。
+/// 其中第 5 组（跨行的省略号行）只在整章文本层有意义，段落展示层跳过。
+fn normalize_punctuation(text: &str) -> String {
+    let mut s: String = text
+        .chars()
+        .map(|c| PUNCT_MAP_LOOKUP.get(&c).copied().unwrap_or(c))
+        .collect();
+    // R1：重复标点合并（—－～ 成对化，·、`° → ……，其余留单个）。
+    // 不用正则 backreference（Rust regex 不支援 \1），手写扫描连续相同标点。
+    s = merge_repeated_punct(&s);
+    s = PUNCT_R2A.replace_all(&s, "…").into_owned();
+    s = PUNCT_R2B.replace_all(&s, "…").into_owned();
+    s = PUNCT_R2C.replace_all(&s, "…").into_owned();
+    s = PUNCT_R3.replace_all(&s, "……").into_owned();
+    s = PUNCT_R4.replace_all(&s, "$1").into_owned();
+    s = PUNCT_R6.replace_all(&s, "：“").into_owned();
+    s = PUNCT_R7.replace_all(&s, "”、“").into_owned();
+    s = PUNCT_R8.replace_all(&s, "）。").into_owned();
+    s = PUNCT_R9.replace_all(&s, "$1”").into_owned();
+    s = PUNCT_R10.replace_all(&s, "$1").into_owned();
+    s = PUNCT_R11.replace_all(&s, "$1").into_owned();
+    s = PUNCT_R12.replace_all(&s, "～").into_owned();
+    // R13：?! 连用规范化（？ 开头 → ？！/？？？；！ 开头 → ！？/！！！）。
+    s = PUNCT_R13
+        .replace_all(&s, |caps: &regex::Captures| {
+            let m = caps.get(0).unwrap().as_str();
+            let mut it = m.chars();
+            let first = it.next().unwrap_or('？');
+            let rest: String = it.collect();
+            if first == '？' {
+                if rest.contains('！') { "？！".to_string() } else { "？？？".to_string() }
+            } else if rest.contains('？') {
+                "！？".to_string()
+            } else {
+                "！！！".to_string()
             }
         })
-        .collect()
+        .into_owned();
+    s
+}
+
+/// 是否中文或全角符号（vvsolo Space 字符组的近似：汉字+假名+注音+全角区）。
+fn is_cjk_or_fw(c: char) -> bool {
+    matches!(c,
+        '\u{2E80}'..='\u{2EFF}'
+        | '\u{2F00}'..='\u{2FDF}'
+        | '\u{3000}'..='\u{303F}'
+        | '\u{3040}'..='\u{309F}'
+        | '\u{30A0}'..='\u{30FF}'
+        | '\u{3100}'..='\u{312F}'
+        | '\u{3400}'..='\u{4DBF}'
+        | '\u{4E00}'..='\u{9FFF}'
+        | '\u{F900}'..='\u{FAFF}'
+        | '\u{FF00}'..='\u{FFEF}'
+        | '\u{20000}'..='\u{2A6DF}'
+        | '·' | '–' | '—' | '―' | '…' | '※' | '・' | '°' | '％' | '‰' | '‱' | '℃' | '℉' | '%' | '&' | '/' | '\\'
+    )
+}
+
+/// vvsolo Space：删掉汉字/全角标点及 &、/、\\ 左右两侧的多余半角空格。
+/// 整段连续空格视作一段，若其任一侧贴着中文/全角符号则整段删掉。
+fn normalize_space(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ' ' {
+            let start = i;
+            while i < chars.len() && chars[i] == ' ' {
+                i += 1;
+            }
+            let prev = if start > 0 { Some(chars[start - 1]) } else { None };
+            let next = chars.get(i).copied();
+            let adj = prev.map(is_cjk_or_fw).unwrap_or(false)
+                || next.map(is_cjk_or_fw).unwrap_or(false);
+            if !adj {
+                for _ in start..i {
+                    out.push(' ');
+                }
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 展示层通用排版：全角数字字母转半角 → 标点修正 → 空格修正。
+/// 顺序重要：标点要在断行修正之前跑（半角 . 先变全角 。，断行规则才认得出句末）。
+fn apply_typeset(text: &str) -> String {
+    let s = normalize_number_letter(text);
+    let s = normalize_punctuation(&s);
+    normalize_space(&s)
+}
+
+/// vvsolo「修正错误换行」breakPairs 的移植
+/// （typeset-web/packages/core/src/pipelines.ts，cleanup pipeline）。
+/// 网上下载的小说常带源文件定宽硬换行：行尾不是句末标点（。！？…”：；〗】）
+/// 的换行视为硬换行，删掉换行把它并回上一行；再加几组引号/省略号周围的修正。
+/// 只用于展示分段，不改存档正文与搜索索引。
+static WRONG_BREAK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([^。！？…”：；〗】])\n([^\n])").unwrap()
+});
+
+fn fix_wrong_line_breaks(block: &str) -> String {
+    // 主规则跑两遍（vvsolo 也是两遍；单遍 replace_all 会漏掉相邻的连续断行，
+    // 因为一次匹配消耗了行尾字符，下一处断行就对不上）。
+    let mut s = block.to_string();
+    for _ in 0..2 {
+        s = WRONG_BREAK_RE.replace_all(&s, "$1$2").into_owned();
+    }
+    // 引号/省略号周围的断行修正（vvsolo breakPairs 其余几组）。
+    s = s.replace("，”\n", "，”").replace("\n”", "”").replace("…\n…", "……");
+    s
+}
+
+/// Turn chapter text (plain lines + `\x01IMG:` marker lines) into the
+/// paragraphs the reader renders. `img_base` is the images endpoint
+/// prefix, e.g. `/api/books/{id}/images/`.
+///
+/// Reflow: lines are grouped into blocks by blank lines; inside a block the
+/// vvsolo wrong-break rule above joins hard-wrapped lines into one flowing
+/// paragraph, and only the line breaks it keeps (after sentence-ending
+/// punctuation) stay as paragraph boundaries. IMG marker lines are always
+/// their own paragraph and never join.
+pub fn paragraphs_from_text(text: &str, img_base: &str, reflow: bool) -> Vec<crate::source::Paragraph> {
+    let mut paras: Vec<crate::source::Paragraph> = Vec::new();
+    let mut block: Vec<String> = Vec::new();
+    let mut flush = |block: &mut Vec<String>, paras: &mut Vec<crate::source::Paragraph>| {
+        if block.is_empty() {
+            return;
+        }
+        // reflow=true（txt/缓存纯文本）才做断行合并；epub 行本身就是 HTML block，不合并。
+        let joined = if reflow {
+            fix_wrong_line_breaks(&block.join("\n"))
+        } else {
+            block.join("\n")
+        };
+        for line in joined.lines() {
+            let t = line.trim();
+            if !t.is_empty() {
+                paras.push(crate::source::Paragraph { text: Some(t.to_string()), img: None });
+            }
+        }
+        block.clear();
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            flush(&mut block, &mut paras);
+            continue;
+        }
+        if let Some(p) = t.strip_prefix(IMG_MARKER) {
+            flush(&mut block, &mut paras);
+            paras.push(crate::source::Paragraph { text: None, img: Some(format!("{}{}", img_base, url_encode_path(p))) });
+            continue;
+        }
+        // 每行先过展示层通用排版（全角转半角→标点→空格），再进块做断行修正。
+        block.push(apply_typeset(t));
+    }
+    flush(&mut block, &mut paras);
+    paras
 }
 
 /// Remove `\x01IMG:` marker lines so they never pollute the search index.
@@ -378,6 +621,37 @@ mod tests {
     }
 
     #[test]
+    fn paragraphs_join_hard_wrapped_lines() {
+        // vvsolo「修正错误换行」：源文件定宽硬换行（行尾不是句末标点）要并回一段。
+        // 取自线上实测截图的段落：三行硬换行应并成一段，不再出现「城」「省」单字孤行。
+        let text = "受害的苦主们也很开心，他们的女儿\n终得复仇，黄泉之下也能安息，整个开封城\n的人都开心，尤其是那些事不关己的平民百姓，平白无故地白吃三天的豪宴，省\n下了一大笔钱。\n\n下了一大笔钱。\n";
+        let paras = paragraphs_from_text(text, "/api/books/abc/images/", true);
+        assert_eq!(paras.len(), 2, "paras: {paras:?}");
+        assert_eq!(
+            paras[0].text.as_deref(),
+            Some("受害的苦主们也很开心，他们的女儿终得复仇，黄泉之下也能安息，整个开封城的人都开心，尤其是那些事不关己的平民百姓，平白无故地白吃三天的豪宴，省下了一大笔钱。")
+        );
+        assert_eq!(paras[1].text.as_deref(), Some("下了一大笔钱。"));
+        // 行尾是句末标点 。 的换行是真的分段，保留。
+        let text2 = "第一句话。\n第二句话。\n";
+        let paras2 = paragraphs_from_text(text2, "/api/books/abc/images/", true);
+        assert_eq!(paras2.len(), 2);
+        assert_eq!(paras2[0].text.as_deref(), Some("第一句话。"));
+        assert_eq!(paras2[1].text.as_deref(), Some("第二句话。"));
+    }
+
+    #[test]
+    fn typeset_general_rules() {
+        // vvsolo 通用规则（展示层）：半角标点转全角、全角数字字母转半角、汉字间空格删除。
+        assert_eq!(apply_typeset("你好,世界!这是test。"), "你好，世界！这是test。");
+        assert_eq!(apply_typeset("第１２３章 ＡＢＣ"), "第123章ABC");
+        assert_eq!(apply_typeset("中 文 标 点"), "中文标点");
+        // 重复标点合并：。。。→……；？！连用规范化。
+        assert_eq!(apply_typeset("真的吗。。。"), "真的吗……");
+        assert_eq!(apply_typeset("什么？！"), "什么？！");
+    }
+
+    #[test]
     fn txt_no_headings_is_single_chapter() {
         let chs = split_txt_chapters("没有章节标题的纯文本\n第二行");
         assert_eq!(chs.len(), 1);
@@ -427,7 +701,7 @@ mod tests {
         assert!(text.contains("第一段文字"));
         // Paragraphs: head <title> text (pre-existing html_to_text
         // behaviour), text, image, text — the marker never leaks into text.
-        let paras = paragraphs_from_text(text, "/api/books/abc/images/");
+        let paras = paragraphs_from_text(text, "/api/books/abc/images/", false);
         assert_eq!(paras.len(), 4);
         assert_eq!(paras[0].text.as_deref(), Some("第一章"));
         assert_eq!(paras[1].text.as_deref(), Some("第一段文字"));

@@ -222,14 +222,18 @@ async fn get_chapter(State(s): State<AppState>, Path((id, idx)): Path<(String, i
         // Cached network book: per-chapter text file.
         let f = s.config.chapter_file(&id, idx as usize);
         let text = tokio::fs::read_to_string(&f).await.unwrap_or_default();
-        parser::paragraphs_from_text(&text, &img_base)
+        // 缓存的网络书是纯文本（可能带硬换行），做断行合并。
+        parser::paragraphs_from_text(&text, &img_base, true)
     } else {
         let path = book.path.clone().ok_or_else(|| anyhow!("book has no local path"))?;
         let path = std::path::PathBuf::from(path);
+        // epub 行本身就是 HTML block，不做断行合并；txt 才合并硬换行。
+        // 注意：要在 move 进 spawn_blocking 之前算好，path 移进去后不能再用。
+        let reflow = path.extension().and_then(|e| e.to_str()) != Some("epub");
         let idx_usize = idx as usize;
         let chapters = tokio::task::spawn_blocking(move || parser::parse_book_file(&path)).await??;
         let ch = chapters.chapters.get(idx_usize).ok_or_else(|| anyhow!("chapter {idx} out of range"))?;
-        parser::paragraphs_from_text(&ch.text, &img_base)
+        parser::paragraphs_from_text(&ch.text, &img_base, reflow)
     };
     Ok(Json(json!({
         "book_id": id, "chapter_idx": idx, "title": title, "paragraphs": paras,
