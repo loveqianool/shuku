@@ -31,6 +31,29 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// Cache-Control for embedded frontend files.
+///
+/// The stale-frontend bug (2026-11-12): the backend sent no Cache-Control
+/// at all, so Cloudflare (which fronts the site) cached `sw.js` by
+/// extension and the browser cached it heuristically. The service worker
+/// update check then kept fetching the old `sw.js`, never saw the new
+/// precache manifest, and the old frontend stayed forever.
+/// - `sw.js`, `index.html`, `manifest.webmanifest`: `no-cache` — must
+///   revalidate every time, so a new deploy is picked up on next visit.
+/// - `assets/*` (Vite content-hashes filenames, e.g. `index-abc123.js`):
+///   `immutable`, safe to cache a year; the name changes when content does.
+/// - Everything else (icons, favicon): short cache.
+fn cache_control(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name == "sw.js" || name == "index.html" || name == "manifest.webmanifest" || name == "registerSW.js" {
+        "no-cache"
+    } else if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    }
+}
+
 pub async fn serve(State(_state): State<AppState>, uri: Uri) -> Response {
     let path = uri.path();
     if path.starts_with("/api/") {
@@ -49,9 +72,13 @@ pub async fn serve(State(_state): State<AppState>, uri: Uri) -> Response {
         });
         if let Some(f) = file {
             let body = f.contents().to_vec();
+            let p = f.path().to_str().unwrap_or("index.html");
             return (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type(f.path().to_str().unwrap_or("index.html")))],
+                [
+                    (header::CONTENT_TYPE, content_type(p)),
+                    (header::CACHE_CONTROL, cache_control(p)),
+                ],
                 body,
             )
                 .into_response();
@@ -60,7 +87,10 @@ pub async fn serve(State(_state): State<AppState>, uri: Uri) -> Response {
             if let Some(f) = DIST.get_file("index.html") {
                 return (
                     StatusCode::OK,
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    [
+                        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
                     f.contents().to_vec(),
                 )
                     .into_response();
@@ -77,5 +107,26 @@ pub async fn serve(State(_state): State<AppState>, uri: Uri) -> Response {
             PLACEHOLDER,
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_control;
+
+    #[test]
+    fn cache_headers() {
+        // sw.js / index.html / manifest 每次都要重新验证，否则 SW 更新检查
+        // 会拿到缓存的旧版，前端永远不变（2026-11-12 的 bug）。
+        assert_eq!(cache_control("sw.js"), "no-cache");
+        assert_eq!(cache_control("index.html"), "no-cache");
+        assert_eq!(cache_control("manifest.webmanifest"), "no-cache");
+        assert_eq!(cache_control("registerSW.js"), "no-cache");
+        // Vite 带内容 hash 的资源可长缓存，文件名变了内容就变了。
+        assert_eq!(
+            cache_control("assets/index-3S2z3f1l.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control("icons/icon-192.png"), "public, max-age=3600");
     }
 }

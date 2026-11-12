@@ -286,3 +286,13 @@
 
 - Ye 要求：CI 里的 `cargo test --release` 意义不大、浪费时间，移除。本地推送前已跑全量测试（106 单元 + 2 端到端），CI 再跑一次是重复；且 CI 的 test 跑 musl 目标、耗时更长。移除后 `binary` job 只剩：前端构建 → Rust 工具链 → cargo 缓存 → musl 交叉工具链 → musl 构建 → 上传。相关注释同步更新（删 cargo test 跑 musl 目标的说明、build + test jobs 的说法）。
 - 注意：本地测试门禁不变，推送前仍须 `cargo test --release` 全绿。
+
+## 前端更新后不变：补 Cache-Control（2026-11-12）
+
+- 问题：Ye 报更新后前端一直不变。根因是后端 `static_files::serve` 完全不发 `Cache-Control`：Cloudflare（站前有 CF）按扩展名缓存 `sw.js`，浏览器也启发式缓存，SW 更新检查每次都拿到旧版 `sw.js`，见不到新 precache 清单，旧前端一直被 serve。SW 本身没问题（`registerSW.js` 注册 `/sw.js`，`sw.js` 含 `skipWaiting` + `clientsClaim` + `precacheAndRoute`）。
+- 修法（`src/static_files.rs` 新增 `cache_control`，两个 serve 分支都带上）：
+  - `sw.js`、`index.html`、`manifest.webmanifest`、`registerSW.js` → `no-cache`（每次必重新验证，新版一部署下次访问即生效）。
+  - `assets/*`（Vite 内容 hash 文件名，内容变文件名变）→ `public, max-age=31536000, immutable`。
+  - 其余（icons 等固定名文件）→ `public, max-age=3600`。
+- 用户侧：部署后刷新一次页面即可自愈（浏览器拿新 `sw.js` 后 SW 自动更新）；若旧 SW 已钉死多时仍不变，清一次该站点的网站数据即可。
+- 测试：107 单元 + 2 端到端全绿（新增 `static_files::tests::cache_headers`）。
