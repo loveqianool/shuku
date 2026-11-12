@@ -354,12 +354,48 @@ fn build_schema() -> Schema {
     sb.build()
 }
 
+/// Remove every entry inside `dir`, keeping the directory itself.
+fn clear_dir(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&p)?;
+        } else {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
 impl SearchIndex {
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let schema = build_schema();
-        let index = Index::open_or_create(tantivy::directory::MmapDirectory::open(path)?, schema.clone())
-            .context("open tantivy index")?;
+        let index = match Index::open_or_create(
+            tantivy::directory::MmapDirectory::open(path)?,
+            schema.clone(),
+        ) {
+            Ok(index) => index,
+            // The on-disk index was built with an older schema (INDEX_VERSION
+            // bump, e.g. a new field): tantivy refuses to open it, so the
+            // process would die here before the boot scan could rebuild it
+            // (ff2aa11 added the `source` field and bricked startup on the
+            // deployed box). The index is fully derived data — books and
+            // chapters live in SQLite + files — so drop it and start empty;
+            // the boot scan re-indexes every book whose recorded version
+            // is stale.
+            Err(tantivy::TantivyError::SchemaError(msg)) => {
+                tracing::warn!("tantivy index schema mismatch ({msg}); rebuilding index from scratch");
+                clear_dir(path)?;
+                Index::open_or_create(
+                    tantivy::directory::MmapDirectory::open(path)?,
+                    schema.clone(),
+                )
+                .context("open tantivy index after rebuild")?
+            }
+            Err(e) => return Err(e).context("open tantivy index"),
+        };
         index.tokenizers().register("jieba", JiebaTokenizer::new());
         index.tokenizers().register("raw", tantivy::tokenizer::RawTokenizer::default());
         let writer = index.writer_with_num_threads(writer_threads(), writer_heap_bytes())?;
@@ -806,6 +842,34 @@ mod tests {
         assert_eq!(pinyin_text("第1章 第0本第1回"), "di zhang di ben di hui dizhangdibendihui d dz dzd dzdb dzdbd dzdbdh");
         assert_eq!(pinyin_text("Harry Potter"), "");
         assert_eq!(pinyin_text(""), "");
+    }
+
+    #[test]
+    fn open_rebuilds_index_with_stale_schema() {
+        // Regression: ff2aa11 added the `source` field (INDEX_VERSION 3→4)
+        // and the deployed binary died at startup — open_or_create refuses
+        // an on-disk index whose schema differs, before the boot scan
+        // could rebuild it. open() must drop the stale index and start
+        // empty instead of failing.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("probe-stale-schema-{}", uuid::Uuid::new_v4()));
+        // Old schema: same shape minus the `source` field.
+        let mut sb = tantivy::schema::SchemaBuilder::default();
+        sb.add_text_field("book_id", tantivy::schema::TextOptions::default().set_stored());
+        let old_schema = sb.build();
+        {
+            std::fs::create_dir_all(&dir).unwrap();
+            let old = Index::create_in_dir(&dir, old_schema).unwrap();
+            let mut w = old.writer(50_000_000).unwrap();
+            w.add_document(doc!(old.schema().get_field("book_id").unwrap() => "b1"))
+                .unwrap();
+            w.commit().unwrap();
+        }
+        let idx = SearchIndex::open(&dir).unwrap();
+        assert!(idx.index.schema().get_field("source").is_ok());
+        assert_eq!(idx.index.reader().unwrap().searcher().num_docs(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
