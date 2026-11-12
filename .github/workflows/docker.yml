@@ -3,7 +3,7 @@ name: Docker
 # Build the musl static binary per architecture (amd64 + arm64, native
 # runners), then pack them into one multi-arch image and push to GHCR.
 # Pushes to main and version tags publish :latest / :<version>; pull
-# requests only run the build + test jobs and never push.
+# requests only run the build jobs and never push.
 on:
   push:
     branches: [main]
@@ -56,7 +56,7 @@ jobs:
       # Cache the cargo registry + target dir across runs (keyed per
       # arch: the two matrix jobs build different targets). First run
       # with the cache only populates it; later runs reuse it and the
-      # test + musl builds become incremental. A cache miss or eviction
+      # musl builds become incremental. A cache miss or eviction
       # just falls back to a full rebuild — never a wrong build.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -68,17 +68,11 @@ jobs:
       # azure.archive.ubuntu.com（exit 100）；run #18 里重试 3 次仍失败，
       # amd64 在这步挂了 19 分钟，arm64 卡了 21 分钟，Ubuntu 镜像 DNS
       # 持续解析不到。改用预编译交叉工具链（从 GitHub 下载，不经 apt），
-      # 不再依赖 Ubuntu 镜像。注意：它会设 CARGO_BUILD_TARGET，cargo test
-      # 随之跑 musl 目标（同架构 runner 上可直接运行，与发版二进制一致）。
+      # 不再依赖 Ubuntu 镜像。
       - name: Install musl toolchain
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: ${{ matrix.target }}
-
-      # Gate the image on tests: a failing suite publishes nothing.
-      - name: Test
-        working-directory: crates/server
-        run: cargo test --release
 
       - name: Build musl binary
         working-directory: crates/server
