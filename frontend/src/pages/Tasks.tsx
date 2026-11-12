@@ -4,6 +4,9 @@ import { api, type BookWithIssues, type TaskItem, type TaskStats } from "../lib/
 const Tasks: Component = () => {
   const [type, setType] = createSignal<"scan" | "crawl" | undefined>(undefined);
   const [tasks, setTasks] = createSignal<TaskItem[]>([]);
+  const [total, setTotal] = createSignal(0);
+  const [page, setPage] = createSignal(1);
+  const [loadingMore, setLoadingMore] = createSignal(false);
   const [stats, setStats] = createSignal<TaskStats | null>(null);
   const [issueBooks, setIssueBooks] = createSignal<BookWithIssues[]>([]);
   const [error, setError] = createSignal("");
@@ -15,9 +18,10 @@ const Tasks: Component = () => {
 
   const refresh = async () => {
     try {
-      const [t, s] = await Promise.all([api.listTasks(type(), undefined), api.taskStats()]);
+      const [t, s] = await Promise.all([api.listTasks(type(), undefined, 1, 20), api.taskStats()]);
       setTasks(t.items);
-      setStats(s);
+      setTotal(t.total);
+      setPage(1);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -29,6 +33,21 @@ const Tasks: Component = () => {
     }
   };
   refresh();
+
+  // 加载更多：下一页追加到列表（刷新/换筛选条件时回到第 1 页）。
+  const loadMore = async () => {
+    if (loadingMore() || tasks().length >= total()) return;
+    setLoadingMore(true);
+    try {
+      const t = await api.listTasks(type(), undefined, page() + 1, 20);
+      setTasks([...tasks(), ...t.items]);
+      setPage(page() + 1);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   const act = async (fn: () => Promise<unknown>, msg: string) => {
     setError(""); setOk("");
@@ -98,6 +117,11 @@ const Tasks: Component = () => {
         )}
       </For>
       <Show when={tasks().length === 0}><p class="muted">当前队列为空。</p></Show>
+      <Show when={tasks().length > 0 && tasks().length < total()}>
+        <button onClick={loadMore} disabled={loadingMore()}>
+          {loadingMore() ? "加载中…" : `加载更多（还剩 ${total() - tasks().length} 条）`}
+        </button>
+      </Show>
     </div>
   );
 };

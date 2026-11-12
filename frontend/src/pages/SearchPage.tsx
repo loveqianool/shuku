@@ -6,7 +6,9 @@ const SearchPage: Component = () => {
   const [scope, setScope] = createSignal<SearchScope>("all");
   const [hits, setHits] = createSignal<SearchHit[]>([]);
   const [total, setTotal] = createSignal(0);
+  const [page, setPage] = createSignal(1);
   const [loading, setLoading] = createSignal(false);
+  const [loadingMore, setLoadingMore] = createSignal(false);
   const [error, setError] = createSignal("");
   const [searched, setSearched] = createSignal(false);
   const [suggestions, setSuggestions] = createSignal<Suggestion[]>([]);
@@ -52,6 +54,7 @@ const SearchPage: Component = () => {
     // 先清旧结果：新搜索加载中旧命中还挂着，会误以为是这次的结果。
     setHits([]);
     setTotal(0);
+    setPage(1);
     try {
       const res = await api.search(q().trim(), scope(), 1, 20);
       setHits(res.items);
@@ -60,6 +63,21 @@ const SearchPage: Component = () => {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
+    }
+  };
+
+  // 加载更多：下一页追加到结果列表。
+  const loadMore = async () => {
+    if (loading() || loadingMore() || hits().length >= total()) return;
+    setLoadingMore(true);
+    try {
+      const res = await api.search(q().trim(), scope(), page() + 1, 20);
+      setHits([...hits(), ...res.items]);
+      setPage(page() + 1);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingMore(false);
     }
   };
 
@@ -115,6 +133,11 @@ const SearchPage: Component = () => {
           )}
         </For>
         <Show when={hits().length === 0}><p class="muted">没有命中，换个关键词试试。</p></Show>
+        <Show when={hits().length > 0 && hits().length < total()}>
+          <button onClick={loadMore} disabled={loadingMore()}>
+            {loadingMore() ? "加载中…" : `加载更多（还剩 ${total() - hits().length} 个）`}
+          </button>
+        </Show>
       </Show>
     </div>
   );

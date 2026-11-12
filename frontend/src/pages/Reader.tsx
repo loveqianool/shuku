@@ -146,12 +146,20 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     if (n === 0 || downloading()) return;
     setDownloading(true);
     setDownloadProgress(0);
+    const controller = new AbortController();
+    downloadController = controller;
     try {
-      await downloadBook(props.bookId, n, setDownloadProgress);
+      await downloadBook(props.bookId, n, setDownloadProgress, { signal: controller.signal });
     } finally {
+      downloadController = undefined;
       setDownloading(false);
       refreshOffline();
     }
+  };
+  // 取消整本离线：中断进行中的章节请求，worker 循环停下来不再取下一章。
+  let downloadController: AbortController | undefined;
+  const cancelDownload = () => {
+    downloadController?.abort();
   };
   const clearOffline = async () => {
     await deleteOfflineBook(props.bookId, toc().length);
@@ -863,9 +871,13 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         <button disabled={downloading() || toc().length === 0} onClick={downloadWholeBook}>
           {downloading() ? `下载中 ${downloadProgress()} / ${toc().length}` : "下载整本离线读"}
         </button>
+        <Show when={downloading()}>
+          <button onClick={cancelDownload}>取消</button>
+        </Show>
         <Show when={(offlineCount() ?? 0) > 0 && !downloading()}>
           <button onClick={clearOffline}>删除离线缓存</button>
         </Show>
+        <span class="muted">整本离线与全库共享缓存：最多 5000 章、保留 30 天</span>
       </div>
 
       <div class="card row">

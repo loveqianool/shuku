@@ -151,7 +151,7 @@ const Bookshelf: Component = () => {
                   style={{ position: "absolute", top: "0", left: "0", width: "100%", transform: `translateY(${item.start}px)`, height: `${item.size}px`, display: "flex", gap: "8px", "align-items": "center" }}
                   onClick={() => (location.hash = `#/read/${encodeURIComponent(b().id)}`)}
                 >
-                  <Show when={b().cover}>
+                  <Show when={b().cover_mime}>
                     <img src={`/api/books/${encodeURIComponent(b().id)}/cover`} alt="" style={{ height: "56px", width: "40px", "object-fit": "cover", "flex-shrink": "0" }} />
                   </Show>
                   <div style={{ "min-width": "0" }}>
