@@ -96,8 +96,10 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 /* 拖动竖向滑杆时的提示：目标章节 + 全书百分比，停 1.2 秒后淡出。 */
 .book-tip { position: fixed; right: 32px; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 10px 14px; border-radius: 8px; z-index: 25; font-size: 14px; white-space: nowrap; opacity: 1; transition: opacity 0.3s; pointer-events: none; }
 .book-tip.fading { opacity: 0; }
-/* 顶栏/底栏显示时留出上下空间，免得固定顶栏/底栏盖住正文。 */
-.reader.chrome-on { padding-top: 52px; padding-bottom: 120px; }
+/* 阅读页顶栏（.nav.nav-overlay）是 fixed 浮层：显示/隐藏时不占文档流
+   空间，阅读区内容不动、不重新排版。顶栏、阅读器顶栏、底栏三者都浮
+   在正文之上，点正文唤出/收起只遮住部分正文，不改变阅读区本身。 */
+.nav.nav-overlay { position: fixed; top: 0; left: 50%; transform: translateX(-50%); width: min(960px, calc(100% - 24px)); }
 
 table.logs { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.logs td, table.logs th { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }

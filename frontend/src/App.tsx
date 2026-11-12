@@ -74,7 +74,7 @@ const App: Component = () => {
   return (
     <div class="app">
       <Show when={route().name !== "read" || readerChrome()}>
-      <nav class="nav">
+      <nav class="nav" classList={{ "nav-overlay": route().name === "read" }}>
         <a href="#/" class={route().name === "books" ? "brand active" : "brand"}>📚 书库</a>
         <a href="#/search" class={route().name === "search" ? "active" : ""}>检索</a>
         <a href="#/sources" class={route().name === "sources" || route().name === "test" ? "active" : ""}>书源</a>

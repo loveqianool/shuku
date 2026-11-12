@@ -351,3 +351,14 @@
 - 真正根因：`.reader-content p` 的 `word-break: keep-all`。Firefox 对中文的处理是 `keep-all` 禁止在汉字之间断行，只允许在标点/空格处断行；一个 147 字的长段因此只能在逗号、句号、引号处断开，变成每行 10 来字、行行停在标点后的短行。Chromium 对中文 `keep-all` 的处理不同，会在字间断行，所以桌面浏览器测出来是满行。
 - 修法：`frontend/src/styles.css` 的 `.reader-content p` 删掉 `word-break: keep-all`（改回默认 `normal`，Firefox 即可在汉字间断行填满行宽）；保留 `line-break: strict; hanging-punctuation: first; text-wrap: pretty; overflow-wrap: break-word;`。构建产物已确认无 `keep-all`。
 - 测试：107 单元 + 2 端到端全绿（纯 CSS 改动，后端未动）。
+
+## 顶栏/底栏改为浮层，显示/隐藏不改变阅读区（2026-11-12）
+
+- Ye 指出：显示/隐藏顶栏底栏时不应改变阅读区内容，现在会压阅读区窗口、导致内容变了。
+- 根因：`.reader` 在 chrome 显示时加了两重 padding——CSS `.reader.chrome-on` 的 `padding-top: 52px; padding-bottom: 120px` + inline `padding-top: navH()+barH()`；另 App 顶栏 `.nav` 是 `position: sticky`，显示时占文档流空间、把内容往下推。chrome 一开一合，阅读区高度来回变、内容重新排版、可见文字跟着变。
+- 修法（全部改为浮层，不占文档流空间，内容不动）：
+  - `frontend/src/pages/Reader.tsx`：`.reader` 删掉 `chrome-on` class 与 inline `padding-top`；删掉只为 padding 服务的 `barH` 信号与 `barRef`。
+  - `frontend/src/styles.css`：删掉 `.reader.chrome-on` 规则；新增 `.nav.nav-overlay`（`position: fixed; top: 0; left: 50%; transform: translateX(-50%); width: min(960px, calc(100% - 24px))`）。
+  - `frontend/src/App.tsx`：阅读页的 `<nav>` 加 `classList={{ "nav-overlay": route().name === "read" }}`，只在阅读页变 fixed 浮层，其他页仍是 sticky。
+  - 效果：顶栏、阅读器顶栏、底栏三者都浮在正文之上，点正文唤出/收起只遮住部分正文，阅读区高度与内容完全不动。`navH` 仍量导航实高，用来把阅读器顶栏顶到导航下方（fixed 元素的 offsetHeight 照常可量）。
+- 测试：107 单元 + 2 端到端全绿（纯前端改动，后端未动）。

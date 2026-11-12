@@ -77,16 +77,13 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [scrollFrac, setScrollFrac] = createSignal(0);
   // 竖向全书滑杆拖动中的值（null 表示没在拖），松手才跳章，免得拖动时反复加载。
   const [bookDrag, setBookDrag] = createSignal<number | null>(null);
-  // 顶栏两行叠放：App 导航（sticky，顶 0）+ 阅读器顶栏（fixed）。
+  // 顶栏两行叠放：App 导航（阅读页 fixed 浮层）+ 阅读器顶栏（fixed）。
   // 导航高度随屏宽换行而变，量实高再把阅读器顶栏顶到导航下方，
   // 免得两栏在视口顶部重叠；窗口变宽/窄时重测。
-  let barRef: HTMLDivElement | undefined;
   const [navH, setNavH] = createSignal(0);
-  const [barH, setBarH] = createSignal(0);
   const measureBars = () => {
     const nav = document.querySelector(".nav") as HTMLElement | null;
     setNavH(nav ? nav.offsetHeight : 0);
-    if (barRef) setBarH(barRef.offsetHeight);
   };
   createEffect(() => {
     if (showChrome()) requestAnimationFrame(measureBars);
@@ -540,9 +537,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const ch = () => chapter();
 
   return (
-    <div class="reader" classList={{ "chrome-on": showChrome() }} style={{ "padding-top": showChrome() ? `${navH() + barH()}px` : undefined }}>
+    <div class="reader">
       <Show when={showChrome()}>
-        <div class="reader-bar" ref={barRef} style={{ top: `${navH()}px` }}>
+        <div class="reader-bar" style={{ top: `${navH()}px` }}>
           <a href="#/">‹ 书库</a>
           <strong>{book()?.title ?? "…"}</strong>
           <span class="muted">第 {idx() + 1} 章 / 共 {toc().length} 章</span>
