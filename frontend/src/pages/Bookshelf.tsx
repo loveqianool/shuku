@@ -1,4 +1,4 @@
-import { createSignal, createEffect, onMount, For, Show, type Component } from "solid-js";
+import { createSignal, createEffect, onCleanup, onMount, For, Show, type Component } from "solid-js";
 import { createVirtualizer } from "@tanstack/solid-virtual";
 import { api, type Book, type RecentBook } from "../lib/api";
 
@@ -9,6 +9,16 @@ const Bookshelf: Component = () => {
   const [author, setAuthor] = createSignal("");
   const [tag, setTag] = createSignal("");
   const [sort, setSort] = createSignal("updated");
+  // 防抖后的筛选值（250ms）：每敲一字就发请求太浪费，输入框即时回显，
+  // 真正拉列表只跟防抖后的值。
+  const [dq, setDq] = createSignal("");
+  const [dauthor, setDauthor] = createSignal("");
+  const [dtag, setDtag] = createSignal("");
+  createEffect(() => {
+    const qq = q(); const aa = author(); const tt = tag();
+    const t = setTimeout(() => { setDq(qq); setDauthor(aa); setDtag(tt); }, 250);
+    onCleanup(() => clearTimeout(t));
+  });
   const [books, setBooks] = createSignal<Book[]>([]);
   const [total, setTotal] = createSignal(0);
   const [page, setPage] = createSignal(1);
@@ -26,7 +36,7 @@ const Bookshelf: Component = () => {
     setLoading(true);
     setError("");
     try {
-      const res = await api.listBooks({ q: q(), author: author(), tag: tag(), sort: sort(), page: p, page_size: PAGE_SIZE });
+      const res = await api.listBooks({ q: dq(), author: dauthor(), tag: dtag(), sort: sort(), page: p, page_size: PAGE_SIZE });
       if (my !== loadSeq) return;
       setBooks(append ? [...books(), ...res.items] : res.items);
       setTotal(res.total);
@@ -52,7 +62,7 @@ const Bookshelf: Component = () => {
   // 筛选变化时回到第 1 页并滚回顶部（否则虚拟列表还停在旧的滚动位置，
   // 配合同步滞后的测量缓存会渲染到越界的旧索引）。
   createEffect(() => {
-    void q(); void author(); void tag(); void sort();
+    void dq(); void dauthor(); void dtag(); void sort();
     parentRef?.scrollTo({ top: 0 });
     load(1, false);
   });

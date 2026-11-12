@@ -360,7 +360,10 @@ async fn download(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if "/\\?%*:|\"<>".contains(c) { '_' } else { c })
+        // Control characters (\n, \r, \0, ...) would corrupt the
+        // Content-Disposition header value (header injection); strip them
+        // the same way as the path-unsafe punctuation.
+        .map(|c| if c.is_control() || "/\\?%*:|\"<>".contains(c) { '_' } else { c })
         .collect()
 }
 

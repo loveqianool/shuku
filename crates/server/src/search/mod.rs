@@ -539,12 +539,12 @@ impl SearchIndex {
         let total = searcher.search(&*query, &tantivy::collector::Count)?;
         let mut snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_content)?;
         snippet_gen.set_max_num_chars(400);
-        let mut title_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_chapter_title)?;
-        title_snippet_gen.set_max_num_chars(120);
-        let mut book_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_book_title)?;
-        book_snippet_gen.set_max_num_chars(120);
-        let mut pinyin_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_pinyin)?;
-        pinyin_snippet_gen.set_max_num_chars(120);
+        // Fallback generators (title / book / pinyin) are created lazily:
+        // most hits match in the content, so building all four up front
+        // wastes a tokenizer+highlighter setup on every search.
+        let mut title_snippet_gen: Option<SnippetGenerator> = None;
+        let mut book_snippet_gen: Option<SnippetGenerator> = None;
+        let mut pinyin_snippet_gen: Option<SnippetGenerator> = None;
         let mut hits = Vec::new();
         for (score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
@@ -556,26 +556,29 @@ impl SearchIndex {
                 .replace("</b>", "</em>");
             if snippet.is_empty() {
                 // Match was in the title/author, not the body: highlight there.
-                snippet = title_snippet_gen
-                    .snippet_from_doc(&doc)
-                    .to_html()
-                    .replace("<b>", "<em>")
-                    .replace("</b>", "</em>");
+                if title_snippet_gen.is_none() {
+                    title_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_chapter_title).ok().map(|mut g| { g.set_max_num_chars(120); g });
+                }
+                if let Some(g) = title_snippet_gen.as_mut() {
+                    snippet = g.snippet_from_doc(&doc).to_html().replace("<b>", "<em>").replace("</b>", "</em>");
+                }
             }
             if snippet.is_empty() {
-                snippet = book_snippet_gen
-                    .snippet_from_doc(&doc)
-                    .to_html()
-                    .replace("<b>", "<em>")
-                    .replace("</b>", "</em>");
+                if book_snippet_gen.is_none() {
+                    book_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_book_title).ok().map(|mut g| { g.set_max_num_chars(120); g });
+                }
+                if let Some(g) = book_snippet_gen.as_mut() {
+                    snippet = g.snippet_from_doc(&doc).to_html().replace("<b>", "<em>").replace("</b>", "</em>");
+                }
             }
             if snippet.is_empty() {
                 // Match was only via pinyin: show the matched pinyin.
-                snippet = pinyin_snippet_gen
-                    .snippet_from_doc(&doc)
-                    .to_html()
-                    .replace("<b>", "<em>")
-                    .replace("</b>", "</em>");
+                if pinyin_snippet_gen.is_none() {
+                    pinyin_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_pinyin).ok().map(|mut g| { g.set_max_num_chars(120); g });
+                }
+                if let Some(g) = pinyin_snippet_gen.as_mut() {
+                    snippet = g.snippet_from_doc(&doc).to_html().replace("<b>", "<em>").replace("</b>", "</em>");
+                }
             }
             // One tantivy fragment per chapter made results look
             // incomplete; show up to 5 windows around literal

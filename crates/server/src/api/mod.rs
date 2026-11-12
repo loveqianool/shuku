@@ -10,7 +10,7 @@ use crate::search::SearchIndex;
 use crate::source::{Engine, SourceDef};
 use anyhow::{anyhow, Context, Result};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 #[derive(Clone)]
@@ -66,7 +67,9 @@ pub struct PageQuery {
 
 impl PageQuery {
     fn page(&self) -> i64 {
-        self.page.unwrap_or(1).max(1)
+        // Upper bound so (page - 1) * page_size can never overflow i64
+        // (page_size is clamped to 500; 10000 * 500 = 5,000,000).
+        self.page.unwrap_or(1).clamp(1, 10000)
     }
     fn page_size(&self) -> i64 {
         self.page_size.unwrap_or(20).clamp(1, 500)
@@ -125,6 +128,14 @@ pub fn router(state: AppState) -> Router {
         .fallback(crate::static_files::serve)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+        // API responses must not be cached by browsers or the CDN in front
+        // of the service (stale JSON / progress / task state is a real bug
+        // source). `if_not_present` leaves the static-file handler's own
+        // Cache-Control (sw.js no-cache, hashed assets immutable) untouched.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .with_state(state)
 }
 
@@ -195,12 +206,25 @@ async fn delete_book(State(s): State<AppState>, Path(id): Path<String>) -> ApiRe
     if deleted {
         // Index + files are best-effort: the DB row is already gone, so
         // a stale index doc or leftover file is harmless and gets
-        // rebuilt/cleaned on the next scan.
+        // rebuilt/cleaned on the next scan. Failures are logged (not
+        // swallowed) so a broken index dir or permission problem is visible.
         let id_num: u64 = id.parse().unwrap_or(0);
         let search = s.search.clone();
-        let _ = tokio::task::spawn_blocking(move || search.delete_book(id_num)).await;
-        let _ = std::fs::remove_dir_all(s.config.data_dir.join("chapters").join(&id));
-        let _ = std::fs::remove_file(s.config.data_dir.join("covers").join(&id));
+        // spawn_blocking gives Result<Result<()>, JoinError>: flatten both
+        // layers so an index failure is logged, not silently dropped.
+        let idx_res = tokio::task::spawn_blocking(move || search.delete_book(id_num))
+            .await
+            .map_err(|e| anyhow::anyhow!("join: {e}"))
+            .and_then(|r| r);
+        if let Err(e) = idx_res {
+            tracing::warn!(book_id = %id, error = %e, "delete_book: index cleanup failed");
+        }
+        if let Err(e) = std::fs::remove_dir_all(s.config.data_dir.join("chapters").join(&id)) {
+            tracing::warn!(book_id = %id, error = %e, "delete_book: chapter files cleanup failed");
+        }
+        if let Err(e) = std::fs::remove_file(s.config.data_dir.join("covers").join(&id)) {
+            tracing::warn!(book_id = %id, error = %e, "delete_book: cover cleanup failed");
+        }
     }
     Ok(Json(json!({ "deleted": deleted })))
 }
@@ -218,12 +242,15 @@ async fn get_chapter(State(s): State<AppState>, Path((id, idx)): Path<(String, i
     let book: BookRow = s.db.get_book(&id).await?.ok_or_else(|| anyhow!("book not found: {id}"))?;
     let title = s.db.get_chapter_title(&id, idx).await?.unwrap_or_default();
     let img_base = format!("/api/books/{id}/images/");
-    let paras: Vec<crate::source::Paragraph> = if book.source == "cached" {
+    // Raw chapter text first; the regex typesetting below is CPU-heavy and
+    // must not run on the async runtime thread (it used to run inline here
+    // for cached books, blocking the event loop for the whole chapter).
+    let (text, reflow): (String, bool) = if book.source == "cached" {
         // Cached network book: per-chapter text file.
         let f = s.config.chapter_file(&id, idx as usize);
         let text = tokio::fs::read_to_string(&f).await.unwrap_or_default();
         // 缓存的网络书是纯文本（可能带硬换行），做断行合并。
-        parser::paragraphs_from_text(&text, &img_base, true)
+        (text, true)
     } else {
         let path = book.path.clone().ok_or_else(|| anyhow!("book has no local path"))?;
         let path = std::path::PathBuf::from(path);
@@ -233,8 +260,10 @@ async fn get_chapter(State(s): State<AppState>, Path((id, idx)): Path<(String, i
         let idx_usize = idx as usize;
         let chapters = tokio::task::spawn_blocking(move || parser::parse_book_file(&path)).await??;
         let ch = chapters.chapters.get(idx_usize).ok_or_else(|| anyhow!("chapter {idx} out of range"))?;
-        parser::paragraphs_from_text(&ch.text, &img_base, reflow)
+        (ch.text.clone(), reflow)
     };
+    let paras: Vec<crate::source::Paragraph> =
+        tokio::task::spawn_blocking(move || parser::paragraphs_from_text(&text, &img_base, reflow)).await?;
     Ok(Json(json!({
         "book_id": id, "chapter_idx": idx, "title": title, "paragraphs": paras,
     })))
@@ -463,8 +492,17 @@ async fn get_source(State(s): State<AppState>, Path(id): Path<String>) -> ApiRes
 async fn update_source(State(s): State<AppState>, Path(id): Path<String>, Json(raw): Json<Value>) -> ApiResult<Json<Value>> {
     crate::source::validate_source(&raw).map_err(|e| anyhow!("invalid source: {e}"))?;
     let mut raw = raw;
-    if raw.get("bookSourceUrl").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
-        raw["bookSourceUrl"] = json!(id);
+    // The path id and the body's bookSourceUrl must agree: silently
+    // upserting under the body's id would update a *different* source
+    // than the URL names (or create a new one under an unrelated id).
+    match raw.get("bookSourceUrl").and_then(|v| v.as_str()) {
+        Some(u) if !u.is_empty() && u != id => {
+            return Err(anyhow!("path id {id} does not match bookSourceUrl {u}").into());
+        }
+        Some(u) if u.is_empty() => {
+            raw["bookSourceUrl"] = json!(id);
+        }
+        _ => {}
     }
     let saved = s.db.upsert_source(&raw).await?;
     Ok(Json(json!({ "id": saved })))
@@ -610,8 +648,8 @@ async fn add_bookmark(State(s): State<AppState>, Path(id): Path<String>, Json(re
     Ok(Json(json!({ "id": bid })))
 }
 
-async fn delete_bookmark(State(s): State<AppState>, Path((_id, bid)): Path<(String, String)>) -> ApiResult<Json<Value>> {
-    let ok = s.db.delete_bookmark(&bid).await?;
+async fn delete_bookmark(State(s): State<AppState>, Path((id, bid)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    let ok = s.db.delete_bookmark(&id, &bid).await?;
     Ok(Json(json!({ "ok": ok })))
 }
 
@@ -660,18 +698,15 @@ impl TaskListQuery {
 }
 
 async fn list_tasks(State(s): State<AppState>, Query(q): Query<TaskListQuery>) -> ApiResult<Json<Value>> {
-    let tables: Vec<&str> = match q.r#type.as_deref() {
-        Some("scan") => vec!["scan_tasks"],
-        Some("crawl") => vec!["crawl_tasks"],
-        _ => vec!["scan_tasks", "crawl_tasks"],
+    let (items, total) = match q.r#type.as_deref() {
+        Some("scan") => s.db.list_tasks("scan_tasks", q.status.clone(), q.pq().page(), q.pq().page_size()).await?,
+        Some("crawl") => s.db.list_tasks("crawl_tasks", q.status.clone(), q.pq().page(), q.pq().page_size()).await?,
+        // No type: one UNION ALL query, ordered by created_at and paginated
+        // once (db::list_all_tasks). Querying each table with the same page
+        // and concatenating returned up to 2*page_size rows on page 1 and
+        // each table's own page 2 afterwards.
+        _ => s.db.list_all_tasks(q.status.clone(), q.pq().page(), q.pq().page_size()).await?,
     };
-    let mut items = vec![];
-    let mut total = 0;
-    for t in tables {
-        let (mut rows, n) = s.db.list_tasks(t, q.status.clone(), q.pq().page(), q.pq().page_size()).await?;
-        total += n;
-        items.append(&mut rows);
-    }
     Ok(page_envelope(items, total, q.pq().page(), q.pq().page_size()))
 }
 
@@ -682,6 +717,18 @@ pub struct ScanReq {
 
 async fn trigger_scan(State(s): State<AppState>, body: Option<Json<ScanReq>>) -> ApiResult<Json<Value>> {
     let req = body.map(|Json(r)| r).unwrap_or(ScanReq { path: None });
+    // Containment: a scan path must live inside the configured books dir.
+    // Without this, POST /api/tasks/scan with an arbitrary path would make
+    // the scanner read (and index) any txt/epub file on the host.
+    if let Some(p) = &req.path {
+        let canon = std::fs::canonicalize(p)
+            .map_err(|e| anyhow!("scan path not found or not readable: {p} ({e})"))?;
+        let base = std::fs::canonicalize(&s.config.books_dir)
+            .map_err(|e| anyhow!("books dir not readable: {} ({e})", s.config.books_dir.display()))?;
+        if !canon.starts_with(&base) {
+            return Err(anyhow!("scan path must be inside the books dir: {p}").into());
+        }
+    }
     let payload = serde_json::json!({ "path": req.path }).to_string();
     let id = s.db.enqueue_task("scan_tasks", "scan", &payload).await?;
     Ok(Json(json!({ "id": id, "status": "pending" })))

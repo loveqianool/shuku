@@ -283,16 +283,22 @@ async fn parse_one_file(
 
 /// Scan `dir` (recursive). Parses + indexes only files whose mtime changed
 /// or that were never indexed.
-pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, data_dir: &Path) -> Result<ScanReport> {
+///
+/// `full_scan` must be true only when `dir` is the whole books dir: the
+/// "file vanished -> mark broken" step compares the walked files against
+/// every known book, so a partial scan (one file from the watcher, or a
+/// subdirectory from POST /api/tasks/scan) would otherwise mark the whole
+/// library broken. A partial scan only (re)indexes what it walks.
+pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, data_dir: &Path, full_scan: bool) -> Result<ScanReport> {
     let mut report = ScanReport::default();
     if !dir.exists() {
         info!(target: "scan", dir = %dir.display(), "books dir does not exist, skipping");
         return Ok(report);
     }
     let known = db.all_book_paths().await?;
-    let mut known_map: HashMap<String, (String, i64, i64)> = HashMap::new();
-    for (id, path, mtime, iv) in known {
-        known_map.insert(path, (id, mtime, iv));
+    let mut known_map: HashMap<String, (String, i64, i64, String)> = HashMap::new();
+    for (id, path, mtime, iv, status) in known {
+        known_map.insert(path, (id, mtime, iv, status));
     }
     let mut found: Vec<PathBuf> = Vec::new();
     for entry in WalkDir::new(dir).follow_links(false).into_iter().filter_map(|e| e.ok()) {
@@ -302,11 +308,13 @@ pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, dat
         }
     }
     let found_set: std::collections::HashSet<String> = found.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-    for (path, (id, _mtime, _iv)) in &known_map {
-        if !found_set.contains(path) {
-            // File vanished: mark broken (do not delete metadata silently).
-            let _ = db.mark_book_status(id, "broken").await;
-            report.removed += 1;
+    if full_scan {
+        for (path, (id, _mtime, _iv, _status)) in &known_map {
+            if !found_set.contains(path) {
+                // File vanished: mark broken (do not delete metadata silently).
+                let _ = db.mark_book_status(id, "broken").await;
+                report.removed += 1;
+            }
         }
     }
     // Cheap stat pass first (sequential): only changed / new files need work.
@@ -316,7 +324,10 @@ pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, dat
         let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
         let path_str = path.to_string_lossy().into_owned();
         let needs_index = match known_map.get(&path_str) {
-            Some((_, old_mtime, iv)) => *old_mtime != mtime || *iv < INDEX_VERSION,
+            // A book stuck at status=broken (e.g. marked by an old buggy
+            // partial scan) is re-indexed even when its mtime is unchanged,
+            // so a later full scan heals it instead of leaving it broken.
+            Some((_, old_mtime, iv, status)) => *old_mtime != mtime || *iv < INDEX_VERSION || status == "broken",
             None => true,
         };
         if !needs_index {
@@ -481,20 +492,50 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         let book = write_txt(&tmp, "test.txt", "第一章 开始\n少年修仙。\n第二章 练功\n打坐修炼。\n");
-        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data")).await.unwrap();
+        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
         assert_eq!(r1.indexed, 1);
         assert_eq!(r1.broken, 0);
-        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data")).await.unwrap();
+        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
         assert_eq!(r2.indexed, 0, "unchanged book must not be re-indexed");
         assert_eq!(r2.unchanged, 1);
         // Touch the file: new mtime forces re-index.
         let later = SystemTime::now() + std::time::Duration::from_secs(2);
         filetime_set(&book, later);
-        let r3 = scan_once(&db, &search, &tmp, &tmp.join("data")).await.unwrap();
+        let r3 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
         assert_eq!(r3.indexed, 1, "mtime change must trigger re-index");
         // Search must see the content.
         let (hits, _) = search.search("修仙", None, 10, 0).unwrap();
         assert!(!hits.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn partial_scan_does_not_mark_others_broken() {
+        // Regression: the watcher enqueues a scan with path=<one file>, and
+        // POST /api/tasks/scan accepts a subdirectory. scan_once used to
+        // compare the walked files against EVERY known book and mark the
+        // rest "broken". A partial scan must only (re)index what it walks.
+        let tmp = std::env::temp_dir().join(format!("shuku-scan-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = Database::open_in_memory().await.unwrap();
+        let search = Arc::new(SearchIndex::open_in_ram().unwrap());
+        write_txt(&tmp, "a.txt", "第一章 甲\n内容甲。\n");
+        let b = write_txt(&tmp, "b.txt", "第一章 乙\n内容乙。\n");
+        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        assert_eq!(r1.indexed, 2);
+        // Partial scan of a single file (what the watcher enqueues).
+        let r2 = scan_once(&db, &search, &b, &tmp.join("data"), false).await.unwrap();
+        assert_eq!(r2.broken, 0, "partial scan must not mark other books broken");
+        let (books, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
+        assert_eq!(books.len(), 2);
+        assert!(books.iter().all(|bk| bk.status == "ok"), "both books must stay ok, got {:?}", books.iter().map(|bk| (&bk.title, &bk.status)).collect::<Vec<_>>());
+        // And a broken book heals on the next full scan even if its mtime
+        // did not change (needs_index also keys on status == "broken").
+        db.mark_book_status(&books[0].id, "broken").await.unwrap();
+        let r3 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        assert_eq!(r3.indexed, 1, "broken book must be re-indexed by a full scan");
+        let (books3, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
+        assert!(books3.iter().all(|bk| bk.status == "ok"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -506,7 +547,7 @@ mod tests {
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         std::fs::write(tmp.join("图册.epub"), crate::parser::test_epub_with_cover()).unwrap();
         let data = tmp.join("data");
-        let r = scan_once(&db, &search, &tmp, &data).await.unwrap();
+        let r = scan_once(&db, &search, &tmp, &data, true).await.unwrap();
         assert_eq!(r.indexed, 1);
         let (books, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         assert_eq!(books.len(), 1);
@@ -516,7 +557,7 @@ mod tests {
         assert_eq!(std::fs::read(&cover_file).unwrap().as_slice(), b"\xff\xd8\xff\xe0fake-cover");
         // A txt book has no cover.
         write_txt(&tmp, "plain.txt", "第一章 开始\n内容。\n");
-        let r2 = scan_once(&db, &search, &tmp, &data).await.unwrap();
+        let r2 = scan_once(&db, &search, &tmp, &data, true).await.unwrap();
         assert_eq!(r2.indexed, 1);
         let (books2, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         let plain = books2.iter().find(|b| b.title == "plain").unwrap();
@@ -533,7 +574,7 @@ mod tests {
         write_txt(&tmp, "good.txt", "第一章 好书\n内容正常。\n");
         let bad = tmp.join("bad.epub");
         std::fs::write(&bad, b"not a zip").unwrap();
-        let r = scan_once(&db, &search, &tmp, &tmp.join("data")).await.unwrap();
+        let r = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
         assert_eq!(r.indexed, 1);
         assert_eq!(r.broken, 1);
         let bad_row = db.get_book_by_path(&bad.to_string_lossy()).await.unwrap().unwrap();
@@ -553,7 +594,7 @@ mod tests {
             write_txt(&tmp, &format!("book{i:02}.txt"), &content);
         }
         std::fs::write(tmp.join("bad.epub"), b"not a zip").unwrap();
-        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data")).await.unwrap();
+        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
         assert!(r1.workers >= 1, "workers must be reported");
         assert_eq!(r1.indexed, 20, "all 20 txt books must be indexed, got {r1:?}");
         assert_eq!(r1.broken, 1, "broken epub must be counted, not block the queue");
@@ -565,7 +606,7 @@ mod tests {
         let (hits, total) = search.search("故事继续发展", None, 100, 0).unwrap();
         assert_eq!(total, 20, "all 20 books share the phrase, hits: {}", hits.len());
         // Second scan: txt books unchanged, broken epub retried (index_version 0).
-        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data")).await.unwrap();
+        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
         assert_eq!(r2.indexed, 0);
         assert_eq!(r2.unchanged, 20);
         assert_eq!(r2.broken, 1);

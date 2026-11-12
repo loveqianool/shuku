@@ -1,6 +1,12 @@
 # REST 契约
 
-基础：`GET /api/health` → `{ok:true, version}`；所有列表默认 `page=1&page_size=20`，返回 `{items, total, page, page_size}`。
+基础：`GET /api/health` → `{ok:true, version}`；所有列表默认 `page=1&page_size=20`，返回 `{items, total, page, page_size}`（例外见下）。`page` 钳在 1..10000，`page_size` 钳在 1..500。
+
+列表返回形例外：`GET /api/sources` 只返 `{items, total}`（无分页参数）；`GET /api/books/duplicates` 返裸数组 `[{title, author, books:[...]}]`；`GET /api/books/recent` 返 `{items:[...]}`（固定 100 本，无 total/page）；`GET/POST/DELETE /api/books/:id/bookmarks` 与 `GET /api/books/:id/tags`、`GET /api/tags` 返 `{items, total}` 或裸数组（见各节）。
+
+## 错误格式
+
+所有接口失败时一律返回 HTTP 500 + `{error: "原因"}`（暂不分 404/400/500，见 ARCHITECTURE.md 待定项）。成功时 HTTP 200（`DELETE /api/books/:id` 等个别接口也如此）。API 响应带 `Cache-Control: no-store`，不进浏览器/CDN 缓存；静态前端文件另有自己的缓存头（见 `src/static_files.rs`）。
 
 ## 书库
 - `GET /api/books?q=&author=&tag=&sort=updated|title|author&page=&page_size=` — 分页筛选；q 同时匹配书名拼音（音节/连写/首字母，如 `wlcl` 命中《武林沉沦》）
@@ -22,15 +28,15 @@
 ## 全文检索
 - `GET /api/search?q=&scope=local|cached|all&book_id=&page=&page_size=20` — `book_id` 限定某本书内搜索
 - 返回章节级命中：`{book_id, book_title, author, chapter_idx, chapter_title, snippet（高亮 <em>…</em>）, score}`；scope=local 只查本地书，cached 只查已缓存网络书，all 两者
-- 检索走 tantivy，禁止 SQLite LIKE；索引含 `pinyin` 字段（书名+作者+章节名拼音，空格分隔与连写两种形式），查询侧把拉丁字母按音节切分（`xiuxian` → `xiu xian`），所以打拼音能找到汉字书名/作者；索引版本 2（老库下次扫描自动重建）
+- 检索走 tantivy，禁止 SQLite LIKE；索引含 `pinyin` 字段（书名+作者+章节名拼音，空格分隔与连写两种形式），查询侧把拉丁字母按音节切分（`xiuxian` → `xiu xian`），所以打拼音能找到汉字书名/作者；索引版本 3（老库下次扫描自动重建）
 - `GET /api/suggest?q=` — 搜索联想：书名/作者子串匹配（书名优先）+ 全文索引补足（覆盖拼音），最多 8 条 `{id, title, author}`
 
 ## 阅读统计
-- `GET /api/stats` — `{total_books, reading_books, finished_books（读到最后一章）, total_seconds（阅读器上报的累计时长）, active_days, finished_by_month[[月, 本数]], recent_finished[[id, title, author, ts]], top_books_by_time[[id, title, author, seconds]]}`
+- `GET /api/stats` — `{total_books, reading_books, finished_books（读到最后一章）, total_seconds（阅读器上报的累计时长）, active_days, finished_by_month[[月, 本数]], recent_finished[[id, title, author, ts]], top_books_by_time[[id, title, author, seconds]]}`；上限：`finished_by_month` 最近 12 个月，`recent_finished` 与 `top_books_by_time` 各 10 条
 
 ## OPDS（供 KOReader / 静读天下等外部阅读器）
 - `GET /opds/` — 导航：全部图书 / 按作者 / 最新入库
-- `GET /opds/books?page=` / `GET /opds/recent?page=` — 采编 feed（50 本/页，分页链接 first/previous/next/last）
+- `GET /opds/books?page=` / `GET /opds/recent?page=` — 采编 feed（50 本/页，分页链接 first/previous/next/last 按需出现：首页无 previous，末页无 next，只有一页时四个全无）
 - `GET /opds/authors` / `GET /opds/authors/:author` — 按作者导航与采编 feed
 - `GET /opds/search?q=` — OpenSearch 搜索；`GET /opds/opensearch.xml` — 描述文档
 - `GET /opds/download/:id` — 下书：本地书直接给原文件（epub/txt），缓存书由章节文件拼成 txt（去掉 epub 图片标记行）
@@ -38,7 +44,7 @@
 ## 书源
 - `GET /api/sources` / `POST /api/sources` / `GET /api/sources/:id` / `PUT /api/sources/:id` / `DELETE /api/sources/:id`
 - `POST /api/sources/import` `{sources:[...]}` / `GET /api/sources/export` — 阅读3 JSON 格式
-- 书源字段（阅读3 JSON 子集）：`bookSourceUrl, bookSourceName, bookSourceGroup, bookSourceType, searchUrl, exploreUrl, bookUrlPattern, ruleSearch, ruleExplore, ruleBookInfo, ruleToc, ruleContent, jsLib?, enabled, weight, lastCheckTime, customOrder`
+- 书源字段（阅读3 JSON 子集）：`bookSourceUrl, bookSourceName, bookSourceGroup, bookSourceType, searchUrl, exploreUrl, bookUrlPattern, ruleSearch, ruleExplore, ruleBookInfo, ruleToc, ruleContent, jsLib?, loginUrl?, loginCheckJs?, loginUi?, header?, enabled, weight, lastCheckTime, customOrder`。规则对象内另有 `checkKeyWord`（搜索校验）、`nextTocUrl`/`nextContentUrl`（分页）、`webJs`/`preUpdateJs`/`formatJs`（JS 管线）、`isVolume`/`isVip`/`isPay`（章节标记）
 - 健康：`health`/`healthError`/`lastCheckTime`（定时跑 `ruleSearch.checkKeyWord` 或 explore 探针，默认每天；`POST /api/sources/:id/health-check` 手动触发）
 - 订阅：`POST /api/sources/subscribe` `{url}` — 订阅 URL（http(s)）定期刷新规则（与健康检查同一周期）；源上记 `subscriptionUrl`
 
@@ -60,6 +66,26 @@
 - `POST /api/tasks/chapter-check` — 全库缺章检查（后台扫全部书，写 `chapter_issues` 表）
 - `GET /api/tasks/stats` — 队列长度、熔断状态、令牌桶余量、source_cache 行数/字节数（调试用）
 
-## 环境变量（新增）
-- `SHUKU_UPDATE_CHECK_INTERVAL_SECS`（默认 21600）更新检查周期；`SHUKU_SOURCE_HEALTH_INTERVAL_SECS`（默认 86400）健康检查/订阅刷新周期
-- `SHUKU_CACHE_MAX_MB`（默认 512）/ `SHUKU_CACHE_MAX_ROWS`（默认 20000）source_cache 上限；`SHUKU_CACHE_PRUNE_INTERVAL_SECS`（默认 86400）清理周期（每天清过期行 + 按最旧淘汰到上限内）
+## 环境变量（共 19 个；数值型非法值回默认值，越界值夹到上下限，空字符串按未设置）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SHUKU_HOME` | `.` | 服务根目录；`books` 与 `data` 默认在其下 |
+| `SHUKU_BOOKS_DIR` | `$SHUKU_HOME/books` | 书库目录 |
+| `SHUKU_DATA_DIR` | `$SHUKU_HOME/data` | 数据目录（shuku.db、index/、chapters/、covers/） |
+| `SHUKU_ADDR` | `0.0.0.0:8080` | 监听地址 |
+| `SHUKU_RATE_PER_SEC` | `2.0` | 每域名令牌桶补充速率（请求/秒，0.1..1000） |
+| `SHUKU_RATE_BURST` | `5.0` | 每域名令牌桶容量（1..1000） |
+| `SHUKU_BREAKER_FAILURES` | `5` | 熔断阈值：连续失败次数（1..1000） |
+| `SHUKU_BREAKER_COOLDOWN_SECS` | `60` | 熔断冷却秒数（1..86400） |
+| `SHUKU_CACHE_TTL_SEARCH_SECS` | `60` | 搜索缓存 TTL 秒（0..86400） |
+| `SHUKU_CACHE_TTL_TOC_SECS` | `600` | 目录缓存 TTL 秒（0..2592000） |
+| `SHUKU_CACHE_TTL_CONTENT_SECS` | `86400` | 章节缓存 TTL 秒（0..31536000） |
+| `SHUKU_UPDATE_CHECK_INTERVAL_SECS` | `21600` | 缓存书更新检查周期（60..2592000） |
+| `SHUKU_SOURCE_HEALTH_INTERVAL_SECS` | `86400` | 书源健康检查/订阅刷新周期（3600..2592000） |
+| `SHUKU_CACHE_MAX_MB` | `512` | source_cache 上限 MB（16..16384） |
+| `SHUKU_CACHE_MAX_ROWS` | `20000` | source_cache 上限行数（100..1000000） |
+| `SHUKU_CACHE_PRUNE_INTERVAL_SECS` | `86400` | 缓存清理周期（3600..2592000；每天清过期行 + 按最旧淘汰到上限内） |
+| `SHUKU_SCAN_WORKERS` | 核数一半（1..8） | 并行扫描解析线程数（钳 1..32） |
+| `SHUKU_INDEX_THREADS` | 核数一半（1..8） | tantivy 写线程数（钳 1..16） |
+| `SHUKU_INDEX_HEAP_MB` | `150` | tantivy 写堆 MB（钳 50..2048） |

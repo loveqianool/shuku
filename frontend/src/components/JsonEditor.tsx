@@ -1,4 +1,4 @@
-import { createEffect, onCleanup, type Component } from "solid-js";
+import { createEffect, onCleanup, onMount, type Component } from "solid-js";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { json } from "@codemirror/lang-json";
@@ -14,7 +14,10 @@ const JsonEditor: Component<Props> = (props) => {
   let host: HTMLDivElement | undefined;
   let view: EditorView | undefined;
 
-  createEffect(() => {
+  // 只建一次（onMount）：以前是 createEffect 且读了 props.value，每敲一字
+  // 父组件回传 value 就触发重建，编辑器被销毁重建、丢焦点丢光标。
+  // 外部改值走下面第二个 effect 同步进 doc，不重建。
+  onMount(() => {
     if (!host) return;
     view = new EditorView({
       state: EditorState.create({
@@ -29,8 +32,8 @@ const JsonEditor: Component<Props> = (props) => {
       }),
       parent: host,
     });
-    onCleanup(() => view?.destroy());
   });
+  onCleanup(() => view?.destroy());
 
   createEffect(() => {
     const v = props.value;

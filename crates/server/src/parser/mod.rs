@@ -222,7 +222,7 @@ fn is_cjk_or_fw(c: char) -> bool {
         | '\u{F900}'..='\u{FAFF}'
         | '\u{FF00}'..='\u{FFEF}'
         | '\u{20000}'..='\u{2A6DF}'
-        | '·' | '–' | '—' | '―' | '…' | '※' | '・' | '°' | '％' | '‰' | '‱' | '℃' | '℉' | '%' | '&' | '/' | '\\'
+        | '·' | '–' | '—' | '―' | '…' | '※' | '°' | '‰' | '‱' | '℃' | '℉' | '%' | '&' | '/' | '\\'
     )
 }
 
@@ -296,7 +296,7 @@ fn fix_wrong_line_breaks(block: &str) -> String {
 pub fn paragraphs_from_text(text: &str, img_base: &str, reflow: bool) -> Vec<crate::source::Paragraph> {
     let mut paras: Vec<crate::source::Paragraph> = Vec::new();
     let mut block: Vec<String> = Vec::new();
-    let mut flush = |block: &mut Vec<String>, paras: &mut Vec<crate::source::Paragraph>| {
+    let flush = |block: &mut Vec<String>, paras: &mut Vec<crate::source::Paragraph>| {
         if block.is_empty() {
             return;
         }
@@ -383,7 +383,7 @@ pub fn split_txt_chapters(text: &str) -> Vec<Chapter> {
             } else {
                 heading.clone()
             };
-            if heading.len() > 3 && title.chars().count() < 60 {
+            if heading.chars().count() > 1 && title.chars().count() < 60 {
                 if let Some(t) = cur_title.take() {
                     chapters.push(Chapter { title: t, text: cur_lines.join("\n") });
                     cur_lines.clear();

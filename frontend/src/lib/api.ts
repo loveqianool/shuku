@@ -182,16 +182,12 @@ export interface Progress {
   offset: number;
 }
 
-export interface Bookmark {
-  id?: string;
-  chapter_idx: number;
-  offset: number;
-  note?: string;
-}
-
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
+    // 默认 15 秒超时：以前没设 signal，网络挂住时请求永远不回，
+    // 前端一直转圈。调用方自带 signal 时不覆盖。
+    signal: init?.signal ?? AbortSignal.timeout(15000),
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
   if (!res.ok) {
@@ -234,11 +230,12 @@ export const api = {
   suggest: (q: string) =>
     req<{ items: Suggestion[] }>("/api/suggest" + qs({ q })),
 
-  listSources: () => req<Source[]>("/api/sources"),
+  listSources: async (): Promise<Source[]> =>
+    (await req<{ items: Source[]; total: number }>("/api/sources")).items,
   getSource: (id: string) => req<Source>(`/api/sources/${encodeURIComponent(id)}`),
-  createSource: (s: Source) => req<Source>("/api/sources", { method: "POST", body: JSON.stringify(s) }),
+  createSource: (s: Source) => req<{ id: string }>("/api/sources", { method: "POST", body: JSON.stringify(s) }),
   updateSource: (id: string, s: Source) =>
-    req<Source>(`/api/sources/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(s) }),
+    req<{ id: string }>(`/api/sources/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(s) }),
   deleteSource: (id: string) => req<void>(`/api/sources/${encodeURIComponent(id)}`, { method: "DELETE" }),
   importSources: (sources: Source[]) =>
     req<{ imported?: number }>("/api/sources/import", { method: "POST", body: JSON.stringify({ sources }) }),
@@ -259,30 +256,12 @@ export const api = {
   getProgress: (id: string) => req<Progress>(`/api/books/${encodeURIComponent(id)}/progress`),
   saveProgress: (id: string, p: Progress) =>
     req<Progress>(`/api/books/${encodeURIComponent(id)}/progress`, { method: "PUT", body: JSON.stringify(p) }),
-  listBookmarks: (id: string) => req<Bookmark[]>(`/api/books/${encodeURIComponent(id)}/bookmarks`),
-  addBookmark: (id: string, b: Bookmark) =>
-    req<Bookmark>(`/api/books/${encodeURIComponent(id)}/bookmarks`, { method: "POST", body: JSON.stringify(b) }),
-  deleteBookmark: (bookId: string, bmId: string) =>
-    req<void>(`/api/books/${encodeURIComponent(bookId)}/bookmarks/${encodeURIComponent(bmId)}`, { method: "DELETE" }),
-  listTags: (id: string) => req<string[]>(`/api/books/${encodeURIComponent(id)}/tags`),
-  addTag: (id: string, tag: string) =>
-    req<void>(`/api/books/${encodeURIComponent(id)}/tags`, { method: "POST", body: JSON.stringify({ tag }) }),
-  deleteTag: (bookId: string, tag: string) =>
-    req<void>(`/api/books/${encodeURIComponent(bookId)}/tags/${encodeURIComponent(tag)}`, { method: "DELETE" }),
-  allTags: () => req<string[]>("/api/tags"),
-
   listTasks: (type?: "scan" | "crawl", status?: string) =>
     req<Page<TaskItem>>("/api/tasks" + qs({ type, status })),
   taskStats: () => req<TaskStats>("/api/tasks/stats"),
   triggerScan: (path?: string) => req<TaskItem>("/api/tasks/scan", { method: "POST", body: JSON.stringify({ path }) }),
   enqueueCrawl: (source_id: string, book_url: string) =>
     req<TaskItem>("/api/tasks/crawl", { method: "POST", body: JSON.stringify({ source_id, book_url }) }),
-  checkUpdate: (id: string) =>
-    req<TaskItem>(`/api/books/${encodeURIComponent(id)}/check-update`, { method: "POST" }),
-  checkUpdatesAll: () =>
-    req<{ queued?: number }>("/api/tasks/check-updates", { method: "POST" }),
-  changeSource: (id: string, body: { source_id: string; book_url?: string }) =>
-    req<TaskItem>(`/api/books/${encodeURIComponent(id)}/change-source`, { method: "POST", body: JSON.stringify(body) }),
   listDuplicates: () => req<DuplicateGroup[]>("/api/books/duplicates"),
   deleteBook: (id: string) =>
     req<{ deleted: boolean }>(`/api/books/${encodeURIComponent(id)}`, { method: "DELETE" }),

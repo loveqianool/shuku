@@ -175,8 +175,10 @@ pub fn run_login_ui(html: &str, script: &str, js_lib: &str, page_url: &Url) -> R
     let setup = format!(
         "{js_lib} let result = {html_json}; let input = result; let src = result; {JS_HELPERS} var __els = {els_json}; var __forms = {forms_json}; var __clicked = -1; var __submittedForm = -1; {DOCUMENT_SHIM}"
     );
+    // JSON-escaped copy of the setup, for the `return`-retry path below.
+    let setup_json = serde_json::to_string(&setup)?;
     let code = format!(
-        "(function(){{ try {{ {setup} let __out; try {{ __out = eval({script_json}); }} catch(e) {{ if (String(e).indexOf('return') !== -1) {{ __out = (function(){{ {setup} {script} }})(); }} else {{ throw e; }} }} return JSON.stringify({{els: __els, clicked: __clicked, submittedForm: __submittedForm}}); }} catch(e) {{ return 'LOGINUI_ERROR:' + String(e); }} }})()"
+        "(function(){{ try {{ {setup} let __out; try {{ __out = eval({script_json}); }} catch(e) {{ if (String(e).indexOf('return') !== -1) {{ __out = (new Function({setup_json} + \"\\n\" + {script_json}))(); }} else {{ throw e; }} }} return JSON.stringify({{els: __els, clicked: __clicked, submittedForm: __submittedForm}}); }} catch(e) {{ return 'LOGINUI_ERROR:' + String(e); }} }})()"
     );
     let out: String = ctx
         .with(|ctx| ctx.eval::<String, _>(code))

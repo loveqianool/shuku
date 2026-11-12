@@ -14,6 +14,12 @@ pub const MIGRATION_SQL: &str = include_str!("../../migrations/001_init.sql");
 /// Full books column list, in row_book order.
 const BOOK_COLS: &str = "id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover";
 
+/// Shared upsert for a book row (18 columns: the 17 in BOOK_COLS plus
+/// title_pinyin). `upsert_book` and `upsert_books_batch` must stay in sync
+/// — a column added in one place and missed in the other silently
+/// misaligns the params.
+const UPSERT_BOOK_SQL: &str = "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover,title_pinyin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover,title_pinyin=excluded.title_pinyin";
+
 #[derive(Debug, Clone)]
 pub struct Database {
     conn: Connection,
@@ -136,8 +142,26 @@ impl Database {
     async fn migrate(&self) -> Result<()> {
         let sql = MIGRATION_SQL.to_string();
         self.call_db(move |c| {
-                c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+                c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
                 c.execute_batch(&sql)?;
+                // Indexes for hot paths (idempotent; old DBs pick them up).
+                // Task claim: both workers poll every 3s on (status,
+                // next_retry_at, created_at); without these it is a full
+                // table scan + sort each time, and history rows are never
+                // deleted so the cost grows with uptime.
+                c.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_scan_tasks_claim ON scan_tasks(status, next_retry_at, created_at)",
+                )?;
+                c.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_crawl_tasks_claim ON crawl_tasks(status, next_retry_at, created_at)",
+                )?;
+                c.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_sources_order ON sources(custom_order, name)",
+                )?;
+                // Cache prune deletes oldest-first by fetched_at.
+                c.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_source_cache_fetched ON source_cache(fetched_at)",
+                )?;
                 // Reading time accumulated by the reader (seconds per book).
                 c.execute_batch(
                     "CREATE TABLE IF NOT EXISTS reading_seconds (
@@ -182,27 +206,42 @@ impl Database {
                         .map(|n| n > 0)?;
                     if !exists {
                         c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {ddl}"))?;
-                        if table == "books" && col == "title_pinyin" {
-                            // Backfill once for rows written before the
-                            // column existed (later rows get it from upsert).
-                            let rows: Vec<(String, String)> = {
-                                let mut stmt = c.prepare("SELECT id, title FROM books")?;
-                                let rows = stmt
-                                    .query_map([], |r| {
-                                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                                    })?
-                                    .collect::<Result<Vec<_>, _>>()?;
-                                rows
-                            };
-                            for (id, title) in rows {
-                                let py = crate::search::pinyin_text(&title);
-                                c.execute(
-                                    "UPDATE books SET title_pinyin = ?1 WHERE id = ?2",
-                                    params![py, id],
-                                )?;
-                            }
-                        }
                     }
+                }
+                // Update/health checks filter on source + last_update_check.
+                // Must run AFTER the ALTER loop above: last_update_check is
+                // added there, so creating this index earlier fails on a
+                // fresh DB with "no such column".
+                c.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_books_source_lastcheck ON books(source, last_update_check)",
+                )?;
+                // Backfill title_pinyin for any rows missing it. Runs on
+                // every migrate (not only when the column is first added):
+                // a previous backfill that failed mid-way would otherwise
+                // leave the column present with rows permanently missing
+                // pinyin. Wrapped in a transaction so a failure rolls back
+                // cleanly instead of leaving a partial backfill.
+                {
+                    let tx = c.transaction()?;
+                    let rows: Vec<(String, String)> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT id, title FROM books WHERE title_pinyin = '' OR title_pinyin IS NULL",
+                        )?;
+                        let rows = stmt
+                            .query_map([], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            })?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        rows
+                    };
+                    for (id, title) in rows {
+                        let py = crate::search::pinyin_text(&title);
+                        tx.execute(
+                            "UPDATE books SET title_pinyin = ?1 WHERE id = ?2",
+                            params![py, id],
+                        )?;
+                    }
+                    tx.commit()?;
                 }
                 Ok(())
             })
@@ -292,10 +331,13 @@ impl Database {
                 let tag_join = if tag.is_empty() {
                     String::new()
                 } else {
-                    format!(
-                        " AND id IN (SELECT book_id FROM tags WHERE tag = '{}')",
-                        tag.replace('\'', "''")
-                    )
+                    // Parameterised like q/author: the old code interpolated
+                    // the tag with manual ''-escaping, which was correct
+                    // but is the only user input spliced into SQL in the
+                    // whole codebase — one place to keep in sync.
+                    let n = args.len() + 1;
+                    args.push(tag);
+                    format!(" AND id IN (SELECT book_id FROM tags WHERE tag = ?{n})")
                 };
                 let total_sql = format!("SELECT COUNT(*) FROM books WHERE {where_sql}{tag_join}");
                 let total: i64 = c.query_row(&total_sql, rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
@@ -315,8 +357,7 @@ impl Database {
         let b = b.clone();
         self.call_db(move |c| {
                 c.execute(
-                    "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover,title_pinyin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-                     ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover,title_pinyin=excluded.title_pinyin",
+                    UPSERT_BOOK_SQL,
                     params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover, crate::search::pinyin_text(&b.title)],
                 )?;
                 Ok(())
@@ -339,8 +380,7 @@ impl Database {
             let tx = c.transaction()?;
             for b in &books {
                 tx.execute(
-                    "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover,title_pinyin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-                     ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover,title_pinyin=excluded.title_pinyin",
+                    UPSERT_BOOK_SQL,
                     params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover, crate::search::pinyin_text(&b.title)],
                 )?;
             }
@@ -407,11 +447,11 @@ impl Database {
             .await
     }
 
-    pub async fn all_book_paths(&self) -> Result<Vec<(String, String, i64, i64)>> {
+    pub async fn all_book_paths(&self) -> Result<Vec<(String, String, i64, i64, String)>> {
         self.call_db(move |c| {
-                let mut stmt = c.prepare("SELECT id, path, mtime, index_version FROM books WHERE source='local' AND path IS NOT NULL")?;
+                let mut stmt = c.prepare("SELECT id, path, mtime, index_version, status FROM books WHERE source='local' AND path IS NOT NULL")?;
                 let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)))?
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
@@ -618,13 +658,18 @@ impl Database {
         let issues = issues.to_vec();
         let now = chrono::Utc::now().timestamp();
         self.call_db(move |c| {
-                c.execute("DELETE FROM chapter_issues WHERE book_id=?1", params![book_id])?;
+                // Single transaction (like replace_chapters): a DELETE
+                // followed by per-row INSERTs without one would lose the
+                // old issue records if an INSERT failed midway.
+                let tx = c.transaction()?;
+                tx.execute("DELETE FROM chapter_issues WHERE book_id=?1", params![book_id])?;
                 for iss in &issues {
-                    c.execute(
+                    tx.execute(
                         "INSERT INTO chapter_issues(book_id,idx,kind,detail,checked_at) VALUES(?1,?2,?3,?4,?5)",
                         params![book_id, iss.idx, iss.kind, iss.detail, now],
                     )?;
                 }
+                tx.commit()?;
                 Ok(())
             })
             .await
@@ -951,20 +996,24 @@ impl Database {
     }
 
     /// Atomically claim one pending task whose retry time has come.
+    /// Also claims `failed` tasks whose backoff has expired: `finish_task`
+    /// leaves failures as `failed` (so the UI can show them), and the
+    /// backoff in `next_retry_at` is the retry schedule — without this,
+    /// a failed task could never be picked up again.
     pub async fn claim_task(&self, table: &str) -> Result<Option<TaskRow>> {
         let table = table.to_string();
         let now = chrono::Utc::now().timestamp();
         self.call_db(move |c| {
                 let row: Option<TaskRow> = c
                     .query_row(
-                        &format!("SELECT id,type,status,payload,attempts,next_retry_at,error,created_at,updated_at FROM {table} WHERE status='pending' AND next_retry_at<=?1 ORDER BY created_at ASC LIMIT 1"),
+                        &format!("SELECT id,type,status,payload,attempts,next_retry_at,error,created_at,updated_at FROM {table} WHERE status IN ('pending','failed') AND next_retry_at<=?1 ORDER BY created_at ASC LIMIT 1"),
                         params![now],
                         row_task,
                     )
                     .optional()?;
                 if let Some(t) = &row {
                     c.execute(
-                        &format!("UPDATE {table} SET status='running', updated_at=?1 WHERE id=?2 AND status='pending'"),
+                        &format!("UPDATE {table} SET status='running', updated_at=?1 WHERE id=?2 AND status IN ('pending','failed')"),
                         params![now, t.id],
                     )?;
                 }
@@ -999,10 +1048,21 @@ impl Database {
         let (table, id, status) = (table.to_string(), id.to_string(), status.to_string());
         let now = chrono::Utc::now().timestamp();
         self.call_db(move |c| {
-                let n = c.execute(
-                    &format!("UPDATE {table} SET status=?1, updated_at=?2 WHERE id=?3"),
-                    params![status, now, id],
-                )?;
+                // Resetting to `pending` (manual retry / resume) also clears
+                // the backoff: otherwise the task would sit until
+                // `next_retry_at` (up to 64 min) even though the user just
+                // asked for an immediate retry.
+                let n = if status == "pending" {
+                    c.execute(
+                        &format!("UPDATE {table} SET status=?1, next_retry_at=0, updated_at=?2 WHERE id=?3"),
+                        params![status, now, id],
+                    )?
+                } else {
+                    c.execute(
+                        &format!("UPDATE {table} SET status=?1, updated_at=?2 WHERE id=?3"),
+                        params![status, now, id],
+                    )?
+                };
                 Ok(n > 0)
             })
             .await
@@ -1024,6 +1084,37 @@ impl Database {
                 )?;
                 let mut stmt = c.prepare(&format!(
                     "SELECT id,type,status,payload,attempts,next_retry_at,error,created_at,updated_at FROM {table} {where_sql} ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
+                ))?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(args.iter()), row_task)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((rows, total))
+            })
+            .await
+    }
+
+    /// Both task tables merged, ordered by created_at, paginated once.
+    /// The old API path queried each table with the same page and
+    /// concatenated the results, so page 1 could return up to 2*page_size
+    /// rows and page 2 was each table's own page 2 (wrong order, wrong
+    /// total). A single UNION ALL with an outer LIMIT/OFFSET is the fix.
+    pub async fn list_all_tasks(&self, status: Option<String>, page: i64, page_size: i64) -> Result<(Vec<TaskRow>, i64)> {
+        let offset = (page.max(1) - 1) * page_size.max(1);
+        let limit = page_size.max(1);
+        self.call_db(move |c| {
+                let (where_sql, args): (String, Vec<String>) = match &status {
+                    Some(s) if !s.is_empty() => ("WHERE status=?1".to_string(), vec![s.clone()]),
+                    _ => ("".to_string(), vec![]),
+                };
+                let total: i64 = c.query_row(
+                    &format!(
+                        "SELECT (SELECT COUNT(*) FROM scan_tasks {where_sql}) + (SELECT COUNT(*) FROM crawl_tasks {where_sql})"
+                    ),
+                    rusqlite::params_from_iter(args.iter()),
+                    |r| r.get(0),
+                )?;
+                let mut stmt = c.prepare(&format!(
+                    "SELECT id,type,status,payload,attempts,next_retry_at,error,created_at,updated_at FROM (SELECT id,type,status,payload,attempts,next_retry_at,error,created_at,updated_at FROM scan_tasks {where_sql} UNION ALL SELECT id,type,status,payload,attempts,next_retry_at,error,created_at,updated_at FROM crawl_tasks {where_sql}) ORDER BY created_at DESC LIMIT {limit} OFFSET {offset}"
                 ))?;
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(args.iter()), row_task)?
@@ -1208,10 +1299,12 @@ impl Database {
         Ok(id)
     }
 
-    pub async fn delete_bookmark(&self, id: &str) -> Result<bool> {
-        let id = id.to_string();
+    pub async fn delete_bookmark(&self, book_id: &str, id: &str) -> Result<bool> {
+        let (book_id, id) = (book_id.to_string(), id.to_string());
         self.call_db(move |c| {
-                let n = c.execute("DELETE FROM bookmarks WHERE id=?1", params![id])?;
+                // Scoped to the book from the route: the old code ignored
+                // the book id and deleted by bookmark id alone.
+                let n = c.execute("DELETE FROM bookmarks WHERE id=?1 AND book_id=?2", params![id, book_id])?;
                 Ok(n > 0)
             })
             .await

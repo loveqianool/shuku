@@ -8,6 +8,10 @@ const Duplicates = () => {
   const [error, setError] = createSignal("");
   const [loading, setLoading] = createSignal(false);
 
+  // 组键：标题+作者拼起来当 key。不能用 `::` 拼接——标题里若有 `::`
+  // 会撞键（《A::B》/C 与《A》/B::C 拼出来一样）；JSON 数组序列化无歧义。
+  const groupKey = (g: DuplicateGroup) => JSON.stringify([g.title, g.author]);
+
   const load = async () => {
     setLoading(true);
     try {
@@ -15,7 +19,7 @@ const Duplicates = () => {
       setGroups(gs);
       // Default-keep the first book of each group (most chapters, then
       // largest size — the backend already sorts that way).
-      setKeep(Object.fromEntries(gs.map((g) => [`${g.title}::${g.author}`, g.books[0]?.id ?? ""])));
+      setKeep(Object.fromEntries(gs.map((g) => [groupKey(g), g.books[0]?.id ?? ""])));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -25,7 +29,7 @@ const Duplicates = () => {
   onMount(load);
 
   const pruneGroup = async (g: DuplicateGroup) => {
-    const keepId = keep()[`${g.title}::${g.author}`];
+    const keepId = keep()[groupKey(g)];
     const doomed = g.books.filter((b) => b.id !== keepId);
     if (doomed.length === 0) return;
     if (!confirm(`删除《${g.title}》的其余 ${doomed.length} 个副本？保留的副本不受影响。`)) return;
@@ -55,9 +59,9 @@ const Duplicates = () => {
                 <label class="row">
                   <input
                     type="radio"
-                    name={`${g.title}::${g.author}`}
-                    checked={keep()[`${g.title}::${g.author}`] === b.id}
-                    onChange={() => setKeep({ ...keep(), [`${g.title}::${g.author}`]: b.id })}
+                    name={groupKey(g)}
+                    checked={keep()[groupKey(g)] === b.id}
+                    onChange={() => setKeep({ ...keep(), [groupKey(g)]: b.id })}
                   />
                   <span>{b.source === "cached" ? "缓存" : "本地"} · {b.chapter_count} 章 · {((b.size ?? 0) / 1024).toFixed(0)} KB</span>
                   <a href={`#/read/${encodeURIComponent(b.id)}`}>打开</a>

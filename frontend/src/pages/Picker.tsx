@@ -207,9 +207,13 @@ const Picker: Component<{ sourceId?: string }> = (props) => {
   const [previewError, setPreviewError] = createSignal("");
   let iframeRef: HTMLIFrameElement | undefined;
 
-  if (props.sourceId) {
+  // 按 props.sourceId 拉书源：放 createEffect 里，换源（hash 变但组件
+  // 不重挂）时重拉；以前是组件体里一次性 if，换源后还留着旧书源的规则。
+  createEffect(() => {
+    const sid = props.sourceId;
+    if (!sid) return;
     api
-      .getSource(props.sourceId)
+      .getSource(sid)
       .then((s) => {
         setSource(s);
         setUrl(s.searchUrl ?? "");
@@ -220,7 +224,7 @@ const Picker: Component<{ sourceId?: string }> = (props) => {
         });
       })
       .catch((e) => setError(String(e)));
-  }
+  });
 
   const postCmd = (cmd: Record<string, unknown>) => {
     iframeRef?.contentWindow?.postMessage({ type: "shuku-picker-cmd", ...cmd }, "*");
@@ -398,7 +402,7 @@ const Picker: Component<{ sourceId?: string }> = (props) => {
           ruleToc: r.ruleToc,
           ruleContent: r.ruleContent,
         };
-        const created = (await api.createSource(payload)) as unknown as { id: string };
+        const created = await api.createSource(payload);
         setSource({ ...payload, id: created.id });
         setMsg("已新建书源，去测试面板验证一下");
       }
@@ -453,7 +457,9 @@ const Picker: Component<{ sourceId?: string }> = (props) => {
       <div class="picker-grid">
         <div class="picker-preview">
           <Show when={html()}>
-            <iframe ref={iframeRef} srcdoc={html()} title="picker" class="picker-frame" />
+            {/* sandbox 只放行脚本、不放行同源：快照里的内联事件处理器
+                拿不到父页面 origin，点选脚本仍可跑、仍可 postMessage 回传。 */}
+            <iframe ref={iframeRef} srcdoc={html()} title="picker" class="picker-frame" sandbox="allow-scripts" />
           </Show>
           <Show when={jsonData() !== null}>
             <div class="card json-tree">

@@ -35,13 +35,11 @@
 ## 已知限制（留待后续）
 
 - txt 章节按需解析：每次读章节都要全文件解析一次（大文件可接受，十几万本规模下建议后续加章节偏移索引）。
-- 扫描目前是单 worker 顺序处理；十几万本首次全量扫描会较慢（可并行化解析 + 批量索引，后续优化）。
-- epub 章节不含图片段落（只出 text）；图片懒加载需另加 `/api/books/:id/images/:name` 之类的图片直出端点。
 - 书源规则是阅读3 JSON 的常用子集：`&&`/`@attr`/`##`/`js:`、bookList/chapterList/content 对象规则已覆盖；XPath/`@json:` 解析已实现（2026-11-10，见下）；规则嵌套对象的高级形式未实现，遇到会返回空提取（不崩溃）。
-- `searchUrl` 模板只替换 `{{key}}`/`{{keyword}}`/`{{page}}`。
-- 令牌桶/熔断参数目前是硬编码（2/s、burst 5、5 次/60s），未做成环境变量。
 - notify 监听是 best-effort：监听失败不影响周期扫描；事件触发的是增量扫描任务（3s 轮询拾取）。
 - 缓存书的书名/作者来自爬取任务入参（或回退 book_url）；若书源 toc 页无书名，正文页才会有。
+
+（已解决，从本节移出：并行扫描 2026-11-06；epub 图片段落 + `/api/books/:id/images/*path` 2026-11-10；`searchUrl` 模板扩展 `{{JS}}`/请求规则 JSON/charset 链 2026-11-10；令牌桶/熔断/缓存 TTL 全部可配 `SHUKU_RATE_*`/`SHUKU_BREAKER_*`/`SHUKU_CACHE_TTL_*` 2026-11-10，见 docs/API.md 环境变量表。）
 
 ## 并行扫描（2026-11-06）
 
@@ -152,7 +150,7 @@
 ## Docker CI（2026-11-11，Ye 要求）
 
 - `Dockerfile`（仓库根）：alpine:3.21 + 预编的 musl 静态二进制（CI 每架构编一个，`bin-<arch>/shuku`），建 `/tmp`（扫描暂存用）`/data` `/books`；默认 `SHUKU_BOOKS_DIR=/books`、`SHUKU_DATA_DIR=/data`、`SHUKU_ADDR=0.0.0.0:8080`，端口 8080。reqwest 用 rustls 自带根证书，镜像里不需要 CA 证书包。
-- `.github/workflows/docker.yml`：push 到 main 或 `v*` 标签时跑；`binary` 任务在 amd64（ubuntu-24.04）与 arm64（ubuntu-24.04-arm）原生 runner 上各编前端 + musl 二进制，**先跑全量测试，通过才推镜像**；`docker` 任务（PR 不跑）用 buildx 各推 `amd64-<sha>` / `arm64-<sha>` 镜像，再 `imagetools create` 合成多架构清单 `:latest`、`:sha-<sha>`（打标签时另加 `:<版本号>`）。GHCR 包默认私有，工作流最后一步用 `gh api` 把它改公开（best-effort，失败不影响构建）。
+- `.github/workflows/docker.yml`：push 到 main 或 `v*` 标签时跑；`binary` 任务在 amd64（ubuntu-24.04）与 arm64（ubuntu-24.04-arm）原生 runner 上各编前端 + musl 二进制（CI 自 2026-11-12 不再跑测试，见下「CI 移除 Test 步骤」；推送前本地须跑全量测试全绿）；`docker` 任务（PR 不跑）用 buildx 各推 `amd64-<sha>` / `arm64-<sha>` 镜像，再 `imagetools create` 合成多架构清单 `:latest`、`:sha-<sha>`（打标签时另加 `:<版本号>`）。GHCR 包默认私有，工作流最后一步用 `gh api` 把它改公开（best-effort，失败不影响构建）。
 - 本地编镜像：先编 musl 二进制，放进 `bin-amd64/shuku`，再 `docker build -t shuku .`（本机无 docker，未本地验证，靠 CI 首跑验证）。
 
 ## 发布（PAT 推送，2026-11-11，Ye 要求）
@@ -362,3 +360,16 @@
   - `frontend/src/App.tsx`：阅读页的 `<nav>` 加 `classList={{ "nav-overlay": route().name === "read" }}`，只在阅读页变 fixed 浮层，其他页仍是 sticky。
   - 效果：顶栏、阅读器顶栏、底栏三者都浮在正文之上，点正文唤出/收起只遮住部分正文，阅读区高度与内容完全不动。`navH` 仍量导航实高，用来把阅读器顶栏顶到导航下方（fixed 元素的 offsetHeight 照常可量）。
 - 测试：107 单元 + 2 端到端全绿（纯前端改动，后端未动）。
+
+## 全量代码审查（2026-11-12）
+
+- Ye 要求做一次全量检查、找可优化处与 bug 并修。审查分后端正确性/性能、安全与健壮性、前端、文档五个面，原始约 121 项、去重后约 110 项。
+- 已修 52 项（本地，测试全绿）：
+  - Critical 1 项：前端 `listSources` 解包 `{items}`（后端返 `{items,total}`，前端断言裸数组，书源页会空白）；`createSource`/`updateSource` 返回类型改 `{id}`。
+  - 后端正确性：任务认领放宽到 `failed` 且退避到期自动重试、手动重试清 `next_retry_at`；`replace_chapter_issues` 包进单事务；`list_books` tag 过滤参数化；`UPSERT_BOOK_SQL` 去重；`list_all_tasks` 用 UNION ALL 一次分页（修无 type 时第一页返 2×page_size）；`delete_bookmark` 改 `(book_id,id)` 双参（修越权删书签）；`scan_once` 加 `full_scan` 参数（消失→broken 循环只在全量扫描跑）；`needs_index` 加 `status=="broken"`；`rebuild_index` 拆 `rebuild_index_inner`（出错后恢复爬虫）；`fetch_spec` 401/403 改强制真重登；`dedupe_chapters` 去重键改 `(url,name)`；`update_source` 路径 id 与 body 不一致拒绝；`delete_book` 清理失败记日志；`split_txt_chapters` 标题长度按字符计。
+  - 后端性能：migrate 加 PRAGMA（synchronous=NORMAL、cache_size、busy_timeout、temp_store）与 5 个索引；`title_pinyin` 回填自愈；`fetch_raw` 响应体流式读、上限 10MB；熔断器计 429；`get_chapter` 两分支排版搬进 `spawn_blocking`；搜索 fallback snippet 懒建立；`run_js` 的 `return` 重试改 `new Function` 拼接。
+  - 安全与健壮性：`trigger_scan` 路径 containment 校验；`PageQuery::page()` 钳 1..10000；数值型环境变量补上限钳制、空字串按未设置；全站加 `Cache-Control: no-store`（不覆盖静态文件已有头）；OPDS `sanitize_filename` strip 控制字符。
+  - 前端：Reader（`loadSeq` 序号守卫、滚动进度 1s 防抖保存、恢复进度传像素 offset、换书复位信号、`stepMatch` 跨分页 while 加载、批注内 `splitOnTerm`、繁简 effect 序号守卫、朗读缓存中文语音、`patchSettings` clamp）；删 `api.ts` 10 个零调用者 wrapper；`JsonEditor` 只建一次；Picker iframe 加 `sandbox="allow-scripts"`；Bookshelf 筛选 250ms 防抖；SearchPage 联想序号守卫；Duplicates keep 键改 JSON；Sources 导入重置 file input；App 离线横幅事件驱动；`req()` 默认 15 秒超时；`100vh`→`100dvh`；竖向滑杆避开顶底栏浮层、宽 28px；整本离线失败章节不计 `done` 且单章 15 秒超时。
+  - 文档：ARCHITECTURE（11 张表、schema 补字段、SW 策略改述、REST 清单补全）与 API.md（索引版本 3、环境变量 19 个、错误格式、stats 上限、书源字段、OPDS 分页）同步；BUILD_NOTES「已知限制」删已解决的四条，CI 一节改述（自 2026-11-12 不再跑测试）。
+- 待定 21 项（未动手，需判断或实测）：SSRF 完整校验、CORS 收紧、章节级缓存、搜索 scope 改索引、爬取有界并发、`list_matches` 流式化、书库列表/联想改走 tantivy、OPDS 流式下载、任务历史归档、错误状态码区分、XPath 序号谓词分组、换源原子替换、失败章节计数、书源凭证加密、整本离线取消按钮、搜索/任务页分页、阅读器首尾常驻 padding（与浮层方案取舍，需 Ye 定）、watcher 回调 panic、QuickJS/图片/OPDS 若干待实测项、`cover` 改名与 `list_matches` 计数。
+- 测试：108 单元（新增 `partial_scan_does_not_mark_others_broken`）+ 2 端到端全绿；前端构建通过。

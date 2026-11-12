@@ -1,4 +1,4 @@
-import { createSignal, For, Show, type Component } from "solid-js";
+import { createSignal, For, Show, onCleanup, type Component } from "solid-js";
 import { api, type SearchHit, type SearchScope, type Suggestion } from "../lib/api";
 
 const SearchPage: Component = () => {
@@ -12,6 +12,9 @@ const SearchPage: Component = () => {
   const [suggestions, setSuggestions] = createSignal<Suggestion[]>([]);
   const [showSuggest, setShowSuggest] = createSignal(false);
   let suggestTimer: ReturnType<typeof setTimeout> | undefined;
+  // 联想序号守卫：防抖后先发的请求可能后到，旧结果不覆盖新输入的。
+  let suggestSeq = 0;
+  onCleanup(() => clearTimeout(suggestTimer));
 
   const onInput = (v: string) => {
     setQ(v);
@@ -22,8 +25,11 @@ const SearchPage: Component = () => {
     }
     // 防抖 200ms：书名/作者联想（也覆盖拼音，如 xiuxian）。
     suggestTimer = setTimeout(() => {
-      api.suggest(v.trim())
+      const seq = ++suggestSeq;
+      const query = v.trim();
+      api.suggest(query)
         .then((r) => {
+          if (seq !== suggestSeq) return;
           setSuggestions(r.items);
           setShowSuggest(true);
         })
@@ -43,6 +49,9 @@ const SearchPage: Component = () => {
     setError("");
     setSearched(true);
     setShowSuggest(false);
+    // 先清旧结果：新搜索加载中旧命中还挂着，会误以为是这次的结果。
+    setHits([]);
+    setTotal(0);
     try {
       const res = await api.search(q().trim(), scope(), 1, 20);
       setHits(res.items);

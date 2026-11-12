@@ -322,6 +322,12 @@ pub fn validate_source(raw: &Value) -> Result<()> {
 pub const JS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const JS_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Max response body accepted from a source (10 MiB). Chapter / TOC /
+/// search pages are kilobytes; without a cap a single hostile or broken
+/// source could OOM the single process (fetch_raw used to read the whole
+/// body with `resp.bytes()` before any check).
+pub const MAX_FETCH_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Syntax-only check: compile via `new Function(body)` without executing.
 pub fn validate_js_syntax(script: &str) -> Result<()> {
     let script = script.to_string();
@@ -404,8 +410,10 @@ fn run_js_inner(script: &str, input: &str, vars: &[(&str, &str)], js_lib: &str, 
         let setup = format!(
             "{js_lib} {vars_code} let result = {input_json}; let input = result; let src = result; let base_url = {base_json}; let baseUrl = base_url; let url = base_url; {JS_HELPERS} {prelude}"
         );
+        // JSON-escaped copy of the setup, for the `return`-retry path below.
+        let setup_json = serde_json::to_string(&setup)?;
         let code = format!(
-            "(function(){{ try {{ {setup} let __out; try {{ __out = eval({script_json}); }} catch(e) {{ if (String(e).indexOf('return') !== -1) {{ __out = (function(){{ {setup} {script} }})(); }} else {{ throw e; }} }} return (typeof __out === 'object' && __out !== null) ? JSON.stringify(__out) : String(__out === undefined ? result : __out); }} catch(e) {{ return 'JS_ERROR:' + String(e); }} }})()"
+            "(function(){{ try {{ {setup} let __out; try {{ __out = eval({script_json}); }} catch(e) {{ if (String(e).indexOf('return') !== -1) {{ __out = (new Function({setup_json} + \"\\n\" + {script_json}))(); }} else {{ throw e; }} }} return (typeof __out === 'object' && __out !== null) ? JSON.stringify(__out) : String(__out === undefined ? result : __out); }} catch(e) {{ return 'JS_ERROR:' + String(e); }} }})()"
         );
         let out: String = ctx.eval(code).map_err(|e| anyhow!("js exec: {e}"))?;
         if let Some(msg) = out.strip_prefix("JS_ERROR:") {
@@ -1131,8 +1139,13 @@ fn dedupe_books(books: &mut Vec<BookHit>) {
 }
 
 fn dedupe_chapters(chapters: &mut Vec<ChapterHit>) {
+    // Key on (url, name): chapters without a chapterUrl all fall back to
+    // the same page URL (see finish_chapter_hit), so keying on url alone
+    // silently kept only the first chapter of such a TOC. Same-URL +
+    // same-name is still a true duplicate and is dropped. (Mirrors
+    // dedupe_books, which exempts empty book URLs.)
     let mut seen = std::collections::HashSet::new();
-    chapters.retain(|c| seen.insert(c.url.clone()));
+    chapters.retain(|c| seen.insert((c.url.clone(), c.name.clone())));
 }
 
 /// Test-only wrapper: production calls `extract_toc_page` directly.
@@ -1821,7 +1834,12 @@ impl Engine {
         let (status, body) = self.fetch_raw(source, spec, kind, force_refresh, logs, t0).await?;
         if (status == 401 || status == 403) && allow_login_retry && !source.login_url.is_empty() {
             logs.push(LogEntry { level: "info".into(), module: "login".into(), msg: format!("{status} for {}, trying loginUrl", spec.url), ms: t0.elapsed().as_millis() as u64 });
-            match self.login(source, false, &mut *logs, t0).await {
+            // Force a real re-login: with force=false, `login` short-circuits
+            // on a login_state entry younger than LOGIN_TTL (30 min) and
+            // returns "already logged in" without touching the server — but
+            // a 401 means the server-side session is already dead, so the
+            // retry would just get the same 401 again.
+            match self.login(source, true, &mut *logs, t0).await {
                 Ok((true, _)) => {
                     logs.push(LogEntry { level: "info".into(), module: "login".into(), msg: "login ok, retrying request".into(), ms: t0.elapsed().as_millis() as u64 });
                     let (status2, body2) = self.fetch_raw(source, spec, kind, force_refresh, &mut *logs, t0).await?;
@@ -1934,7 +1952,7 @@ impl Engine {
         if let Some(b) = &spec.body {
             req = req.body(b.clone());
         }
-        let resp = match req.send().await {
+        let mut resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
                 self.breaker.record_failure(&domain);
@@ -1948,9 +1966,38 @@ impl Engine {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let bytes = resp.bytes().await.unwrap_or_default();
-        let body = decode_body(&bytes, spec.charset.as_deref(), ct.as_deref());
-        if status >= 500 {
+        // Reject an over-large body before downloading it (Content-Length
+        // is advisory, so the stream below enforces the same cap as well).
+        if let Some(len) = resp.headers().get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<usize>().ok()) {
+            if len > MAX_FETCH_BODY_BYTES {
+                return Err(anyhow!("response body too large ({} bytes): {}", len, spec.url));
+            }
+        }
+        // Stream the body with a hard cap instead of `resp.bytes()`: the
+        // old code read the whole body into memory (Bytes + decoded String
+        // + cache clones) with no limit at all.
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    buf.extend_from_slice(&chunk);
+                    if buf.len() > MAX_FETCH_BODY_BYTES {
+                        return Err(anyhow!("response body exceeds {} bytes: {}", MAX_FETCH_BODY_BYTES, spec.url));
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.breaker.record_failure(&domain);
+                    return Err(anyhow!("http request failed: {e}"));
+                }
+            }
+        }
+        let body = decode_body(&buf, spec.charset.as_deref(), ct.as_deref());
+        if status >= 500 || status == 429 {
+            // 429 is rate limiting: the breaker must open so we stop
+            // hammering the source. (401/403 are deliberately NOT counted
+            // here: a login-required source 401s once before its first
+            // login, and that is expected, not unhealthiness.)
             self.breaker.record_failure(&domain);
         } else if status < 400 {
             self.breaker.record_success(&domain);

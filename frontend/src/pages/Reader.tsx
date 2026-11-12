@@ -181,6 +181,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     return c ? c.fn(t) : t;
   };
   const applyScript = async (script: ReaderSettings["script"]) => {
+    const seq = ++scriptSeq;
     if (script === "orig") {
       setConverter(null);
       return;
@@ -188,22 +189,47 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     try {
       if (script === "trad") {
         const m = await import("opencc-js/cn2t");
+        if (seq !== scriptSeq) return;
         setConverter({ fn: m.Converter({ from: "cn", to: "t" }) });
       } else {
         const m = await import("opencc-js/t2cn");
+        if (seq !== scriptSeq) return;
         setConverter({ fn: m.Converter({ from: "t", to: "cn" }) });
       }
     } catch {
-      setConverter(null);
+      if (seq === scriptSeq) setConverter(null);
     }
   };
+  // 只跟 script 变化：settings 是整包 signal，读它会让改字号/模式也
+  // 触发重复 import；再加序号守卫，快速来回切换时旧的 import 回来
+  // 不覆盖新的 converter。
+  let scriptSeq = 0;
+  let lastScript: ReaderSettings["script"] | null = null;
   createEffect(() => {
-    applyScript(settings().script);
+    const script = settings().script;
+    if (script === lastScript) return;
+    lastScript = script;
+    applyScript(script);
   });
 
   // 朗读：浏览器 speechSynthesis，优先中文语音。切章/退出时停。
+  // getVoices() 首次常为空（语音异步加载）：进页面就预热并监听
+  // voiceschanged 缓存中文语音，否则第一次朗读总落到默认语音。
   const [speaking, setSpeaking] = createSignal(false);
   const [ttsRate, setTtsRate] = createSignal(1);
+  const [zhVoice, setZhVoice] = createSignal<SpeechSynthesisVoice | null>(null);
+  const pickZhVoice = () => {
+    const v = window.speechSynthesis?.getVoices().find((x) => x.lang?.startsWith("zh")) ?? null;
+    if (v) setZhVoice(v);
+    return v;
+  };
+  onMount(() => {
+    pickZhVoice();
+    const synth = window.speechSynthesis;
+    if (!synth) return;
+    synth.addEventListener("voiceschanged", pickZhVoice);
+    onCleanup(() => synth.removeEventListener("voiceschanged", pickZhVoice));
+  });
   const stopSpeaking = () => {
     window.speechSynthesis?.cancel();
     setSpeaking(false);
@@ -221,7 +247,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       .join("\n");
     if (!text) return;
     const u = new SpeechSynthesisUtterance(text);
-    const zh = synth.getVoices().find((v) => v.lang?.startsWith("zh"));
+    const zh = zhVoice() ?? synth.getVoices().find((v) => v.lang?.startsWith("zh"));
     if (zh) u.voice = zh;
     u.rate = ttsRate();
     u.onend = () => setSpeaking(false);
@@ -234,11 +260,19 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
 
   const patchSettings = (p: Partial<ReaderSettings>) => {
     const next = { ...settings(), ...p };
+    // 输入框 min/max 只拦 UI，typed 值、脏的 localStorage 仍可能越界
+    // 或 NaN；这里按字段夹紧，NaN 回默认值。
+    if (typeof next.fontSize === "number")
+      next.fontSize = Number.isFinite(next.fontSize) ? Math.min(32, Math.max(12, next.fontSize)) : 18;
+    if (typeof next.lineHeight === "number")
+      next.lineHeight = Number.isFinite(next.lineHeight) ? Math.min(3, Math.max(1.2, next.lineHeight)) : 1.9;
+    if (typeof next.indent === "number")
+      next.indent = Number.isFinite(next.indent) ? Math.min(4, Math.max(0, next.indent)) : 2;
     setSettings(next);
     saveSettings(next);
   };
 
-  const loadToc = async () => {
+  const loadToc = async (seq?: number) => {
     const all: ChapterMeta[] = [];
     let page = 1;
     for (;;) {
@@ -247,23 +281,31 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       if (all.length >= res.total || res.items.length === 0) break;
       page += 1;
     }
+    if (seq !== undefined && seq !== loadSeq) return;
     setToc(all);
   };
 
+  // 序号守卫：换书/跳章时先到的响应不覆盖后到的（Bookshelf 同款 loadSeq）。
+  // 每次 loadChapter / 换书 effect 都自增，await 回来后对不上就丢弃。
+  let loadSeq = 0;
+
   // frac?: 0..1，换章后滚到章内对应位置（竖向全书滑杆按百分比定位时用）。
-  // 不传则滚到章首。滚动要等章节渲染好（scrollHeight 就绪）再做。
-  const loadChapter = async (i: number, frac?: number) => {
+  // offsetPx?: 恢复进度时用的像素偏移（读到的 offset 原样滚回去）。
+  // 两者都不传则滚到章首。滚动要等章节渲染好（scrollHeight 就绪）再做。
+  const loadChapter = async (i: number, frac?: number, offsetPx?: number) => {
+    const seq = ++loadSeq;
     setLoading(true);
     setError("");
     stopSpeaking();
     try {
       const ch = await api.getChapter(props.bookId, i);
+      if (seq !== loadSeq) return;
       setChapter(ch);
       setIdx(i);
       setHighlights(loadHighlights(props.bookId, i));
       setSelText("");
       location.hash = `#/read/${encodeURIComponent(props.bookId)}/${i}`;
-      if (frac === undefined) {
+      if (frac === undefined && offsetPx === undefined) {
         if (contentRef) contentRef.scrollTop = 0;
         window.scrollTo(0, 0);
         setScrollFrac(0);
@@ -272,48 +314,93 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       } else {
         // 等渲染好再滚到章内位置，并按实际 offset 保存进度。
         requestAnimationFrame(() => {
-          scrollToFrac(frac);
-          setScrollFrac(frac);
-          const offset = settings().mode === "page" ? (contentRef?.scrollTop ?? 0) : window.scrollY;
-          api.saveProgress(props.bookId, { chapter_idx: i, offset }).catch(() => {});
+          if (seq !== loadSeq) return;
+          if (offsetPx !== undefined) {
+            // 按像素恢复：夹到最大滚动范围，免得换了字号/屏宽后越界。
+            if (settings().mode === "page") {
+              const el = contentRef;
+              if (el) el.scrollTop = Math.min(offsetPx, Math.max(0, el.scrollHeight - el.clientHeight));
+            } else {
+              window.scrollTo(0, Math.min(offsetPx, Math.max(0, document.documentElement.scrollHeight - window.innerHeight)));
+            }
+            setScrollFrac(getScrollFrac());
+            const offset = settings().mode === "page" ? (contentRef?.scrollTop ?? 0) : window.scrollY;
+            api.saveProgress(props.bookId, { chapter_idx: i, offset }).catch(() => {});
+          } else {
+            scrollToFrac(frac!);
+            setScrollFrac(frac!);
+            const offset = settings().mode === "page" ? (contentRef?.scrollTop ?? 0) : window.scrollY;
+            api.saveProgress(props.bookId, { chapter_idx: i, offset }).catch(() => {});
+          }
         });
       }
     } catch (e) {
+      if (seq !== loadSeq) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (seq === loadSeq) setLoading(false);
     }
   };
 
   createEffect(() => {
-    api.getBook(props.bookId).then((b) => {
+    const seq = ++loadSeq;
+    const bid = props.bookId;
+    // 换书：清掉上本书的搜索/目录/设置等状态，免得旧内容闪一下。
+    // （直接复位 signal，不调 clearSearch：它定义在后面，effect 首次
+    // 同步执行时会碰到 TDZ。）
+    setInBookQ("");
+    setInBookMatches([]);
+    setInBookMatchTotal(0);
+    setInBookMatchPage(1);
+    setInBookHits([]);
+    setInBookTotal(0);
+    setSearchTerm("");
+    setCurrentMatch(-1);
+    setCurrentOccurrence(-1);
+    setSearchDone(false);
+    setShowToc(false);
+    setShowSearch(false);
+    setShowSettings(false);
+    setChapterIssues(null);
+    setSameAuthor([]);
+    setScrollFrac(0);
+    setChapter(null);
+    setBook(null);
+    setToc([]);
+    api.getBook(bid).then((b) => {
+      if (seq !== loadSeq) return;
       setBook(b);
       // 同作者归组：后端 author 过滤是子串匹配，前端再按全等过滤。
       if (b.author) {
         api.listBooks({ author: b.author, page: 1, page_size: 100 })
-          .then((res) => setSameAuthor(res.items.filter((x) => x.author === b.author && x.id !== props.bookId)))
+          .then((res) => { if (seq === loadSeq) setSameAuthor(res.items.filter((x) => x.author === b.author && x.id !== bid)); })
           .catch(() => {});
       }
-    }).catch((e) => setError(String(e)));
-    loadToc().catch((e) => setError(String(e)));
-    // 恢复进度：无明确章节时跳到上次章节
-    api.getProgress(props.bookId)
+    }).catch((e) => { if (seq === loadSeq) setError(String(e)); });
+    loadToc(seq).catch((e) => { if (seq === loadSeq) setError(String(e)); });
+    // 恢复进度：无明确章节时跳到上次章节，并按像素偏移滚回去
+    // （以前只跳章不恢复章内位置，读一半的章节每次都回章首）。
+    api.getProgress(bid)
       .then((p) => {
-        if (props.initialIdx === 0 && p.chapter_idx > 0) loadChapter(p.chapter_idx);
+        if (seq !== loadSeq) return;
+        if (props.initialIdx === 0) loadChapter(p.chapter_idx, undefined, p.offset);
         else loadChapter(props.initialIdx);
       })
-      .catch(() => loadChapter(props.initialIdx));
+      .catch(() => { if (seq === loadSeq) loadChapter(props.initialIdx); });
   });
 
-  // 滚动进度自动保存（防抖 1s）
-  const onScroll = () => {
-    if (!contentRef) return;
-    setScrollFrac(getScrollFrac());
+  // 滚动进度自动保存（防抖 1s）：仿真翻页模式走容器滚动，
+  // 滚动模式走整页滚动，两路共用同一防抖保存。
+  const scheduleSaveProgress = (offset: number) => {
     clearTimeout(saveTimer);
-    const offset = contentRef.scrollTop;
     saveTimer = setTimeout(() => {
       api.saveProgress(props.bookId, { chapter_idx: idx(), offset }).catch(() => {});
     }, 1000);
+  };
+  const onScroll = () => {
+    if (!contentRef) return;
+    setScrollFrac(getScrollFrac());
+    scheduleSaveProgress(contentRef.scrollTop);
   };
   onCleanup(() => clearTimeout(saveTimer));
 
@@ -361,8 +448,13 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       window.scrollTo({ top: v * (document.documentElement.scrollHeight - window.innerHeight) });
     }
   };
-  // 滚动模式下整页滚，用 window 滚动事件同步本章进度。
-  const onWinScroll = () => { if (settings().mode !== "page") setScrollFrac(getScrollFrac()); };
+  // 滚动模式下整页滚，用 window 滚动事件同步本章进度并防抖保存
+  // （以前只同步滑杆不保存，滚动模式下读再久进度也不更新）。
+  const onWinScroll = () => {
+    if (settings().mode === "page") return;
+    setScrollFrac(getScrollFrac());
+    scheduleSaveProgress(window.scrollY);
+  };
   window.addEventListener("scroll", onWinScroll, { passive: true });
   onCleanup(() => window.removeEventListener("scroll", onWinScroll));
 
@@ -462,15 +554,18 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setCurrentOccurrence(k);
   };
 
-  // 上一处 / 下一处：超出已加载的结果时先加载下一页。
+  // 上一处 / 下一处：超出已加载的结果时先加载下一页（可能要连加载多页，
+  // 旧代码只加载一页，目标在更后面时 jumpToMatch 会拿到 undefined）。
   const stepMatch = async (d: number) => {
     const total = inBookMatchTotal();
     if (total === 0) return;
     let n = currentMatch() + d;
     if (n < 0) n = 0;
     if (n >= total) n = total - 1;
-    if (n >= inBookMatches().length) {
+    while (n >= inBookMatches().length && inBookMatches().length < total) {
+      const before = inBookMatches().length;
       await loadMoreMatches();
+      if (inBookMatches().length === before) break;
     }
     await jumpToMatch(n);
   };
@@ -698,7 +793,12 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
                 <p>
                   <For each={renderTextWithHighlights(p.text ?? "", highlights())}>
                     {(part) => part.anno ? (
-                      <mark class="anno" title={highlights().find((h) => h.text === part.text)?.note ?? ""}>{disp(part.text)}</mark>
+                      <mark class="anno" title={highlights().find((h) => h.text === part.text)?.note ?? ""}>
+                        {/* 批注内也要切搜索词，否则词落在批注里就标不出来、定位不到 */}
+                        <For each={splitOnTerm(part.text, searchTerm())}>
+                          {(sp) => sp.hit ? <mark class="search-hit">{disp(sp.text)}</mark> : <>{disp(sp.text)}</>}
+                        </For>
+                      </mark>
                     ) : (
                       <For each={splitOnTerm(part.text, searchTerm())}>
                         {(sp) => sp.hit ? <mark class="search-hit">{disp(sp.text)}</mark> : <>{disp(sp.text)}</>}

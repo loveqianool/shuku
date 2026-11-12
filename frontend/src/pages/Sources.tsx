@@ -110,7 +110,7 @@ const Sources: Component = () => {
             type="file"
             accept="application/json,.json"
             style={{ display: "none" }}
-            onChange={(e) => { const f = e.currentTarget.files?.[0]; if (f) doImport(f); }}
+            onChange={(e) => { const f = e.currentTarget.files?.[0]; e.currentTarget.value = ""; if (f) void doImport(f); }}
           />
         </label>
         <input

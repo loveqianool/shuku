@@ -21,8 +21,10 @@ function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, "");
   const parts = h.split("/").filter(Boolean);
   if (parts[0] === "search") return { name: "search" };
-  if (parts[0] === "read" && parts[1])
-    return { name: "read", bookId: decodeURIComponent(parts[1]), chapterIdx: parts[2] ? Number(parts[2]) : 0 };
+  if (parts[0] === "read" && parts[1]) {
+    const n = Number(parts[2]);
+    return { name: "read", bookId: decodeURIComponent(parts[1]), chapterIdx: parts[2] && Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0 };
+  }
   if (parts[0] === "sources" && parts[2] === "test")
     return { name: "test", sourceId: decodeURIComponent(parts[1]) };
   if (parts[0] === "sources" && parts[2] === "pick")
@@ -43,6 +45,20 @@ const App: Component = () => {
   const onHash = () => setRoute(parseHash());
   window.addEventListener("hashchange", onHash);
   onCleanup(() => window.removeEventListener("hashchange", onHash));
+
+  // 离线横幅：navigator.onLine 不是响应式的，首次渲染后不断网/联网
+  // 横幅都不会变；监听 online/offline 事件驱动 signal。
+  const [online, setOnline] = createSignal(navigator.onLine);
+  onMount(() => {
+    const up = () => setOnline(true);
+    const down = () => setOnline(false);
+    window.addEventListener("online", up);
+    window.addEventListener("offline", down);
+    onCleanup(() => {
+      window.removeEventListener("online", up);
+      window.removeEventListener("offline", down);
+    });
+  });
 
   // 定期检查 Service Worker 更新（2026-11-12）：阅读器翻页是 hash 跳转，
   // 不触发浏览器的 SW 更新检查，旧 SW 会一直钉住（导致章节一直吃旧版
@@ -87,7 +103,7 @@ const App: Component = () => {
         </button>
       </nav>
       </Show>
-      <Show when={!navigator.onLine}>
+      <Show when={!online()}>
         <div class="offline-note">离线状态：仅可查看已缓存的静态资源与最近阅读章节。</div>
       </Show>
       <Show when={route().name === "books"}><Bookshelf /></Show>

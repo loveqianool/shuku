@@ -262,11 +262,15 @@ async fn process_scan_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) ->
     }
     let payload: serde_json::Value = serde_json::from_str(&task.payload).unwrap_or(serde_json::json!({}));
     let path = payload.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let dir = match path {
+    let dir = match &path {
         Some(p) => std::path::PathBuf::from(p),
         None => sched.books_dir.clone(),
     };
-    let report = crate::scanner::scan_once(&sched.db, &sched.search, &dir, &sched.data_dir).await?;
+    // Only a scan of the whole books dir may mark missing books broken.
+    // A single file (watcher) or subdirectory scan must not: it only walks
+    // part of the library, so every other book would look "vanished".
+    let full_scan = path.is_none() || dir == sched.books_dir;
+    let report = crate::scanner::scan_once(&sched.db, &sched.search, &dir, &sched.data_dir, full_scan).await?;
     Ok(format!("scan done: {} new/updated, {} broken, {} unchanged", report.indexed, report.broken, report.unchanged))
 }
 
@@ -801,17 +805,27 @@ pub async fn rebuild_index(sched: &Arc<Scheduler>, pause_crawl: bool) -> Result<
     if pause_crawl {
         sched.pause_crawl(true);
     }
+    // Run the fallible part in a helper so the crawl worker is resumed on
+    // EVERY exit path: previously an early `?` (delete_all / scan_once /
+    // reindex_cached_books) left `pause_crawl` set forever and the crawl
+    // queue stalled while the index was already empty.
+    let result = rebuild_index_inner(sched).await;
+    if pause_crawl {
+        sched.pause_crawl(false);
+    }
+    let (report, cached) = result?;
+    Ok(format!("rebuild done: {} local indexed, {} cached re-indexed, {} broken", report.indexed, cached, report.broken))
+}
+
+async fn rebuild_index_inner(sched: &Arc<Scheduler>) -> Result<(crate::scanner::ScanReport, usize)> {
     let search = sched.search.clone();
     tokio::task::spawn_blocking(move || search.delete_all()).await??;
     info!(target: "search", "index cleared for rebuild");
     // Force the incremental scanner to pick local books up again.
     sched.db.reset_index_versions().await?;
-    let report = crate::scanner::scan_once(&sched.db, &sched.search, &sched.books_dir, &sched.data_dir).await?;
+    let report = crate::scanner::scan_once(&sched.db, &sched.search, &sched.books_dir, &sched.data_dir, true).await?;
     let cached = crate::scanner::reindex_cached_books(&sched.db, &sched.search, &sched.data_dir).await?;
-    if pause_crawl {
-        sched.pause_crawl(false);
-    }
-    Ok(format!("rebuild done: {} local indexed, {} cached re-indexed, {} broken", report.indexed, cached, report.broken))
+    Ok((report, cached))
 }
 
 #[cfg(test)]

@@ -48,11 +48,13 @@ export async function downloadBook(
       const idx = next;
       next += 1;
       try {
-        await fetch(chapterUrl(bookId, idx));
+        // 失败的章节不计入 done（以前 catch 后照样 +1，进度到 100%
+        // 其实有章节没下下来）；15 秒超时，免得一章挂住拖死整批。
+        await fetch(chapterUrl(bookId, idx), { signal: AbortSignal.timeout(15000) });
+        done += 1;
       } catch {
         // 离线/失败的章节跳过，其余继续；已缓存数以实际为准。
       }
-      done += 1;
       onProgress(done);
     }
   };
