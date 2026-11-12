@@ -216,31 +216,58 @@ fn apply_test<'a>(els: Vec<ElementRef<'a>>, test: &NodeTest) -> Vec<ElementRef<'
     }
 }
 
+/// Group `els` (document order, already node-test filtered) by parent and
+/// keep, per group, the elements whose 1-based position within that group
+/// satisfies `keep`. This is standard XPath positional semantics: `div[1]`
+/// is the first `div` child of EACH parent, not the first `div` in the
+/// whole result set (the old code did the latter, so `//li[1]` on a page
+/// with several lists returned only the very first `li`). Groups are
+/// built in document order and a parent's children are contiguous in it,
+/// so concatenating the groups preserves document order.
+fn apply_pos_pred<'a, F>(els: Vec<ElementRef<'a>>, keep: F) -> Vec<ElementRef<'a>>
+where
+    F: Fn(usize, usize) -> bool, // (1-based position within the parent group, group size)
+{
+    let mut groups: Vec<(Option<ElementRef<'a>>, Vec<ElementRef<'a>>)> = Vec::new();
+    for e in els {
+        let key = e.parent().and_then(ElementRef::wrap);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, g)) => g.push(e),
+            None => groups.push((key, vec![e])),
+        }
+    }
+    let mut out = Vec::new();
+    for (_, g) in groups {
+        let len = g.len();
+        for (i, e) in g.into_iter().enumerate() {
+            if keep(i + 1, len) {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
 fn apply_preds<'a>(mut els: Vec<ElementRef<'a>>, preds: &[Pred]) -> Result<Vec<ElementRef<'a>>> {
     for p in preds {
         match p {
             Pred::Index(n) => {
-                els = els.into_iter().nth(n.saturating_sub(1)).into_iter().collect();
+                els = apply_pos_pred(els, |pos, _| pos == *n);
             }
             Pred::Last => {
-                els = els.into_iter().last().into_iter().collect();
+                els = apply_pos_pred(els, |pos, len| pos == len);
             }
             Pred::PosCmp(cmp, n) => {
-                els = els
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(i, _)| {
-                        let pos = (*i + 1) as i64;
-                        match cmp {
-                            Cmp::Gt => pos > *n,
-                            Cmp::Lt => pos < *n,
-                            Cmp::Ge => pos >= *n,
-                            Cmp::Le => pos <= *n,
-                            Cmp::Eq => pos == *n,
-                        }
-                    })
-                    .map(|(_, e)| e)
-                    .collect();
+                els = apply_pos_pred(els, |pos, _| {
+                    let pos = pos as i64;
+                    match cmp {
+                        Cmp::Gt => pos > *n,
+                        Cmp::Lt => pos < *n,
+                        Cmp::Ge => pos >= *n,
+                        Cmp::Le => pos <= *n,
+                        Cmp::Eq => pos == *n,
+                    }
+                });
             }
             Pred::AttrEq(name, val) => {
                 els.retain(|e| e.value().attr(name).map(|v| v == val).unwrap_or(false))
@@ -558,6 +585,20 @@ mod tests {
         assert_eq!(strs(eval_xpath(root, "//a[contains(@href,'/book/2')]/text()").unwrap()), vec!["都市传奇"]);
         assert_eq!(strs(eval_xpath(root, "//div[contains(text(),'修仙')]/a/text()").unwrap()), vec!["修仙传"]);
         assert_eq!(els(eval_xpath(root, "//div[@class='book'][1]").unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn xpath_positional_predicates_group_by_parent() {
+        // Standard XPath: `li[1]` is the first `li` of EACH parent, not
+        // the first `li` in the whole document.
+        let doc: &'static Html = Box::leak(Box::new(Html::parse_document(
+            r#"<html><body><ul><li>A1</li><li>A2</li></ul><ul><li>B1</li><li>B2</li><li>B3</li></ul></body></html>"#,
+        )));
+        let root = doc.root_element();
+        assert_eq!(strs(eval_xpath(root, "//li[1]/text()").unwrap()), vec!["A1", "B1"]);
+        assert_eq!(strs(eval_xpath(root, "//li[2]/text()").unwrap()), vec!["A2", "B2"]);
+        assert_eq!(strs(eval_xpath(root, "//li[last()]/text()").unwrap()), vec!["A2", "B3"]);
+        assert_eq!(strs(eval_xpath(root, "//li[position()>1]/text()").unwrap()), vec!["A2", "B2", "B3"]);
     }
 
     #[test]

@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         engine,
         scheduler: sched,
         config: cfg.clone(),
+        chapter_cache: Arc::new(api::ChapterCache::new(8)),
     };
     let app = api::router(state);
 

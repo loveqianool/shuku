@@ -393,7 +393,7 @@ mod tests {
             source_id: String::new(),
             has_update: false,
             last_update_check: 0,
-            cover: String::new(),
+            cover_mime: String::new(),
         }
     }
 
