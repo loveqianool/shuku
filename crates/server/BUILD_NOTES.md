@@ -272,3 +272,12 @@
 - 通用规则（Ye 追加「其他合适的统一规则也搬过来」）：除断行外，再移植三条——**标点**（Punctuation：99 对半角/异体标点逐字映射为全角 + 13 组 rps 合并重复标点、省略号/破折号后缀清理、?! 连用规范化）、**空格**（Space：删汉字/全角标点及 &、/、\ 左右的多余半角空格）、**全角数字字母转半角**（NumberLetter，全角区与半角区固定差 0xFEE0，直接算不用查表）。三条都在 `paragraphs_from_text` 里每行先进 `apply_typeset`（顺序：全角转半角 → 标点 → 空格 → 断行合并），标点要在断行之前跑（半角 `.` 先变全角 `。`，断行规则才认得出句末）。不搬的：Quote（跨调用 stateful masking，`maskStore`/`maskSeq`，搬到无状态 Rust 不稳阵）、Variant（改中文字形，有搜索风险）、Unicode 转义（txt 里罕见）、Chapter/Separator/SerialNumber/English/End（结构类，与段落展示无关）。Punctuation 的 R1（重复标点）与 R2/R4 含 backreference/look-ahead，Rust `regex` 不支援，R1 改手写扫描连续相同标点，R2 拆三步、R4 改 capture group。
 - epub 不併行：`paragraphs_from_text` 加 `reflow: bool` 参数。epub 的行本身就是 HTML block（`html_to_text_with_images` 每 text 节点一行、无空行分隔），併行会把标题和正文粘成一段；只有 txt/缓存纯文本才做断行合并。API 按副档名传：`.epub` → false，其余 → true；缓存的网络书（纯文本）→ true。字符级排版（标点/空格/全角转半角）两边都跑，epub 只是不併行。注意 `path` 要在 move 进 `spawn_blocking` 之前算好 reflow，移进去后不能再借用。
 - 测试：106 单元 + 2 端到端全绿。新增 `paragraphs_join_hard_wrapped_lines`（截图原文三行硬换行并成一段；行尾句号的换行仍是 2 段）、`typeset_general_rules`（半角标点转全角、全角数字字母转半角、汉字间空格、重复标点合并、?! 规范化）。既有 `epub_image_paragraphs` 仍过（4 段：标题/正文/img/正文）。
+
+## 竖向滑杆方向反了 + 顶栏重叠（2026-11-12，run #20 线上实测）
+
+- 线上实测（run #20 部署后，全新 shuku-test profile）：(a) 底栏本章滚动通过；(b) 竖向滑杆 88vh、跳章、拖动提示「第 X 章 / 共 N 章 · NN%」格式对、2 秒内淡出，基本通过（提示 % 是拖动位置而非落章章首进度，属正常）；(f) 数字间空格与两端对齐通过；英文单词混排因书库正文里找不到英文样本，未能验证。
+- (c) 失败——竖向滑杆方向反了：往下拖是从第 27 章回第 20 章（往前翻），滑块 0% 在底部、100% 在顶部。根因：竖向 range 在这套 CSS（writing-mode: vertical-lr; direction: rtl）下 0 在底、100 在顶，value 直接等于全书进度就是反的。修：value/事件里用 `100 - pct` 反一下（onInput/onChange 里的 tip 与跳章都走反后的值），CSS 不动；往下拖=往后翻，滑块位置与全书进度一致。
+- (d)(e) 失败——点正文重显顶栏后，App 导航与阅读器顶栏挤在同一行重叠（导航只剩「📚 书库 检」）。根因：导航是 sticky top:0，阅读器顶栏是 fixed top:0，两栏都贴在视口顶部；`.reader.chrome-on` 的 padding-top: 52px 只给一栏留了位置。修：Reader 量导航实高（offsetHeight，换行时变高也算到，resize 时重测），阅读器顶栏 style top 顶到导航下方，正文 padding-top 改为导航高 + 顶栏高（内联样式，chrome 收起时撤掉）。
+- 另：章内标题编号与顶栏差两章（如顶栏第 27 章、章内标题「第二十五章」），是书本身目录里多了两章非正文章（前言类），不是代码问题，不修。
+- 注意：此修曾随 05987cc 推过一次，但随后并行的撤 pangu 提交 8ed4e90 以旧版 Reader.tsx 覆盖了它，故在 8ed4e90 之上重贴了一遍。
+- 测试：前端构建通过；后端无改动。方向与重叠待线上复测确认。

@@ -75,8 +75,26 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [showSettings, setShowSettings] = createSignal(false);
   // 本章内滚动进度（0..1），驱动右边的竖向滑杆与全书进度。
   const [scrollFrac, setScrollFrac] = createSignal(0);
-  // 底栏全书滑杆拖动中的值（null 表示没在拖），松手才跳章，免得拖动时反复加载。
+  // 竖向全书滑杆拖动中的值（null 表示没在拖），松手才跳章，免得拖动时反复加载。
   const [bookDrag, setBookDrag] = createSignal<number | null>(null);
+  // 顶栏两行叠放：App 导航（sticky，顶 0）+ 阅读器顶栏（fixed）。
+  // 导航高度随屏宽换行而变，量实高再把阅读器顶栏顶到导航下方，
+  // 免得两栏在视口顶部重叠；窗口变宽/窄时重测。
+  let barRef: HTMLDivElement | undefined;
+  const [navH, setNavH] = createSignal(0);
+  const [barH, setBarH] = createSignal(0);
+  const measureBars = () => {
+    const nav = document.querySelector(".nav") as HTMLElement | null;
+    setNavH(nav ? nav.offsetHeight : 0);
+    if (barRef) setBarH(barRef.offsetHeight);
+  };
+  createEffect(() => {
+    if (showChrome()) requestAnimationFrame(measureBars);
+  });
+  onMount(() => {
+    window.addEventListener("resize", measureBars);
+    onCleanup(() => window.removeEventListener("resize", measureBars));
+  });
   // 竖向全书滑杆拖动提示：目标章节 + 全书百分比，停 1.2 秒后淡出消失。
   const [bookTip, setBookTip] = createSignal<{ pct: number; chapter: number } | null>(null);
   const [tipFading, setTipFading] = createSignal(false);
@@ -503,9 +521,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const ch = () => chapter();
 
   return (
-    <div class="reader" classList={{ "chrome-on": showChrome() }}>
+    <div class="reader" classList={{ "chrome-on": showChrome() }} style={{ "padding-top": showChrome() ? `${navH() + barH()}px` : undefined }}>
       <Show when={showChrome()}>
-        <div class="reader-bar">
+        <div class="reader-bar" ref={barRef} style={{ top: `${navH()}px` }}>
           <a href="#/">‹ 书库</a>
           <strong>{book()?.title ?? "…"}</strong>
           <span class="muted">第 {idx() + 1} 章 / 共 {toc().length} 章</span>
@@ -765,11 +783,13 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
+      {/* 竖向 range 在这套 CSS 下 0 在底部、100 在顶部，
+          所以 value/事件里用 100 - pct 反一下，往下拖才是往后翻。 */}
       <input
         type="range" min="0" max="100" step="0.1"
-        value={bookDrag() ?? bookPct()}
-        onInput={(e) => { const v = Number(e.currentTarget.value); setBookDrag(v); showBookTip(v); }}
-        onChange={(e) => { const v = Number(e.currentTarget.value); setBookDrag(null); jumpToBookPct(v); showBookTip(v); }}
+        value={bookDrag() ?? 100 - bookPct()}
+        onInput={(e) => { const v = Number(e.currentTarget.value); setBookDrag(v); showBookTip(100 - v); }}
+        onChange={(e) => { const v = Number(e.currentTarget.value); setBookDrag(null); jumpToBookPct(100 - v); showBookTip(100 - v); }}
         class="book-progress"
         aria-label="全书进度"
       />
