@@ -323,3 +323,15 @@
   - 拖动提示 `bookTip` 去掉章节，只显示全书百分比「NN%」。
 - 百分比口径不变：仍按章数均权（(章序号 + 章内滚动进度) / 总章数），即 `bookPct()` 不变；变的是落点（章内位置而非章首）与提示。
 - 测试：107 单元 + 2 端到端全绿（纯前端改动，后端未动）。
+
+## 排版大空格：去 justify + 章节缓存改 NetworkFirst（2026-11-12）
+
+- Ye 发截图：正文每行十几个字、字距被拉到两三个字宽，比之前更糟。
+- 根因（两处夹击）：
+  1. 用户读到的章节是旧版未合并的短行。PWA 的 `recent-chapters` 运行时缓存是 `CacheFirst`（30 天）：之前读过这章时旧版已入缓存，后端上了 vvsolo 断行合并也不会再取新版，一直吃旧短行。已用截图原文验证：合併逻辑本身正确，21 行短行应并成 4 段（14/60/29/152 字），不是合併 bug。
+  2. 短行 + `text-align: justify` + `text-justify: inter-ideograph` 是灾难：每行十几个字，justify 要填满整行宽度，字距就被拉大。justify 是 run #20 加的，之前左对齐时短行只是断行、不会有大空格，所以用户说“更糟了”。
+- 修法：
+  - `frontend/src/styles.css`：`.reader-content p` 删掉 `text-align: justify` 与 `text-justify: inter-ideograph`，改回左对齐（默认）；保留 `line-break: strict`、`hanging-punctuation: first`、`text-wrap: pretty`、`word-break: keep-all`、`overflow-wrap: break-word`。构建产物已确认无 justify。
+  - `frontend/vite.config.ts`：`recent-chapters` 由 `CacheFirst` 改 `NetworkFirst`（`networkTimeoutSeconds: 3`）：有网时永远取新版（后端排版规则再变也能立即生效），离线或 3 秒无响应才回落缓存。离线整本功能不受影响（仍走同一缓存预取）。
+- 部署后用户刷新一次即可：新 SW 接管后正文左对齐无大空格，章节走 NetworkFirst 取到已合并的新版。
+- 测试：107 单元 + 2 端到端全绿（纯前端改动，后端未动）。

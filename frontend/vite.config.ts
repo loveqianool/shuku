@@ -30,12 +30,17 @@ export default defineConfig({
         navigateFallback: "/index.html",
         runtimeCaching: [
           {
-            // 章节正文：CacheFirst。整本离线靠阅读器的「下载整本」把全书
-            // 章节预取进这个缓存；上限 5000 章、30 天（约几十本全本）。
+            // 章节正文：NetworkFirst（2026-11-12 由 CacheFirst 改）。
+            // 原因：后端排版规则会变（如 vvsolo 断行合并），CacheFirst 会让
+            // 用户 30 天内一直吃旧版章節（未合併的短行），再配 justify 就
+            // 出大空格。有网时永远取新版、离线或 3 秒无响应才回落缓存。
+            // 整本离线靠阅读器的「下载整本」把全书章节预取进这个缓存；
+            // 上限 5000 章、30 天（约几十本全本）。
             urlPattern: ({ url }) => /\/api\/books\/[^/]+\/chapters\/\d+$/.test(url.pathname),
-            handler: "CacheFirst",
+            handler: "NetworkFirst",
             options: {
               cacheName: "recent-chapters",
+              networkTimeoutSeconds: 3,
               expiration: { maxEntries: 5000, maxAgeSeconds: 30 * 24 * 3600 },
               cacheableResponse: { statuses: [200] },
             },

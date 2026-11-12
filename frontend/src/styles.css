@@ -71,7 +71,7 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .reader-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 12px; position: fixed; top: 0; left: 50%; transform: translateX(-50%); width: min(720px, 100%); box-sizing: border-box; background: var(--bg); z-index: 20; border-bottom: 1px solid var(--border); }
 .reader-bar select, .reader-bar input[type="number"] { width: auto; flex: 0 0 auto; }
 .reader-content { outline: none; }
-.reader-content p { margin: 0 0 0.6em; text-align: justify; line-break: strict; hanging-punctuation: first; text-justify: inter-ideograph; text-wrap: pretty; word-break: keep-all; overflow-wrap: break-word; }
+.reader-content p { margin: 0 0 0.6em; line-break: strict; hanging-punctuation: first; text-wrap: pretty; word-break: keep-all; overflow-wrap: break-word; }
 .reader-content img { max-width: 100%; display: block; margin: 8px auto; }
 .reader-content.page-mode { height: calc(100vh - 220px); overflow: hidden; }
 .reader-settings { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; font-size: 13px; }
