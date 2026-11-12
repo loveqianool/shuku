@@ -344,3 +344,10 @@
 - 修法（`frontend/src/App.tsx`）：`onMount` 里加定期 SW 更新检查——启动时查一次，之后每 30 分钟查一次，切回前台时也查一次（调 `registration.update()`）；有新版时 autoUpdate 自动接管并刷新。以后再有后端排版改动，不用等用户手动刷新也会自己跟上。
 - 用户侧：这次要先做一次完整重载（彻底关掉标签页/应用再重开，不是翻页），新 SW 接管后章节即取已合并的新版。
 - 测试：107 单元 + 2 端到端全绿（纯前端改动，后端未动）。
+
+## 删 `word-break: keep-all`（2026-11-12）
+
+- Ye 指出私隐标签打开也是短行，SW 缓存推断是错的（私隐标签无旧 SW、无旧缓存）。浏览器实测（桌面 Chromium）第 1 章显示为长合并段落，与 API 一致，进一步说明不是后端/缓存问题。
+- 真正根因：`.reader-content p` 的 `word-break: keep-all`。Firefox 对中文的处理是 `keep-all` 禁止在汉字之间断行，只允许在标点/空格处断行；一个 147 字的长段因此只能在逗号、句号、引号处断开，变成每行 10 来字、行行停在标点后的短行。Chromium 对中文 `keep-all` 的处理不同，会在字间断行，所以桌面浏览器测出来是满行。
+- 修法：`frontend/src/styles.css` 的 `.reader-content p` 删掉 `word-break: keep-all`（改回默认 `normal`，Firefox 即可在汉字间断行填满行宽）；保留 `line-break: strict; hanging-punctuation: first; text-wrap: pretty; overflow-wrap: break-word;`。构建产物已确认无 `keep-all`。
+- 测试：107 单元 + 2 端到端全绿（纯 CSS 改动，后端未动）。
