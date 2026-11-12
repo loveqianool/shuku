@@ -485,11 +485,20 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     loadChapter(target, frac);
   };
   // 底栏「搜索」：只浮出搜索面板并聚焦输入框，不显示顶栏/底栏。
+  // 回到结果列表时滚回上次点过的匹配处（jumpToMatch 会收起面板、卸载
+  // 列表 DOM，再开时位置归零；这里用 current 匹配项恢复位置）。
   let searchInputRef: HTMLInputElement | undefined;
+  let matchListRef: HTMLDivElement | undefined;
   const openSearch = () => {
     setShowChrome(false);
     setShowSearch(true);
-    requestAnimationFrame(() => searchInputRef?.focus());
+    requestAnimationFrame(() => {
+      const hasCurrent = currentMatch() >= 0 && inBookMatches().length > 0;
+      searchInputRef?.focus({ preventScroll: hasCurrent });
+      if (hasCurrent) {
+        matchListRef?.querySelector(".match-row.current")?.scrollIntoView({ block: "nearest" });
+      }
+    });
   };
   // 点正文切换顶栏/底栏显隐（有选词时不切换，免得干扰批注）。
   const toggleChrome = () => {
@@ -658,7 +667,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       </Show>
 
       <Show when={showSearch() && inBookMatches().length > 0}>
-        <div class="card">
+        <div class="card" ref={matchListRef}>
           <strong>本书内搜索「{inBookQ()}」：共 {inBookMatchTotal()} 处</strong>
           <button onClick={clearSearch}>清除</button>
           <For each={inBookMatches()}>

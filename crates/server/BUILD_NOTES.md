@@ -391,3 +391,10 @@
   - 现有缓存清理 worker（`run_cache_worker`，每天跑一次）顺带调 `prune_tasks`；main.rs 传新配置。
   - API.md 环境变量表补两项。
 - 测试：新增 `prune_tasks_drops_old_terminal_and_oldest_over_cap`（旧 done/failed 删、旧 pending/running 留、超上限删最旧的 done/failed）；109 单元 + 2 端到端全绿。
+
+## 搜索结果列表回到上次点过的匹配处（2026-11-12）
+
+- Ye 反馈：书内搜索滚到第 100 个匹配项点开，再回搜索结果页要重新滚到第 100 个，没记住位置。
+- 根因：`jumpToMatch` 会 `setShowSearch(false)`，结果列表 DOM 被卸载；再开搜索时重新挂载，滚动位置归零。
+- 修法（`frontend/src/pages/Reader.tsx`）：`openSearch` 里等一帧后，若已有当前匹配项（`currentMatch() >= 0`），将 `.match-row.current` 那行 `scrollIntoView({ block: "nearest" })` 滚回视野；聚焦输入框改 `preventScroll: true`，免得聚焦把页面拉回顶栏。首次搜索（无当前匹配项）行为不变，仍聚焦输入框。
+- 测试：109 单元 + 2 端到端全绿；前端构建通过。
