@@ -12,13 +12,13 @@ use crate::chapter_check::ChapterIssue;
 pub const MIGRATION_SQL: &str = include_str!("../../migrations/001_init.sql");
 
 /// Full books column list, in row_book order.
-const BOOK_COLS: &str = "id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover";
+const BOOK_COLS: &str = "id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover_mime";
 
 /// Shared upsert for a book row (18 columns: the 17 in BOOK_COLS plus
 /// title_pinyin). `upsert_book` and `upsert_books_batch` must stay in sync
 /// — a column added in one place and missed in the other silently
 /// misaligns the params.
-const UPSERT_BOOK_SQL: &str = "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover,title_pinyin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover=excluded.cover,title_pinyin=excluded.title_pinyin";
+const UPSERT_BOOK_SQL: &str = "INSERT INTO books(id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover_mime,title_pinyin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(id) DO UPDATE SET title=excluded.title,author=excluded.author,path=excluded.path,source_url=excluded.source_url,source=excluded.source,mtime=excluded.mtime,size=excluded.size,index_version=excluded.index_version,status=excluded.status,chapter_count=excluded.chapter_count,updated_at=excluded.updated_at,source_id=excluded.source_id,has_update=excluded.has_update,last_update_check=excluded.last_update_check,cover_mime=excluded.cover_mime,title_pinyin=excluded.title_pinyin";
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -75,7 +75,7 @@ pub struct BookRow {
     pub last_update_check: i64,
     /// Cover image MIME type ("" = none). Bytes live in data/covers/<id>.
     #[serde(default)]
-    pub cover: String,
+    pub cover_mime: String,
 }
 
 /// A book with its last-read position, for the 最近阅读 list.
@@ -184,13 +184,34 @@ impl Database {
                 c.execute_batch(
                     "CREATE INDEX IF NOT EXISTS idx_chapter_issues_book ON chapter_issues(book_id)",
                 )?;
+                // Rename books.cover -> books.cover_mime (keeps the MIME
+                // type data). Idempotent: only when the old column exists
+                // and the new one does not; runs before the ALTER loop
+                // below so a fresh DB gets cover_mime directly.
+                let has_cover: bool = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name='cover'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map(|n| n > 0)?;
+                let has_cover_mime: bool = c
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name='cover_mime'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map(|n| n > 0)?;
+                if has_cover && !has_cover_mime {
+                    c.execute_batch("ALTER TABLE books RENAME COLUMN cover TO cover_mime")?;
+                }
                 // v2 columns (idempotent: only ADD when missing, so old
                 // databases pick them up without a version table).
                 for (table, col, ddl) in [
                     ("books", "source_id", "TEXT NOT NULL DEFAULT ''"),
                     ("books", "has_update", "INTEGER NOT NULL DEFAULT 0"),
                     ("books", "last_update_check", "INTEGER NOT NULL DEFAULT 0"),
-                    ("books", "cover", "TEXT NOT NULL DEFAULT ''"),
+                    ("books", "cover_mime", "TEXT NOT NULL DEFAULT ''"),
                     ("books", "title_pinyin", "TEXT NOT NULL DEFAULT ''"),
                     ("sources", "health", "TEXT NOT NULL DEFAULT 'unknown'"),
                     ("sources", "health_error", "TEXT NOT NULL DEFAULT ''"),
@@ -353,12 +374,71 @@ impl Database {
             .await
     }
 
+    /// Books whose ids are in `ids` (from a tantivy `search_book_ids`
+    /// call), with the same author / tag filters, sort and pagination as
+    /// `list_books`. Used when the library list has a `q` filter: matching
+    /// is done by tantivy (jieba + pinyin), not by SQLite `instr`.
+    pub async fn list_books_by_ids(
+        &self,
+        ids: Vec<u64>,
+        author: Option<String>,
+        tag: Option<String>,
+        sort: &str,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<BookRow>, i64)> {
+        let order = match sort {
+            "title" => "title COLLATE NOCASE ASC",
+            "author" => "author COLLATE NOCASE ASC",
+            _ => "updated_at DESC",
+        }
+        .to_string();
+        let (author, tag) = (author.unwrap_or_default(), tag.unwrap_or_default());
+        let offset = (page.max(1) - 1) * page_size.max(1);
+        let limit = page_size.max(1);
+        // Book ids are TEXT in SQLite; bind them as strings.
+        let id_strs: Vec<String> = ids.iter().map(|n| n.to_string()).collect();
+        self.call_db(move |c| {
+                let mut where_sql = String::from("1=1");
+                let mut args: Vec<String> = vec![];
+                if id_strs.is_empty() {
+                    return Ok((vec![], 0));
+                }
+                let placeholders: Vec<String> =
+                    (1..=id_strs.len()).map(|i| format!("?{i}")).collect();
+                where_sql.push_str(&format!(" AND id IN ({})", placeholders.join(",")));
+                args.extend(id_strs);
+                if !author.is_empty() {
+                    where_sql.push_str(&format!(" AND instr(author, ?{}) > 0", args.len() + 1));
+                    args.push(author);
+                }
+                let tag_join = if tag.is_empty() {
+                    String::new()
+                } else {
+                    let n = args.len() + 1;
+                    args.push(tag);
+                    format!(" AND id IN (SELECT book_id FROM tags WHERE tag = ?{n})")
+                };
+                let total_sql = format!("SELECT COUNT(*) FROM books WHERE {where_sql}{tag_join}");
+                let total: i64 = c.query_row(&total_sql, rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
+                let list_sql = format!(
+                    "SELECT {BOOK_COLS} FROM books WHERE {where_sql}{tag_join} ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+                );
+                let mut stmt = c.prepare(&list_sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(args.iter()), row_book)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((rows, total))
+            })
+            .await
+    }
+
     pub async fn upsert_book(&self, b: &BookRow) -> Result<()> {
         let b = b.clone();
         self.call_db(move |c| {
                 c.execute(
                     UPSERT_BOOK_SQL,
-                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover, crate::search::pinyin_text(&b.title)],
+                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover_mime, crate::search::pinyin_text(&b.title)],
                 )?;
                 Ok(())
             })
@@ -381,7 +461,7 @@ impl Database {
             for b in &books {
                 tx.execute(
                     UPSERT_BOOK_SQL,
-                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover, crate::search::pinyin_text(&b.title)],
+                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover_mime, crate::search::pinyin_text(&b.title)],
                 )?;
             }
             for (book_id, titles) in &chapters {
@@ -404,6 +484,17 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.call_db(move |c| {
                 c.execute("UPDATE books SET status=?1, updated_at=?2 WHERE id=?3", params![status, now, id])?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Bump one book's `index_version` (after re-indexing it, so the next
+    /// incremental rebuild skips it).
+    pub async fn set_book_index_version(&self, id: &str, version: i64) -> Result<()> {
+        let id = id.to_string();
+        self.call_db(move |c| {
+                c.execute("UPDATE books SET index_version=?1 WHERE id=?2", params![version, id])?;
                 Ok(())
             })
             .await
@@ -458,25 +549,12 @@ impl Database {
             .await
     }
 
-    /// All book ids (as u64) for a source kind, for search scope filtering.
-    pub async fn book_ids_by_source(&self, source: &str) -> Result<Vec<u64>> {
-        let source = source.to_string();
-        self.call_db(move |c| {
-                let mut stmt = c.prepare("SELECT id FROM books WHERE source=?1")?;
-                let rows = stmt
-                    .query_map(params![source], |r| r.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows.iter().filter_map(|s| s.parse::<u64>().ok()).collect())
-            })
-            .await
-    }
-
     /// All cached (network) books, for re-indexing from chapter files.
-    pub async fn cached_books(&self) -> Result<Vec<(String, String, String)>> {
+    pub async fn cached_books(&self) -> Result<Vec<(String, String, String, i64)>> {
         self.call_db(move |c| {
-                let mut stmt = c.prepare("SELECT id, title, author FROM books WHERE source='cached'")?;
+                let mut stmt = c.prepare("SELECT id, title, author, index_version FROM books WHERE source='cached'")?;
                 let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
@@ -727,23 +805,6 @@ impl Database {
     /// (substring, not full-text). Title matches rank before author
     /// matches. Used by the search box dropdown; the full search is
     /// still tantivy (and covers pinyin).
-    pub async fn suggest_books(&self, q: &str, limit: i64) -> Result<Vec<BookRow>> {
-        let q = q.to_string();
-        self.call_db(move |c| {
-                let mut stmt = c.prepare(&format!(
-                    "SELECT {BOOK_COLS} FROM books \
-                     WHERE instr(title, ?1) > 0 OR instr(author, ?1) > 0 \
-                     ORDER BY CASE WHEN instr(title, ?1) > 0 THEN 0 ELSE 1 END, title COLLATE NOCASE ASC \
-                     LIMIT ?2"
-                ))?;
-                let rows = stmt
-                    .query_map(params![q, limit], row_book)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await
-    }
-
     /// (author, book count), most books first. Empty authors are skipped.
     pub async fn list_authors(&self) -> Result<Vec<(String, i64)>> {
         self.call_db(move |c| {
@@ -1438,7 +1499,7 @@ fn row_book(r: &rusqlite::Row) -> rusqlite::Result<BookRow> {
         source_id: r.get(13)?,
         has_update: r.get(14)?,
         last_update_check: r.get(15)?,
-        cover: r.get(16)?,
+        cover_mime: r.get(16)?,
     })
 }
 
@@ -1477,29 +1538,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suggest_books_ranks_title_before_author() {
-        let db = Database::open_in_memory().await.unwrap();
-        let now = chrono::Utc::now().timestamp();
-        let mk = |id: &str, title: &str, author: &str| BookRow {
-            id: id.into(), title: title.into(), author: author.into(), path: None,
-            source_url: None, source: "local".into(),
-            mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 1,
-            created_at: now, updated_at: now, source_id: String::new(),
-            has_update: false, last_update_check: 0, cover: String::new(),
-        };
-        db.upsert_book(&mk("1", "另一本", "修真者")).await.unwrap();
-        db.upsert_book(&mk("2", "修仙传", "忘语")).await.unwrap();
-        db.upsert_book(&mk("3", "无关", "别人")).await.unwrap();
-        let got = db.suggest_books("修", 8).await.unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].id, "2", "title match ranks first");
-        assert_eq!(got[1].id, "1", "author match second");
-        assert!(db.suggest_books("不存在", 8).await.unwrap().is_empty());
-        let got = db.suggest_books("修", 1).await.unwrap();
-        assert_eq!(got.len(), 1);
-    }
-
-    #[tokio::test]
     async fn list_books_matches_pinyin_initials() {
         let db = Database::open_in_memory().await.unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -1508,7 +1546,7 @@ mod tests {
             source_url: None, source: "local".into(),
             mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 1,
             created_at: now, updated_at: now, source_id: String::new(),
-            has_update: false, last_update_check: 0, cover: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
         };
         db.upsert_book(&mk("1", "武林沉沦")).await.unwrap();
         db.upsert_book(&mk("2", "修仙传")).await.unwrap();
@@ -1543,7 +1581,7 @@ mod tests {
             source_url: None, source: "local".into(),
             mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 5,
             created_at: now, updated_at: now, source_id: String::new(),
-            has_update: false, last_update_check: 0, cover: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
         };
         db.upsert_book(&mk("1", "第一本")).await.unwrap();
         db.upsert_book(&mk("2", "第二本")).await.unwrap();
@@ -1581,7 +1619,7 @@ mod tests {
             source_url: None, source: "local".into(),
             mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 5,
             created_at: now, updated_at: now, source_id: String::new(),
-            has_update: false, last_update_check: 0, cover: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
         })
         .await
         .unwrap();
@@ -1699,7 +1737,7 @@ mod tests {
             source_url: None, source: "local".into(),
             mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: chapters,
             created_at: now, updated_at: now, source_id: String::new(),
-            has_update: false, last_update_check: 0, cover: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
         };
         db.upsert_book(&mk("1", "读完的书", 5)).await.unwrap();
         db.upsert_book(&mk("2", "在读的书", 10)).await.unwrap();
@@ -1732,7 +1770,7 @@ mod tests {
             source_url: None, source: "local".into(),
             mtime: now, size: chapters * 100, index_version: 1, status: "ok".into(), chapter_count: chapters,
             created_at: now, updated_at: now, source_id: String::new(),
-            has_update: false, last_update_check: 0, cover: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
         };
         for (id, t, a, n) in [
             ("1", "修仙传", "忘语", 10),
@@ -1796,7 +1834,7 @@ mod tests {
             source_url: Some("https://example.com/book/1".into()), source: "cached".into(),
             mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 3,
             created_at: now, updated_at: now, source_id: "https://example.com".into(),
-            has_update: false, last_update_check: 0, cover: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
         })
         .await
         .unwrap();
