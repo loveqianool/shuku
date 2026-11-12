@@ -17,7 +17,7 @@ use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
 use tantivy_jieba::JiebaTokenizer;
 use tracing::info;
 
-pub const INDEX_VERSION: i64 = 3;
+pub const INDEX_VERSION: i64 = 4;
 
 /// tantivy indexing threads: `SHUKU_INDEX_THREADS`, else half the CPU
 /// count (1..=8). Writer threads show strongly diminishing returns past 2
@@ -98,7 +98,11 @@ fn find_occurrences(chars: &[char], term_chars: &[Vec<char>]) -> Vec<(usize, usi
         while i + tc.len() <= chars.len() {
             if chars[i..i + tc.len()] == tc[..] {
                 occs.push((i, tc.len()));
-                i += tc.len();
+                // Advance by one, not by the term length, so overlapping
+                // occurrences count (e.g. "aa" occurs twice in "aaa").
+                // Highlighting still skips past each match (see
+                // highlight_window), so rendering stays non-overlapping.
+                i += 1;
             } else {
                 i += 1;
             }
@@ -206,6 +210,7 @@ pub struct SearchIndex {
     f_chapter_title: Field,
     f_content: Field,
     f_pinyin: Field,
+    f_source: Field,
 }
 
 /// Pinyin of a Chinese string, for pinyin search: space-separated
@@ -337,6 +342,15 @@ fn build_schema() -> Schema {
             .set_tokenizer("jieba")
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     ).set_stored());
+    // Book source ("local" / "cached"): a keyword field for scope
+    // filtering, so search does not have to fetch the book ids from
+    // SQLite first. Raw tokenizer = the whole value is one token.
+    // Basic (presence only) is enough for a Term filter.
+    sb.add_text_field("source", TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("raw")
+            .set_index_option(IndexRecordOption::Basic),
+    ).set_stored());
     sb.build()
 }
 
@@ -347,6 +361,7 @@ impl SearchIndex {
         let index = Index::open_or_create(tantivy::directory::MmapDirectory::open(path)?, schema.clone())
             .context("open tantivy index")?;
         index.tokenizers().register("jieba", JiebaTokenizer::new());
+        index.tokenizers().register("raw", tantivy::tokenizer::RawTokenizer::default());
         let writer = index.writer_with_num_threads(writer_threads(), writer_heap_bytes())?;
         Ok(Self {
             f_book_id: schema.get_field("book_id")?,
@@ -356,6 +371,7 @@ impl SearchIndex {
             f_chapter_title: schema.get_field("chapter_title")?,
             f_content: schema.get_field("content")?,
             f_pinyin: schema.get_field("pinyin")?,
+            f_source: schema.get_field("source")?,
             index,
             writer: Mutex::new(writer),
         })
@@ -366,6 +382,7 @@ impl SearchIndex {
         let schema = build_schema();
         let index = Index::create_in_ram(schema.clone());
         index.tokenizers().register("jieba", JiebaTokenizer::new());
+        index.tokenizers().register("raw", tantivy::tokenizer::RawTokenizer::default());
         let writer = index.writer_with_num_threads(writer_threads(), writer_heap_bytes())?;
         Ok(Self {
             f_book_id: schema.get_field("book_id")?,
@@ -375,6 +392,7 @@ impl SearchIndex {
             f_chapter_title: schema.get_field("chapter_title")?,
             f_content: schema.get_field("content")?,
             f_pinyin: schema.get_field("pinyin")?,
+            f_source: schema.get_field("source")?,
             index,
             writer: Mutex::new(writer),
         })
@@ -387,6 +405,7 @@ impl SearchIndex {
         book_id_num: u64,
         book_title: &str,
         author: &str,
+        source: &str,
         chapters: &[(String, String)],
     ) -> Result<usize> {
         let mut w = self.writer.lock().map_err(|e| anyhow::anyhow!("index writer lock poisoned: {e}"))?;
@@ -403,6 +422,7 @@ impl SearchIndex {
                 self.f_chapter_title => title.as_str(),
                 self.f_content => content.as_str(),
                 self.f_pinyin => pinyin.as_str(),
+                self.f_source => source,
             ))?;
             n += 1;
         }
@@ -437,7 +457,7 @@ impl SearchIndex {
     /// index_version still stale).
     pub fn index_books(
         &self,
-        books: &[(u64, String, String, Vec<(String, String)>)],
+        books: &[(u64, String, String, String, Vec<(String, String)>)],
     ) -> Result<Vec<usize>> {
         self.index_books_pinyin(books, true)
     }
@@ -448,15 +468,15 @@ impl SearchIndex {
     /// true; the flag exists only for the probe.
     pub fn index_books_pinyin(
         &self,
-        books: &[(u64, String, String, Vec<(String, String)>)],
+        books: &[(u64, String, String, String, Vec<(String, String)>)],
         include_pinyin: bool,
     ) -> Result<Vec<usize>> {
         let mut w = self.writer.lock().map_err(|e| anyhow::anyhow!("index writer lock poisoned: {e}"))?;
-        for (id, _, _, _) in books {
+        for (id, _, _, _, _) in books {
             w.delete_term(Term::from_field_u64(self.f_book_id, *id));
         }
         let mut counts = Vec::with_capacity(books.len());
-        for (id, title, author, chapters) in books {
+        for (id, title, author, source, chapters) in books {
             let book_pinyin = if include_pinyin {
                 format!("{} {}", pinyin_text(title), pinyin_text(author))
             } else {
@@ -477,6 +497,7 @@ impl SearchIndex {
                     self.f_chapter_title => ctitle.as_str(),
                     self.f_content => content.as_str(),
                     self.f_pinyin => pinyin.as_str(),
+                    self.f_source => source.as_str(),
                 ))?;
                 n += 1;
             }
@@ -487,12 +508,16 @@ impl SearchIndex {
         Ok(counts)
     }
 
-    /// Full-text search. `book_ids` restricts scope (None = all books).
-    /// Blocking call — run inside spawn_blocking.
+    /// Full-text search. `book_ids` restricts scope (None = all books);
+    /// `source` restricts to one book source ("local" / "cached", None =
+    /// all) via the indexed `source` field, so callers no longer have to
+    /// fetch the book ids from SQLite first. Blocking call — run inside
+    /// spawn_blocking.
     pub fn search(
         &self,
         query_str: &str,
         book_ids: Option<&[u64]>,
+        source: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<SearchHit>, usize)> {
@@ -509,7 +534,17 @@ impl SearchIndex {
         // `xiuxian` becomes `xiu xian` and matches the indexed field.
         let expanded = expand_pinyin_query(query_str);
         let base_query = parser.parse_query(&expanded)?;
-        // Scope filter inside tantivy (BooleanQuery) so totals stay correct.
+        // Scope filters inside tantivy (BooleanQuery) so totals stay correct.
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(Occur::Must, base_query)];
+        if let Some(src) = source {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.f_source, src),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
         let query: Box<dyn tantivy::query::Query> = match book_ids {
             Some(ids) if !ids.is_empty() => {
                 let scope_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = ids
@@ -524,13 +559,17 @@ impl SearchIndex {
                         )
                     })
                     .collect();
-                Box::new(BooleanQuery::new(vec![
-                    (Occur::Must, base_query),
-                    (Occur::Must, Box::new(BooleanQuery::new(scope_clauses))),
-                ]))
+                clauses.push((Occur::Must, Box::new(BooleanQuery::new(scope_clauses))));
+                Box::new(BooleanQuery::new(clauses))
             }
             Some(_) => return Ok((vec![], 0)),
-            None => base_query,
+            None => {
+                if clauses.len() == 1 {
+                    clauses.pop().unwrap().1
+                } else {
+                    Box::new(BooleanQuery::new(clauses))
+                }
+            }
         };
         let top_docs = searcher.search(
             &*query,
@@ -604,6 +643,46 @@ impl SearchIndex {
             });
         }
         Ok((hits, total))
+    }
+
+    /// Book ids whose title / author / pinyin match `query_str`, in
+    /// relevance order, deduplicated. Used by the library list filter and
+    /// by search suggestions, so they match on jieba tokens and pinyin
+    /// instead of the SQLite `instr` substring match. Searches
+    /// title/author/pinyin only — not chapter content (a library filter
+    /// is about the book, not a chapter). Blocking call — run inside
+    /// spawn_blocking.
+    pub fn search_book_ids(&self, query_str: &str, limit: usize) -> Result<Vec<u64>> {
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let schema = self.index.schema();
+        let mut parser = QueryParser::new(
+            schema,
+            vec![self.f_book_title, self.f_author, self.f_pinyin],
+            self.index.tokenizers().clone(),
+        );
+        parser.set_conjunction_by_default();
+        let expanded = expand_pinyin_query(query_str);
+        let query = parser.parse_query(&expanded)?;
+        // Ask for more docs than the limit: several chapters of one book
+        // can occupy the top slots, and we dedupe by book below.
+        let top_docs = searcher.search(
+            &*query,
+            &TopDocs::with_limit(limit.saturating_mul(4).max(limit)).order_by_score(),
+        )?;
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut out: Vec<u64> = Vec::new();
+        for (_score, addr) in top_docs {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            let bid = doc.get_first(self.f_book_id).and_then(|v| v.as_u64()).unwrap_or(0);
+            if bid != 0 && seen.insert(bid) {
+                out.push(bid);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Every literal occurrence of `query_str` in one book, in document
@@ -736,6 +815,7 @@ mod tests {
             1,
             "修仙传",
             "忘语",
+            "local",
             &[("第一章 开始".into(), "山里的少年什么也不知道。".into())],
         )
         .unwrap();
@@ -743,12 +823,13 @@ mod tests {
             2,
             "测试小说",
             "作者甲",
+            "local",
             &[("序".into(), "另一本完全无关的书。".into())],
         )
         .unwrap();
         // Full initials, partial initials, author initials.
         for q in ["xxc", "xx", "wy", "x"] {
-            let (hits, _) = idx.search(q, None, 10, 0).unwrap();
+            let (hits, _) = idx.search(q, None, None, 10, 0).unwrap();
             assert!(!hits.is_empty(), "initials query {q:?} must hit 修仙传");
             assert!(
                 hits.iter().any(|h| h.book_id == "1"),
@@ -756,10 +837,10 @@ mod tests {
             );
         }
         // "xx" must not hit the other book (its initials are cxs / zzj / x).
-        let (hits, _) = idx.search("xx", None, 10, 0).unwrap();
+        let (hits, _) = idx.search("xx", None, None, 10, 0).unwrap();
         assert!(hits.iter().all(|h| h.book_id == "1"), "xx must not hit 测试小说: {hits:?}");
         // Full pinyin still works after the initials change.
-        let (hits, _) = idx.search("xiuxian", None, 10, 0).unwrap();
+        let (hits, _) = idx.search("xiuxian", None, None, 10, 0).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].book_title, "修仙传");
     }
@@ -771,6 +852,7 @@ mod tests {
             1,
             "修仙传",
             "忘语",
+            "local",
             &[("第一章 开始".into(), "山里的少年什么也不知道。".into())],
         )
         .unwrap();
@@ -778,29 +860,30 @@ mod tests {
             2,
             "测试小说",
             "作者甲",
+            "local",
             &[("序".into(), "另一本完全无关的书。".into())],
         )
         .unwrap();
         for q in ["xiuxian", "xiu xian", "wangyu", "xiuxianchuan", "xiu xian chuan"] {
-            let (hits, _) = idx.search(q, None, 10, 0).unwrap();
+            let (hits, _) = idx.search(q, None, None, 10, 0).unwrap();
             assert!(!hits.is_empty(), "pinyin query {q:?} must hit 修仙传");
             assert!(hits.iter().all(|h| h.book_id == "1"), "pinyin query {q:?} must not hit the other book: {hits:?}");
             assert_eq!(hits[0].book_title, "修仙传");
         }
         // Chinese query still works, and a pinyin-only match shows a snippet.
-        let (hits, _) = idx.search("修仙", None, 10, 0).unwrap();
+        let (hits, _) = idx.search("修仙", None, None, 10, 0).unwrap();
         assert!(!hits.is_empty());
-        let (hits, _) = idx.search("xiuxian", None, 10, 0).unwrap();
+        let (hits, _) = idx.search("xiuxian", None, None, 10, 0).unwrap();
         assert!(!hits[0].snippet.is_empty(), "pinyin match should still show a snippet");
     }
 
     #[test]
     fn delete_book_removes_docs() {
         let idx = SearchIndex::open_in_ram().unwrap();
-        idx.index_book(1, "测试小说", "作者甲", &[("第一章".into(), "修仙内容".into())]).unwrap();
-        idx.index_book(2, "另一本", "作者乙", &[("序".into(), "修仙世界".into())]).unwrap();
+        idx.index_book(1, "测试小说", "作者甲", "local", &[("第一章".into(), "修仙内容".into())]).unwrap();
+        idx.index_book(2, "另一本", "作者乙", "local", &[("序".into(), "修仙世界".into())]).unwrap();
         idx.delete_book(1).unwrap();
-        let (hits, _) = idx.search("修仙", None, 10, 0).unwrap();
+        let (hits, _) = idx.search("修仙", None, None, 10, 0).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].book_id, "2");
     }
@@ -812,27 +895,62 @@ mod tests {
             1,
             "测试小说",
             "作者甲",
+            "local",
             &[
                 ("第一章 开始".into(), "少年走在山路上，心中想着修仙的事。".into()),
                 ("第二章 练功".into(), "他在山洞里打坐修炼，灵气汇聚。".into()),
             ],
         )
         .unwrap();
-        let (hits, _total) = idx.search("修仙", None, 10, 0).unwrap();
+        let (hits, _total) = idx.search("修仙", None, None, 10, 0).unwrap();
         assert!(!hits.is_empty(), "expected a hit for 修仙");
         assert!(hits[0].snippet.contains("<em>"), "snippet should highlight: {}", hits[0].snippet);
         assert_eq!(hits[0].chapter_idx, 0);
         // incremental re-index replaces old docs
-        idx.index_book(1, "测试小说", "作者甲", &[("第一章 开始".into(), "全新的内容没有任何关键词。".into())])
+        idx.index_book(1, "测试小说", "作者甲", "local", &[("第一章 开始".into(), "全新的内容没有任何关键词。".into())])
             .unwrap();
-        let (hits, _) = idx.search("修仙", None, 10, 0).unwrap();
+        let (hits, _) = idx.search("修仙", None, None, 10, 0).unwrap();
         assert!(hits.is_empty(), "old docs must be gone after re-index");
         // scope filter
-        idx.index_book(2, "另一本", "作者乙", &[("序".into(), "修仙世界广阔无边。".into())])
+        idx.index_book(2, "另一本", "作者乙", "local", &[("序".into(), "修仙世界广阔无边。".into())])
             .unwrap();
-        let (hits, _) = idx.search("修仙", Some(&[2]), 10, 0).unwrap();
+        let (hits, _) = idx.search("修仙", Some(&[2]), None, 10, 0).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].book_id, "2");
+    }
+
+    #[test]
+    fn search_scope_by_source_field() {
+        // scope=local / scope=cached filters by the indexed `source`
+        // field, without fetching book ids from SQLite first.
+        let idx = SearchIndex::open_in_ram().unwrap();
+        idx.index_book(1, "本地书", "作者甲", "local", &[("第一章".into(), "修仙内容".into())]).unwrap();
+        idx.index_book(2, "缓存书", "作者乙", "cached", &[("序".into(), "修仙世界".into())]).unwrap();
+        let (hits, _) = idx.search("修仙", None, Some("local"), 10, 0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].book_id, "1");
+        let (hits, _) = idx.search("修仙", None, Some("cached"), 10, 0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].book_id, "2");
+        let (hits, total) = idx.search("修仙", None, None, 10, 0).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn search_book_ids_matches_title_and_pinyin_initials() {
+        // Library filter / suggest via tantivy: title substring, author,
+        // and pinyin initials (wlcl -> 武林沉沦) all match; chapter
+        // content alone does not (a library filter is about the book).
+        let idx = SearchIndex::open_in_ram().unwrap();
+        idx.index_book(1, "武林沉沦", "佚名", "local", &[("第一章".into(), "江湖内容".into())]).unwrap();
+        idx.index_book(2, "修仙传", "忘语", "local", &[("第一章".into(), "武林高手出现".into())]).unwrap();
+        assert_eq!(idx.search_book_ids("武林", 10).unwrap(), vec![1]);
+        assert_eq!(idx.search_book_ids("wlcl", 10).unwrap(), vec![1]);
+        assert_eq!(idx.search_book_ids("忘语", 10).unwrap(), vec![2]);
+        // "武林高手" only occurs in book 2's chapter content, not in a
+        // title/author, so the book filter must not match it.
+        assert!(idx.search_book_ids("武林高手", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -842,13 +960,14 @@ mod tests {
             1,
             "武林沉沦番外",
             "佚名",
+            "local",
             &[
                 ("番外（1）".into(), "李茉进了屋，李茉又出来了。".into()),
                 ("第一章".into(), "他想起李茉，想起李茉，想起李茉。".into()),
             ],
         )
         .unwrap();
-        idx.index_book(2, "另一本", "作者乙", &[("序".into(), "李茉也在别处。".into())])
+        idx.index_book(2, "另一本", "作者乙", "local", &[("序".into(), "李茉也在别处。".into())])
             .unwrap();
         // 2 + 3 = 5 occurrences, document order (chapter, then offset).
         let (items, total) = idx.list_matches(1, "李茉", 10, 0).unwrap();
@@ -895,21 +1014,21 @@ mod tests {
             .collect();
         files.sort();
         let t0 = Instant::now();
-        let mut books: Vec<(u64, String, String, Vec<(String, String)>)> = Vec::new();
+        let mut books: Vec<(u64, String, String, String, Vec<(String, String)>)> = Vec::new();
         for (i, f) in files.iter().enumerate() {
             let parsed = crate::parser::parse_book_file(f).unwrap();
             let chs: Vec<(String, String)> =
                 parsed.chapters.iter().map(|c| (c.title.clone(), c.text.clone())).collect();
-            books.push((i as u64 + 1, parsed.title, parsed.author, chs));
+            books.push((i as u64 + 1, parsed.title, parsed.author, "local".to_string(), chs));
         }
         let parse_ms = t0.elapsed().as_millis();
         let total_ch: usize = books.iter().map(|b| b.3.len()).sum();
-        let total_bytes: usize = books.iter().flat_map(|b| b.3.iter().map(|c| c.1.len())).sum();
+        let total_bytes: usize = books.iter().flat_map(|b| b.4.iter().map(|c| c.1.len())).sum();
 
         // 1. Raw cost of computing pinyin_text for every title/author.
         let t0 = Instant::now();
         let mut pinyin_bytes = 0usize;
-        for (_, title, author, chs) in &books {
+        for (_, title, author, _source, chs) in &books {
             pinyin_bytes += pinyin_text(title).len() + pinyin_text(author).len();
             for (ct, _) in chs {
                 pinyin_bytes += pinyin_text(ct).len();
@@ -992,12 +1111,12 @@ mod tests {
             let mut times: Vec<u128> = Vec::new();
             for _ in 0..21 {
                 let t0 = Instant::now();
-                let (hits, total) = idx.search(q, None, 10, 0).unwrap();
+                let (hits, total) = idx.search(q, None, None, 10, 0).unwrap();
                 times.push(t0.elapsed().as_micros());
                 let _ = (hits, total);
             }
             times.sort_unstable();
-            let (hits, total) = idx.search(q, None, 10, 0).unwrap();
+            let (hits, total) = idx.search(q, None, None, 10, 0).unwrap();
             println!("pinyin probe: query {q:?} median_us={} hits={} total={total}", times[10], hits.len());
         }
         let _ = std::fs::remove_dir_all(&idx_dir);
