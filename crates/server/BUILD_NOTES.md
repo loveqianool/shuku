@@ -407,3 +407,27 @@
 - #21 之 OPDS 非法头值：**找到真缺口并修了**。`sanitize_filename` 只在缓存书（书名拼文件名）那支用过，本地文件那支直接用磁盘文件名拼 `Content-Disposition`，Linux 文件名可含换行符，会污染头。修法（`src/opds.rs`）：本地文件名也过 `sanitize_filename`。
 - #21 之 reqwest 307/308 body 重发：**代码核实无问题**。请求 body 是 `String`（可重发），客户端没自定义 redirect 策略（用默认：跟随重定向，307/308 保留方法与 body 重发）。无需修，未做 live 测试。
 - #21 之 `get_book_image` 双重解码：**边缘情况，不改**。axum 已解码一次路径后 `percent_decode` 再解一次，正常路径（含空格）下是 no-op；只有 epub 内图片路径字面含 `%20` 时会查不到，该情况极罕见，改动反而可能破坏正常路径。保持现状。
+
+## 待定项剩余 12 项全做 + 第二轮全量检查（2026-11-12）
+
+Ye 指令：剩下的待定全部做，做完再做一次全量检查、精简优化。12 项（#4、#5、#6、#8、#9、#11、#12、#13、#14、#15、#17、#18）全部完成。
+
+- #4 章节级缓存：`src/api/mod.rs` 新增 `ChapterCache`（Mutex + HashMap<String,(i64,Arc<Vec<String>>)> + VecDeque LRU，最多 8 本）。`get_chapter` 本地书分支先取磁盘 mtime 校验，命中直接用缓存；只缓存章节文本，不缓存封面字节。新增测试 `chapter_cache_hit_miss_and_mtime_invalidation`、`chapter_cache_evicts_least_recently_used`。教训：Mutex 缓存 get 后先 clone Arc 断开借用再改 LRU 顺序，否则 E0502。
+- #5 搜索 scope 改索引：schema 新增 `source` 字段（raw tokenizer、Basic、stored），`INDEX_VERSION` 3→4。`search()` 加 `source: Option<&str>` 参数（TermQuery Must 子句）；`index_book` 签名加 `source`（本地书 "local"、缓存书 "cached"）；`index_books` 元组变 5 元组。删已死 DB 方法 `book_ids_by_source`。部署影响：线上 index_version=3，部署后首次扫描会全量重索引一遍（预期）。
+- #6 爬取章节有界并发：`fetch_chapter_texts` 抓取段改 JoinSet + Semaphore（`CRAWL_CONCURRENCY=4`）；结果按 index 收集再按 TOC 顺序写 temp 目录；暂停时 `set.abort_all()` + 删 temp。引擎每域名令牌桶（默认 2.0/s）仍是实际瓶颈。
+- #8 书库列表/联想改走 tantivy：新增 `SearchIndex::search_book_ids(query, limit)`（只查 book_title/author/pinyin 三字段、expand_pinyin_query、TopDocs 取 limit*4 后按书去重保相关序）；DB 新增 `list_books_by_ids`（IN 子句保留 id 顺序）；`list_books` 有 q 走 tantivy 再 `list_books_by_ids`，无 q 走原 SQLite。`suggest` 主来源改 tantivy + 全文补足到 8。删已死 DB 方法 `suggest_books` 及其测试。DB `list_books` 的 `q` 参数与 `title_pinyin` 列保留（完整、已测试的 DB 能力，删除需 DROP COLUMN 迁移，风险大于收益）。
+- #9 增量重建索引：`rebuild_index` 加 `full: bool`（默认 false 增量：只重索引 index_version < INDEX_VERSION 的书；full=true 才清索引全量重建）。`reindex_cached_books` 加 `full` 参数，增量时跳过已达标的书，索引后写回 `set_book_index_version`（新增 DB 方法）。`RebuildReq` 加 `full`，`trigger_rebuild_index` 写进 payload 并回显。`cached_books()` 返回变 4 元组（加 index_version）。
+- #11 换源原子替换：`fetch_chapter_texts` 先写临时目录 `data/chapters/<book_id>.tmp-<uuid>/` 再原子交换（live→`.old-<uuid>` 备份，tmp→live，删备份；交换失败恢复旧目录）；开头清残留 `.tmp-*`；live 缺失但 `.old-*` 存在先恢复备份。原「删超出新 TOC 长度的旧文件」代码已删（交换后天然无残留）。
+- #12 错误状态码：`ApiError` 改 struct `{status, error}`；`not_found`/`bad_request` 构造器；`From<anyhow::Error>`=500、`From<JoinError>`=500、`From<serde_json::Error>`=400。约 25 处调用点改完（不存在→404、参数无效→400）。教训：`spawn_blocking` 闭包返回 `anyhow::Result` 时闭包内不能用 `ApiError`（无 From 转换），改闭包返回 `ApiResult`。
+- #13 XPath 序號謂詞按父节点分组（破坏性，Ye 已知情）：`apply_pos_pred` 按父节点分组、组内 1-based 判定；`//li[1]` 现在返回每个父节点下的第一个 li（标准 XPath），原来只返回全局第一个。新增测试 `xpath_positional_predicates_group_by_parent`。
+- #14 失败新章节不计入 chapter_count：`process_check_update` 新章节按 TOC 顺序抓、第一个失败即 break（不写空文件、不计数），`titles` 只取成功前缀；`fetched==0` 直接返回不写 DB；下次检查从失败处重试。
+- #15 cover 改名 cover_mime + 重叠词计数（破坏性，Ye 已知情）：(a) `find_occurrences` 匹配后 `i += 1`（重叠计入，如 "aa" 在 "aaa" 里算 2 次）；高亮仍非重叠。(b) DB 列 `cover`→`cover_mime`（migrate 前 RENAME COLUMN；ALTER 循环同步改）；`BookRow.cover_mime`、`BOOK_COLS`、`UPSERT_BOOK_SQL`、全部测试 fixture、scanner/scheduler/source/opds 的 `cover: String::new()` 全改。未改名：`ParsedBook.cover`（图片字节）、`item.cover`、`covers/` 目录、`/cover` 路由。API get_book 详情 JSON 键 `"cover"`→`"cover_mime"`；前端 `api.ts`、`Bookshelf.tsx` 同步改完。
+- #17 整本离线取消按钮（前端）：`downloadBook` 加 `options?: {signal?: AbortSignal}`（预取与每章都带 signal、取下一章前查 aborted、每章 fetch 用 `AbortSignal.any([signal, AbortSignal.timeout(15000)])`，取消正常 resolve）；`Reader.tsx` 每次下载新建 AbortController、新增 `cancelDownload()` 与下载中「取消」按钮、离线卡片加文案「最多 5000 章、保留 30 天」。
+- #18 搜索页与任务页加载更多（前端）：`api.ts` 的 `listTasks` 加 `page/page_size` 参数；`SearchPage.tsx`、`Tasks.tsx` 各加 page/total/loadingMore 与 `loadMore()`（追加下一页），按钮「加载更多（还剩 N 个/条）」仅 loaded<total 时显示；Tasks 刷新/换筛选重置到第 1 页。
+
+第二轮全量检查（本节后半）：
+- `cargo check` 仅剩 2 个警告：`static_files.rs` 的 `content_type`、`cache_control` 在本地无 `frontend/dist` 时 never used——CI 有 dist 就用到，不是真死代码，不动。
+- `fetch_chapter_texts` JoinSet 提前返回时任务被 detach：任务只做网络抓取、不写磁盘（写盘在主循环收集结果后），无副作用，安全。
+- `list_books_by_ids` IN 子句最多 1000 个占位符，rusqlite 捆绑的 SQLite（≥3.32）上限 32766，无问题。
+- 文档同步：`docs/API.md`（错误码 404/400/500、rebuild-index 的 full、get_book 的 cover_mime）、`docs/ARCHITECTURE.md`（搜索/联想/书库列表走 tantivy）、本 BUILD_NOTES。
+- 测试：`cargo test --release` 115 单元 + 2 端到端全绿（基线 111 + 新增 5：xpath 分组 1、chapter_cache 2、search source 1、search_book_ids 1；删 suggest_books 测试 1）。
