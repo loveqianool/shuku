@@ -373,3 +373,11 @@
   - 文档：ARCHITECTURE（11 张表、schema 补字段、SW 策略改述、REST 清单补全）与 API.md（索引版本 3、环境变量 19 个、错误格式、stats 上限、书源字段、OPDS 分页）同步；BUILD_NOTES「已知限制」删已解决的四条，CI 一节改述（自 2026-11-12 不再跑测试）。
 - 待定 21 项（未动手，需判断或实测）：SSRF 完整校验、CORS 收紧、章节级缓存、搜索 scope 改索引、爬取有界并发、`list_matches` 流式化、书库列表/联想改走 tantivy、OPDS 流式下载、任务历史归档、错误状态码区分、XPath 序号谓词分组、换源原子替换、失败章节计数、书源凭证加密、整本离线取消按钮、搜索/任务页分页、阅读器首尾常驻 padding（与浮层方案取舍，需 Ye 定）、watcher 回调 panic、QuickJS/图片/OPDS 若干待实测项、`cover` 改名与 `list_matches` 计数。
 - 测试：108 单元（新增 `partial_scan_does_not_mark_others_broken`）+ 2 端到端全绿；前端构建通过。
+
+## 顶栏/底栏默认隐藏，点正文唤出；开搜索只出搜索框（2026-11-12）
+
+- 待定项 #19（阅读器首尾常驻 padding）的取舍，Ye 定：不加常驻 padding，改成默认隐藏浮层、点击显示。
+- 修法（`frontend/src/lib/readerChrome.ts`、`frontend/src/pages/Reader.tsx`）：
+  - `readerChrome` 初始值由 `true` 改 `false`；进阅读界面时 `onMount` 改设 `false`（之前是强制 `true`）。
+  - 开搜索（`openSearch`）改收起顶栏/底栏（`setShowChrome(false)`，之前是强制 `true`）、只浮出搜索面板并聚焦输入框；搜索面板本身已由 `showSearch` 单独控制，不依赖顶栏/底栏。
+- 测试：108 单元 + 2 端到端全绿；前端构建通过。

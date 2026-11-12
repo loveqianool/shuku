@@ -107,8 +107,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     tipClearTimer = setTimeout(() => setBookTip(null), 1500);
   };
   onCleanup(() => { clearTimeout(tipTimer); clearTimeout(tipClearTimer); });
-  // 进阅读界面时顶栏/底栏默认显示（之前若收起过，打开新书时恢复）。
-  onMount(() => setShowChrome(true));
+  // 进阅读界面时顶栏/底栏默认隐藏（点正文唤出；之前若显示过，打开新书时恢复隐藏）。
+  onMount(() => setShowChrome(false));
 
   // 当前选中处定位：章节渲染好之后，把本章第 currentOccurrence 个
   // mark.search-hit 单独标亮（search-hit-current）并滚到它。只在当前
@@ -484,10 +484,10 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     }
     loadChapter(target, frac);
   };
-  // 底栏「搜索」：浮出顶栏与搜索面板并聚焦输入框。
+  // 底栏「搜索」：只浮出搜索面板并聚焦输入框，不显示顶栏/底栏。
   let searchInputRef: HTMLInputElement | undefined;
   const openSearch = () => {
-    setShowChrome(true);
+    setShowChrome(false);
     setShowSearch(true);
     requestAnimationFrame(() => searchInputRef?.focus());
   };
