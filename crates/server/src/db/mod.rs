@@ -978,6 +978,70 @@ impl Database {
             .await
     }
 
+    /// Delete old task history (scan_tasks + crawl_tasks), oldest first.
+    /// Only terminal tasks (`done`/`failed`) are ever deleted: `pending` and
+    /// `running` tasks are kept even when old or over the cap, so a stuck
+    /// queue is never silently "fixed" by deleting live work.
+    /// 1. Time-based: delete terminal tasks older than `retention_days`.
+    /// 2. Count-based: while the total across both tables exceeds `max_rows`,
+    ///    delete the oldest terminal tasks in batches.
+    /// Returns (expired_by_age, deleted_over_cap).
+    pub async fn prune_tasks(&self, retention_days: i64, max_rows: i64) -> Result<(i64, i64)> {
+        self.call_db(move |c| {
+                let now = chrono::Utc::now().timestamp();
+                let cutoff = now - retention_days.max(0) * 86_400;
+                let mut expired = 0i64;
+                for table in ["scan_tasks", "crawl_tasks"] {
+                    expired += c.execute(
+                        &format!("DELETE FROM {table} WHERE status IN ('done','failed') AND created_at < ?1"),
+                        params![cutoff],
+                    )? as i64;
+                }
+                let mut overflow = 0i64;
+                loop {
+                    let total: i64 = c.query_row(
+                        "SELECT (SELECT COUNT(*) FROM scan_tasks) + (SELECT COUNT(*) FROM crawl_tasks)",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if total <= max_rows {
+                        break;
+                    }
+                    // Find which table holds the oldest terminal task, and
+                    // delete a batch from it (oldest first). The loop
+                    // re-checks, so the split across tables stays fair.
+                    let oldest: Option<(String, i64)> = c
+                        .query_row(
+                            "SELECT 'scan_tasks', MIN(created_at) FROM scan_tasks WHERE status IN ('done','failed') \
+                             UNION ALL \
+                             SELECT 'crawl_tasks', MIN(created_at) FROM crawl_tasks WHERE status IN ('done','failed') \
+                             ORDER BY 2 ASC LIMIT 1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?)),
+                        )
+                        .ok()
+                        .and_then(|(t, m)| m.map(|v| (t, v)));
+                    let Some((table, _)) = oldest else {
+                        break; // No terminal tasks left to prune.
+                    };
+                    let deleted = c.execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE id IN \
+                             (SELECT id FROM {table} WHERE status IN ('done','failed') \
+                              ORDER BY created_at ASC, id ASC LIMIT 500)"
+                        ),
+                        [],
+                    )? as i64;
+                    overflow += deleted;
+                    if deleted == 0 {
+                        break;
+                    }
+                }
+                Ok((expired, overflow))
+            })
+            .await
+    }
+
     // ---------- tasks ----------
     pub async fn enqueue_task(&self, table: &str, r#type: &str, payload: &str) -> Result<String> {
         let (table, r#type, payload) = (table.to_string(), r#type.to_string(), payload.to_string());
@@ -1575,6 +1639,55 @@ mod tests {
         assert_eq!(overflow, 1);
         let (_, bytes) = db.cache_stats().await.unwrap();
         assert!(bytes <= 25, "bytes must be under cap: {bytes}");
+    }
+
+    #[tokio::test]
+    async fn prune_tasks_drops_old_terminal_and_oldest_over_cap() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let day = 86_400i64;
+        // scan_tasks: done-old, done-5d, pending-old.
+        // crawl_tasks: failed-old, done-recent, running-old.
+        let s1 = db.enqueue_task("scan_tasks", "rebuild_index", "{}").await.unwrap();
+        let s2 = db.enqueue_task("scan_tasks", "rebuild_index", "{}").await.unwrap();
+        let s3 = db.enqueue_task("scan_tasks", "rebuild_index", "{}").await.unwrap();
+        let c1 = db.enqueue_task("crawl_tasks", "check_update", "{}").await.unwrap();
+        let c2 = db.enqueue_task("crawl_tasks", "check_update", "{}").await.unwrap();
+        let c3 = db.enqueue_task("crawl_tasks", "check_update", "{}").await.unwrap();
+        db.call_db(move |c| {
+            c.execute("UPDATE scan_tasks SET status='done', created_at=?1 WHERE id=?2", params![now - 40 * day, s1])?;
+            c.execute("UPDATE scan_tasks SET status='done', created_at=?1 WHERE id=?2", params![now - 5 * day, s2])?;
+            c.execute("UPDATE scan_tasks SET status='pending', created_at=?1 WHERE id=?2", params![now - 40 * day, s3])?;
+            c.execute("UPDATE crawl_tasks SET status='failed', created_at=?1 WHERE id=?2", params![now - 40 * day, c1])?;
+            c.execute("UPDATE crawl_tasks SET status='done', created_at=?1 WHERE id=?2", params![now, c2])?;
+            c.execute("UPDATE crawl_tasks SET status='running', created_at=?1 WHERE id=?2", params![now - 40 * day, c3])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        // Time-based (30d): the two 40-day-old terminal tasks go;
+        // recent done tasks and old pending/running tasks stay.
+        let (expired, overflow) = db.prune_tasks(30, 10_000).await.unwrap();
+        assert_eq!(expired, 2, "old done + old failed must go");
+        assert_eq!(overflow, 0);
+        let (tasks, total) = db.list_all_tasks(None, 1, 100).await.unwrap();
+        assert_eq!(total, 4);
+        let statuses: Vec<&str> = tasks.iter().map(|t| t.status.as_str()).collect();
+        assert!(statuses.contains(&"done"));
+        assert!(statuses.contains(&"pending"));
+        assert!(statuses.contains(&"running"));
+        assert!(!statuses.contains(&"failed"), "old failed must be gone");
+        // Count cap: 4 tasks, cap 3 -> the oldest terminal task (s2, 5d done) goes;
+        // pending/running are never deleted for the cap.
+        let (_, overflow) = db.prune_tasks(30, 3).await.unwrap();
+        assert_eq!(overflow, 1, "oldest terminal task over the cap must go");
+        let (_, total) = db.list_all_tasks(None, 1, 100).await.unwrap();
+        assert_eq!(total, 3);
+        let (tasks, _) = db.list_all_tasks(None, 1, 100).await.unwrap();
+        let statuses: Vec<&str> = tasks.iter().map(|t| t.status.as_str()).collect();
+        assert!(statuses.contains(&"pending"));
+        assert!(statuses.contains(&"running"));
+        assert_eq!(statuses.iter().filter(|s| **s == "done").count(), 1, "only the recent done task stays");
     }
 
     #[tokio::test]

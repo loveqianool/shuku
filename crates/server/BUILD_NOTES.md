@@ -381,3 +381,13 @@
   - `readerChrome` 初始值由 `true` 改 `false`；进阅读界面时 `onMount` 改设 `false`（之前是强制 `true`）。
   - 开搜索（`openSearch`）改收起顶栏/底栏（`setShowChrome(false)`，之前是强制 `true`）、只浮出搜索面板并聚焦输入框；搜索面板本身已由 `showSearch` 单独控制，不依赖顶栏/底栏。
 - 测试：108 单元 + 2 端到端全绿；前端构建通过。
+
+## 任务历史保留：30 天 + 1 万条上限（2026-11-12）
+
+- 待定项 #16。Ye 问任务历史有无上限：此前无上限、无删除接口、无后台清理，scan_tasks/crawl_tasks 无限增长；Ye 定 30 天 + 1 万条上限。
+- 修法：
+  - 新增配置 `SHUKU_TASK_RETENTION_DAYS`（默认 30，钳 1..3650）与 `SHUKU_TASK_MAX_ROWS`（默认 10000，钳 100..1000000），见 `src/config.rs`。
+  - 新增 `Database::prune_tasks(retention_days, max_rows)`（`src/db/mod.rs`）：先删超过保留天数的 done/failed 任务（按 created_at）；再在两表合计超上限时，按最旧优先分批删 done/failed 任务（每批 500，循环复核，跨表公平）。pending/running 任务永不删，卡住的队列不会被静默「修好」。
+  - 现有缓存清理 worker（`run_cache_worker`，每天跑一次）顺带调 `prune_tasks`；main.rs 传新配置。
+  - API.md 环境变量表补两项。
+- 测试：新增 `prune_tasks_drops_old_terminal_and_oldest_over_cap`（旧 done/failed 删、旧 pending/running 留、超上限删最旧的 done/failed）；109 单元 + 2 端到端全绿。

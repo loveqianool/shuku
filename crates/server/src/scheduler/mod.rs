@@ -600,8 +600,17 @@ pub async fn run_health_worker(sched: Arc<Scheduler>, interval_secs: u64) {
 }
 
 /// Cache prune worker: drop expired source_cache rows and enforce the
-/// row/byte caps (oldest first). First run after 60s, then every interval.
-pub async fn run_cache_worker(sched: Arc<Scheduler>, interval_secs: u64, max_rows: i64, max_bytes: i64) {
+/// row/byte caps (oldest first); also prune task history (done/failed
+/// tasks older than `task_retention_days`, then oldest first while the
+/// total exceeds `task_max_rows`). First run after 60s, then every interval.
+pub async fn run_cache_worker(
+    sched: Arc<Scheduler>,
+    interval_secs: u64,
+    max_rows: i64,
+    max_bytes: i64,
+    task_retention_days: i64,
+    task_max_rows: i64,
+) {
     tokio::time::sleep(Duration::from_secs(60)).await;
     loop {
         match sched.db.prune_source_cache(max_rows, max_bytes).await {
@@ -611,6 +620,14 @@ pub async fn run_cache_worker(sched: Arc<Scheduler>, interval_secs: u64, max_row
                 }
             }
             Err(e) => error!(target: "cache", "cache prune failed: {e}"),
+        }
+        match sched.db.prune_tasks(task_retention_days, task_max_rows).await {
+            Ok((expired, overflow)) => {
+                if expired > 0 || overflow > 0 {
+                    info!(target: "tasks", "pruned tasks: {expired} older than {task_retention_days}d, {overflow} over cap");
+                }
+            }
+            Err(e) => error!(target: "tasks", "task prune failed: {e}"),
         }
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }

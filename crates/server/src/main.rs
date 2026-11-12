@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.cache_prune_interval_secs,
         cfg.cache_max_rows,
         cfg.cache_max_mb * 1_000_000,
+        cfg.task_retention_days,
+        cfg.task_max_rows,
     ));
 
     // Filesystem watcher (best-effort): keep the handle alive for the run.

@@ -71,6 +71,10 @@ pub struct Config {
     pub cache_max_rows: i64,
     /// Cache prune worker interval in seconds.
     pub cache_prune_interval_secs: u64,
+    /// Task history retention: delete done/failed tasks older than this (days).
+    pub task_retention_days: i64,
+    /// Task history cap: max total rows across scan_tasks + crawl_tasks.
+    pub task_max_rows: i64,
 }
 
 impl Default for Config {
@@ -92,6 +96,8 @@ impl Default for Config {
             cache_max_mb: 512,
             cache_max_rows: 20_000,
             cache_prune_interval_secs: 86_400,
+            task_retention_days: 30,
+            task_max_rows: 10_000,
         }
     }
 }
@@ -121,6 +127,8 @@ impl Config {
             cache_max_mb: env_i64("SHUKU_CACHE_MAX_MB", d.cache_max_mb, 16, 16_384),
             cache_max_rows: env_i64("SHUKU_CACHE_MAX_ROWS", d.cache_max_rows, 100, 1_000_000),
             cache_prune_interval_secs: env_u64("SHUKU_CACHE_PRUNE_INTERVAL_SECS", d.cache_prune_interval_secs, 3600, 2_592_000),
+            task_retention_days: env_i64("SHUKU_TASK_RETENTION_DAYS", d.task_retention_days, 1, 3650),
+            task_max_rows: env_i64("SHUKU_TASK_MAX_ROWS", d.task_max_rows, 100, 1_000_000),
         }
     }
 

@@ -86,6 +86,8 @@
 | `SHUKU_CACHE_MAX_MB` | `512` | source_cache 上限 MB（16..16384） |
 | `SHUKU_CACHE_MAX_ROWS` | `20000` | source_cache 上限行数（100..1000000） |
 | `SHUKU_CACHE_PRUNE_INTERVAL_SECS` | `86400` | 缓存清理周期（3600..2592000；每天清过期行 + 按最旧淘汰到上限内） |
+| `SHUKU_TASK_RETENTION_DAYS` | `30` | 任务历史保留天数（1..3650；定期清理删 done/failed 且超过此天数的任务，pending/running 永不删） |
+| `SHUKU_TASK_MAX_ROWS` | `10000` | 任务历史上限总行数（100..1000000；scan_tasks + crawl_tasks 合计，超限删最旧的 done/failed 任务） |
 | `SHUKU_SCAN_WORKERS` | 核数一半（1..8） | 并行扫描解析线程数（钳 1..32） |
 | `SHUKU_INDEX_THREADS` | 核数一半（1..8） | tantivy 写线程数（钳 1..16） |
 | `SHUKU_INDEX_HEAP_MB` | `150` | tantivy 写堆 MB（钳 50..2048） |
