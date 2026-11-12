@@ -49,7 +49,7 @@ NAS / 低功耗 x86 / ARM 常驻服务，单静态二进制（musl），前端 d
 
 ## REST 契约（见 docs/API.md）
 - 书架：GET /api/books（分页/筛选/排序）、GET /api/books/:id、GET /api/books/:id/chapters、GET /api/books/:id/chapters/:idx（段落数组）、GET /api/books/recent（最近阅读 100 本）、GET /api/books/:id/matches（本书内逐处匹配）、GET /api/books/duplicates（疑似重复）、GET /api/books/:id/cover、GET /api/books/:id/images/*path
-- 检索：GET /api/search?q=&scope=local|cached|all&page=、GET /api/suggest（联想，最多 8 条）
+- 检索：GET /api/search?q=&scope=local|cached|all&page=（scope 走索引 `source` 字段过滤，不再查 SQLite 取 ID）、GET /api/suggest（联想，最多 8 条，走 tantivy `search_book_ids` + 全文补足）；书库列表 `GET /api/books?q=` 也走 tantivy（`search_book_ids`）再按 ID 取行
 - 书源：CRUD /api/sources、POST /api/sources/import、GET /api/sources/export、POST /api/sources/:id/health-check、POST /api/sources/subscribe
 - 测试：POST /api/sources/:id/test {kind: search|explore|toc|content|login, ...} → {raw, extracted, js_output, elapsed_ms, error, logs[]}（`explore` 跑 exploreUrl + ruleExplore 不需要 keyword；`login` 单跑 loginUrl + loginCheckJs，配了 loginUi 先走 DOM 填表）；POST /api/picker/fetch（规则拾取器代抓）
 - 进度/书签/标签：reading_progress、bookmarks、tags CRUD；POST /api/books/:id/reading-time

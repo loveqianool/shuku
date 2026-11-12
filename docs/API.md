@@ -6,13 +6,13 @@
 
 ## 错误格式
 
-所有接口失败时一律返回 HTTP 500 + `{error: "原因"}`（暂不分 404/400/500，见 ARCHITECTURE.md 待定项）。成功时 HTTP 200（`DELETE /api/books/:id` 等个别接口也如此）。API 响应带 `Cache-Control: no-store`，不进浏览器/CDN 缓存；静态前端文件另有自己的缓存头（见 `src/static_files.rs`）。
+接口失败时返回 `{error: "原因"}`，HTTP 状态区分：404（书/源/任务/封面不存在、扫描路径不存在）、400（参数无效、非 epub 书取图/封面、源不合法、`serde_json` 解析失败）、500（其他服务端错误）。成功时 HTTP 200（`DELETE /api/books/:id` 等个别接口也如此）。API 响应带 `Cache-Control: no-store`，不进浏览器/CDN 缓存；静态前端文件另有自己的缓存头（见 `src/static_files.rs`）。
 
 ## 书库
 - `GET /api/books?q=&author=&tag=&sort=updated|title|author&page=&page_size=` — 分页筛选；q 同时匹配书名拼音（音节/连写/首字母，如 `wlcl` 命中《武林沉沦》）
 - `GET /api/books/recent` — 最近阅读：最近打开的 100 本书（按阅读进度更新时间倒序；`{items:[{...书目, last_read_at, last_chapter_idx}]}`，点开续读上次章节）
 - `GET /api/books/:id/matches?q=&page=&page_size=500` — 本书内逐处匹配：该词在本书里的每一次字面出现，按章节+位置排序（`{items:[{chapter_idx, chapter_title, offset, snippet}], total}`）；只含字面出现处，拼音查询返回空（回退到按章节分组的 `/api/search`）
-- `GET /api/books/:id` — 书籍详情（含章节数、来源 local|cached、状态）
+- `GET /api/books/:id` — 书籍详情（含章节数、来源 local|cached、状态；封面 MIME 类型在 `cover_mime` 字段，封面字节走 `/api/books/:id/cover`）
 - `GET /api/books/:id/chapters?page=&page_size=200` — 目录（仅标题+索引，不含正文）
 - `GET /api/books/:id/chapters/:idx` — 正文：`{book_id, chapter_idx, title, paragraphs:[{text?:string, img?:string}]}`；本地书从文件按需解析，网络书走缓存/爬取；epub 章节里的 `<img>` 变成 `img` 段落（URL 形如 `/api/books/:id/images/<epub 内路径>`）
 - `GET /api/books/:id/images/*path` — 取 epub 内嵌图片的字节（`path` 是图片在 epub 里的路径，如 `OEBPS/images/pic.jpg`）；仅 epub 书可用，`..` 拒绝，Content-Type 按 epub 内 mime
@@ -62,7 +62,7 @@
 - `GET /api/tasks?type=scan|crawl&status=` — 两套队列分别查
 - `POST /api/tasks/scan` `{path?}` — 触发增量扫描；`POST /api/tasks/crawl` `{source_id, book_url}` — 入队爬取
 - `POST /api/tasks/:id/retry` / `POST /api/tasks/:id/pause` / `POST /api/tasks/:id/resume`
-- `POST /api/tasks/rebuild-index` — 重建 tantivy 索引（期间可暂停爬虫：`{pause_crawl:true}`）
+- `POST /api/tasks/rebuild-index` — 重建 tantivy 索引（期间可暂停爬虫：`{pause_crawl:true}`）；默认增量（只重索引 `index_version` 低于当前 schema 的书），`{full:true}` 全量重建（清索引、全部重索引）
 - `POST /api/tasks/chapter-check` — 全库缺章检查（后台扫全部书，写 `chapter_issues` 表）
 - `GET /api/tasks/stats` — 队列长度、熔断状态、令牌桶余量、source_cache 行数/字节数（调试用）
 
