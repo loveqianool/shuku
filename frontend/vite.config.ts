@@ -6,10 +6,7 @@ export default defineConfig({
   plugins: [
     solid(),
     VitePWA({
-      // prompt：新版由前端手动触发更新（App.tsx 的 useRegisterSW + 更新横幅），
-      // 而不是 autoUpdate 的后台自动更新。长缓存不变（hash 资源 immutable），
-      // sw.js/index.html 用 no-cache 保证每次都能检测到新版。
-      registerType: "prompt",
+      registerType: "autoUpdate",
       includeAssets: ["favicon.svg", "icons/icon-192.png", "icons/icon-512.png"],
       manifest: {
         name: "书库",

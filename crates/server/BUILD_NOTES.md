@@ -305,3 +305,9 @@
   - 导航栏加「🔄 检查更新」按钮：调 `registration.update()` 手动查一次；有新版则横幅弹出，4 秒内无动静显示「已是最新版本」3 秒；未注册 SW 或检查失败也给提示。
 - 长缓存不变：带内容 hash 的 `assets/*` 仍 `immutable` 一年；`sw.js`/`index.html` 仍 `no-cache`，保证每次都能检测到新版。两者结合：平时走长缓存很快，有新版时手动一点即更新。
 - 构建验证：`registerSW.js` 不再自动注入（prompt 模式），`sw.js` 仍含 `skipWaiting`；新 bundle 含更新横幅与「检查更新」文案。测试：107 单元 + 2 端到端全绿。
+
+## 撤销 PWA 手动更新，恢复 autoUpdate（2026-11-12）
+
+- Ye 决定还是自动更新。撤销上一节的手动更新：`vite.config.ts` 的 `registerType` 恢复 `autoUpdate`，`src/App.tsx` 的 `useRegisterSW`、更新横幅、「检查更新」按钮全部删掉，`src/styles.css` 的 `.update-banner`/`.update-check-msg` 样式删掉，`src/vite-env.d.ts`（只为 `virtual:pwa-register/solid` 类型而建）删掉。
+- 长缓存 + 即时检测的根基不变：带内容 hash 的 `assets/*` 仍 `immutable` 一年；`sw.js`/`index.html` 仍 `no-cache`，保证每次都能检测到新版，后台自动更新。
+- 测试：107 单元 + 2 端到端全绿（见下）。

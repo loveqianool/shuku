@@ -122,35 +122,3 @@ table.logs td, table.logs th { border: 1px solid var(--border); padding: 4px 8px
 .json-row:hover { background: var(--surface2); }
 .json-toggle { padding: 0 4px; margin-right: 2px; }
 .json-key { font-family: monospace; margin-right: 6px; }
-
-/* PWA 手动更新横幅（新版 SW 就绪时 App.tsx 弹出）与检查更新提示 */
-.update-banner {
-  position: sticky;
-  top: 0;
-  z-index: 30;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: #14532d;
-  color: #bbf7d0;
-  padding: 10px 12px;
-  border-radius: var(--radius);
-  margin: 12px 0;
-  flex-wrap: wrap;
-}
-.update-banner button {
-  background: #22c55e;
-  color: #052e16;
-  border: 0;
-  border-radius: 8px;
-  padding: 6px 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.update-banner button.ghost {
-  background: transparent;
-  color: #bbf7d0;
-  border: 1px solid #4ade80;
-  font-weight: 400;
-}
-.update-check-msg { color: var(--muted); font-size: 13px; white-space: nowrap; }
