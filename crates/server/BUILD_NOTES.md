@@ -311,3 +311,15 @@
 - Ye 决定还是自动更新。撤销上一节的手动更新：`vite.config.ts` 的 `registerType` 恢复 `autoUpdate`，`src/App.tsx` 的 `useRegisterSW`、更新横幅、「检查更新」按钮全部删掉，`src/styles.css` 的 `.update-banner`/`.update-check-msg` 样式删掉，`src/vite-env.d.ts`（只为 `virtual:pwa-register/solid` 类型而建）删掉。
 - 长缓存 + 即时检测的根基不变：带内容 hash 的 `assets/*` 仍 `immutable` 一年；`sw.js`/`index.html` 仍 `no-cache`，保证每次都能检测到新版，后台自动更新。
 - 测试：107 单元 + 2 端到端全绿（见下）。
+
+## 竖向全书滑杆改按全本百分比滚动，不按章节跳（2026-11-12）
+
+- Ye 要求：右侧全本滚动条不需要分章节，按全本百分比滚动就行。
+- 改法（`frontend/src/pages/Reader.tsx`）：
+  - 新增 `pctToChapterPos(pct)`：全书百分比换算成连续值 pos = pct/100*n（章序号 + 章内位置），target 章 = floor(pos)，章内位置 = pos - target（0..1），不取整即不按章跳。
+  - `jumpToBookPct`：落到目标章的对应位置（章内 frac），而不是章首；同章时只滚动。
+  - `loadChapter(i, frac?)`：新增可选章内位置参数；换章后等渲染好（requestAnimationFrame）再滚到章内位置，并按实际 offset 保存进度；不传 frac 时行为不变（滚到章首、保存 offset 0）。
+  - 滑杆 onInput：同章时拖动即实时滚动（像真正的滚动条）；跨章等松手（onChange）再换章，避免拖动途中反复发请求。
+  - 拖动提示 `bookTip` 去掉章节，只显示全书百分比「NN%」。
+- 百分比口径不变：仍按章数均权（(章序号 + 章内滚动进度) / 总章数），即 `bookPct()` 不变；变的是落点（章内位置而非章首）与提示。
+- 测试：107 单元 + 2 端到端全绿（纯前端改动，后端未动）。

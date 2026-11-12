@@ -95,16 +95,14 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     window.addEventListener("resize", measureBars);
     onCleanup(() => window.removeEventListener("resize", measureBars));
   });
-  // 竖向全书滑杆拖动提示：目标章节 + 全书百分比，停 1.2 秒后淡出消失。
-  const [bookTip, setBookTip] = createSignal<{ pct: number; chapter: number } | null>(null);
+  // 竖向全书滑杆拖动提示：只显示全书百分比（不按章节），停 1.2 秒后淡出消失。
+  const [bookTip, setBookTip] = createSignal<{ pct: number } | null>(null);
   const [tipFading, setTipFading] = createSignal(false);
   let tipTimer: ReturnType<typeof setTimeout> | undefined;
   let tipClearTimer: ReturnType<typeof setTimeout> | undefined;
   const showBookTip = (pct: number) => {
-    const n = toc().length;
-    if (n === 0) return;
-    const target = Math.min(n - 1, Math.max(0, Math.floor((pct / 100) * n)));
-    setBookTip({ pct, chapter: target });
+    if (toc().length === 0) return;
+    setBookTip({ pct });
     setTipFading(false);
     clearTimeout(tipTimer);
     clearTimeout(tipClearTimer);
@@ -255,7 +253,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setToc(all);
   };
 
-  const loadChapter = async (i: number) => {
+  // frac?: 0..1，换章后滚到章内对应位置（竖向全书滑杆按百分比定位时用）。
+  // 不传则滚到章首。滚动要等章节渲染好（scrollHeight 就绪）再做。
+  const loadChapter = async (i: number, frac?: number) => {
     setLoading(true);
     setError("");
     stopSpeaking();
@@ -266,11 +266,21 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       setHighlights(loadHighlights(props.bookId, i));
       setSelText("");
       location.hash = `#/read/${encodeURIComponent(props.bookId)}/${i}`;
-      if (contentRef) contentRef.scrollTop = 0;
-      window.scrollTo(0, 0);
-      setScrollFrac(0);
-      // 进度：切章即保存
-      await api.saveProgress(props.bookId, { chapter_idx: i, offset: 0 }).catch(() => {});
+      if (frac === undefined) {
+        if (contentRef) contentRef.scrollTop = 0;
+        window.scrollTo(0, 0);
+        setScrollFrac(0);
+        // 进度：切章即保存
+        await api.saveProgress(props.bookId, { chapter_idx: i, offset: 0 }).catch(() => {});
+      } else {
+        // 等渲染好再滚到章内位置，并按实际 offset 保存进度。
+        requestAnimationFrame(() => {
+          scrollToFrac(frac);
+          setScrollFrac(frac);
+          const offset = settings().mode === "page" ? (contentRef?.scrollTop ?? 0) : window.scrollY;
+          api.saveProgress(props.bookId, { chapter_idx: i, offset }).catch(() => {});
+        });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -365,16 +375,25 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     if (n === 0) return 0;
     return ((idx() + scrollFrac()) / n) * 100;
   };
-  // 底栏滑杆拖动：跳到对应章节（同章时只滚到对应位置）。
+  // 全书百分比 → {target 章序号, frac 章内位置 0..1}。
+  // pos = pct/100*n 是“章序号 + 章内位置”的连续值，不取整即不按章跳。
+  const pctToChapterPos = (pct: number) => {
+    const n = toc().length;
+    const pos = Math.min(n - 0.0001, Math.max(0, (pct / 100) * n));
+    const target = Math.min(n - 1, Math.floor(pos));
+    return { target, frac: pos - target };
+  };
+  // 竖向全书滑杆拖动：按全书百分比连续定位，不按章节跳。
+  // 落到目标章的对应位置，而不是章首；同章时只滚动。
   const jumpToBookPct = (pct: number) => {
     const n = toc().length;
     if (n === 0) return;
-    const target = Math.min(n - 1, Math.max(0, Math.floor((pct / 100) * n)));
+    const { target, frac } = pctToChapterPos(pct);
     if (target === idx()) {
-      scrollToFrac((pct / 100) * n - target);
+      scrollToFrac(frac);
       return;
     }
-    loadChapter(target);
+    loadChapter(target, frac);
   };
   // 底栏「搜索」：浮出顶栏与搜索面板并聚焦输入框。
   let searchInputRef: HTMLInputElement | undefined;
@@ -788,14 +807,25 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       <input
         type="range" min="0" max="100" step="0.1"
         value={bookDrag() ?? 100 - bookPct()}
-        onInput={(e) => { const v = Number(e.currentTarget.value); setBookDrag(v); showBookTip(100 - v); }}
+        onInput={(e) => {
+          const v = Number(e.currentTarget.value);
+          const pct = 100 - v;
+          setBookDrag(v);
+          showBookTip(pct);
+          // 同章时拖动即实时滚动（像真正的滚动条）；跨章等松手再换章，
+          // 避免拖动途中反复发请求。
+          if (toc().length > 0) {
+            const { target, frac } = pctToChapterPos(pct);
+            if (target === idx()) scrollToFrac(frac);
+          }
+        }}
         onChange={(e) => { const v = Number(e.currentTarget.value); setBookDrag(null); jumpToBookPct(100 - v); showBookTip(100 - v); }}
         class="book-progress"
         aria-label="全书进度"
       />
       <Show when={bookTip()}>
         <div class="book-tip" classList={{ fading: tipFading() }}>
-          第 {bookTip()!.chapter + 1} 章 / 共 {toc().length} 章 · {Math.round(bookTip()!.pct)}%
+          {Math.round(bookTip()!.pct)}%
         </div>
       </Show>
     </div>
