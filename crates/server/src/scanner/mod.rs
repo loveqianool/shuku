@@ -119,9 +119,9 @@ async fn publish_batch(
     batch: Vec<PublishItem>,
     data_dir: &Path,
 ) -> Vec<ScanOutcome> {
-    let tuples: Vec<(u64, String, String, Vec<(String, String)>)> = batch
+    let tuples: Vec<(u64, String, String, String, Vec<(String, String)>)> = batch
         .iter()
-        .map(|b| (b.id_num, b.title.clone(), b.author.clone(), b.chapter_tuples.clone()))
+        .map(|b| (b.id_num, b.title.clone(), b.author.clone(), "local".to_string(), b.chapter_tuples.clone()))
         .collect();
     let search2 = search.clone();
     let indexed = tokio::task::spawn_blocking(move || search2.index_books(&tuples)).await;
@@ -188,7 +188,7 @@ async fn publish_batch(
             source_id: String::new(),
             has_update: false,
             last_update_check: 0,
-            cover: cover.clone(),
+            cover_mime: cover.clone(),
         })
         .collect();
     let chaps: Vec<(String, Vec<String>)> =
@@ -273,7 +273,7 @@ async fn parse_one_file(
                     source_id: String::new(),
                     has_update: false,
                     last_update_check: 0,
-                    cover: String::new(),
+                    cover_mime: String::new(),
                 })
                 .await;
             None
@@ -425,10 +425,18 @@ pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, dat
 
 /// Re-index cached network books from their per-chapter text files
 /// (used by rebuild-index; the directory scanner only covers local books).
-pub async fn reindex_cached_books(db: &Database, search: &Arc<SearchIndex>, data_dir: &Path) -> Result<usize> {
+/// Incremental by default: only books whose `index_version` is older than
+/// the current `INDEX_VERSION` are re-indexed (e.g. after a schema change),
+/// and each re-indexed book's version is bumped so the next rebuild skips
+/// it. Pass `full=true` to re-index every cached book (e.g. after index
+/// corruption). Returns how many books were re-indexed.
+pub async fn reindex_cached_books(db: &Database, search: &Arc<SearchIndex>, data_dir: &Path, full: bool) -> Result<usize> {
     let books = db.cached_books().await?;
     let mut n = 0;
-    for (id, title, author) in books {
+    for (id, title, author, index_version) in books {
+        if !full && index_version >= INDEX_VERSION {
+            continue;
+        }
         let (chapters, _total) = db.list_chapters(&id, 1, 100_000).await?;
         let mut tuples: Vec<(String, String)> = Vec::new();
         for ch in chapters {
@@ -439,9 +447,12 @@ pub async fn reindex_cached_books(db: &Database, search: &Arc<SearchIndex>, data
         let id_num: u64 = id.parse().unwrap_or(0);
         let search2 = search.clone();
         let (t, a) = (title, author);
-        tokio::task::spawn_blocking(move || search2.index_book(id_num, &t, &a, &tuples))
+        tokio::task::spawn_blocking(move || search2.index_book(id_num, &t, &a, "cached", &tuples))
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+        // Mark the book current so the next incremental rebuild skips it.
+        // (index_book deletes the book's old docs first, so this is safe.)
+        let _ = db.set_book_index_version(&id, INDEX_VERSION).await;
         n += 1;
     }
     Ok(n)
@@ -509,7 +520,7 @@ mod tests {
         let r3 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
         assert_eq!(r3.indexed, 1, "mtime change must trigger re-index");
         // Search must see the content.
-        let (hits, _) = search.search("修仙", None, 10, 0).unwrap();
+        let (hits, _) = search.search("修仙", None, None, 10, 0).unwrap();
         assert!(!hits.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -556,7 +567,7 @@ mod tests {
         assert_eq!(r.indexed, 1);
         let (books, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         assert_eq!(books.len(), 1);
-        assert_eq!(books[0].cover, "image/jpeg");
+        assert_eq!(books[0].cover_mime, "image/jpeg");
         let cover_file = data.join("covers").join(&books[0].id);
         assert!(cover_file.exists(), "cover bytes must be stored under data/covers");
         assert_eq!(std::fs::read(&cover_file).unwrap().as_slice(), b"\xff\xd8\xff\xe0fake-cover");
@@ -566,7 +577,7 @@ mod tests {
         assert_eq!(r2.indexed, 1);
         let (books2, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         let plain = books2.iter().find(|b| b.title == "plain").unwrap();
-        assert!(plain.cover.is_empty());
+        assert!(plain.cover_mime.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -605,10 +616,10 @@ mod tests {
         assert_eq!(r1.broken, 1, "broken epub must be counted, not block the queue");
         // Every book must be searchable (index-first invariant holds in parallel).
         for i in [0, 7, 19] {
-            let (hits, _) = search.search(&format!("独特内容词{i}"), None, 10, 0).unwrap();
+            let (hits, _) = search.search(&format!("独特内容词{i}"), None, None, 10, 0).unwrap();
             assert!(!hits.is_empty(), "book {i} must be searchable");
         }
-        let (hits, total) = search.search("故事继续发展", None, 100, 0).unwrap();
+        let (hits, total) = search.search("故事继续发展", None, None, 100, 0).unwrap();
         assert_eq!(total, 20, "all 20 books share the phrase, hits: {}", hits.len());
         // Second scan: txt books unchanged, broken epub retried (index_version 0).
         let r2 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
@@ -669,7 +680,7 @@ mod tests {
             return;
         }
         let t0 = std::time::Instant::now();
-        let mut books: Vec<(u64, String, String, Vec<(String, String)>)> = Vec::new();
+        let mut books: Vec<(u64, String, String, String, Vec<(String, String)>)> = Vec::new();
         let mut files: Vec<PathBuf> = Vec::new();
         for e in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             if e.file_type().is_file() {
@@ -681,7 +692,7 @@ mod tests {
             let parsed = crate::parser::parse_book_file(f).unwrap();
             let tuples: Vec<(String, String)> =
                 parsed.chapters.iter().map(|c| (c.title.clone(), c.text.clone())).collect();
-            books.push((book_id_for_path(f), parsed.title, parsed.author, tuples));
+            books.push((book_id_for_path(f), parsed.title, parsed.author, "local".to_string(), tuples));
         }
         let parse_ms = t0.elapsed().as_millis();
         // Disk index, 16-book batches, like the real scanner.
@@ -705,7 +716,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let t2 = std::time::Instant::now();
         let now = chrono::Utc::now().timestamp();
-        for (id_num, title, author, chapters) in &books {
+        for (id_num, title, author, _source, chapters) in &books {
             let id = id_num.to_string();
             let titles: Vec<String> = chapters.iter().map(|c| c.0.clone()).collect();
             db.upsert_book(&BookRow {
@@ -725,7 +736,7 @@ mod tests {
                 source_id: String::new(),
                 has_update: false,
                 last_update_check: 0,
-                cover: String::new(),
+                cover_mime: String::new(),
             })
             .await
             .unwrap();
