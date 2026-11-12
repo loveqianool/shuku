@@ -1,4 +1,6 @@
-import { createSignal, createEffect, For, Show, onCleanup, type Component } from "solid-js";
+import { createSignal, createEffect, For, Show, onCleanup, onMount, type Component } from "solid-js";
+import pangu from "pangu/browser";
+import { readerChrome as showChrome, setReaderChrome as setShowChrome } from "../lib/readerChrome";
 import { api, type Book, type Chapter, type ChapterMeta, type ChapterIssue, type SearchHit, type BookMatch } from "../lib/api";
 import { downloadBook, deleteOfflineBook, offlineChapterCount } from "../lib/offline";
 import {
@@ -70,13 +72,31 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [searchTerm, setSearchTerm] = createSignal("");
   // 仿另一家阅读器的交互：顶栏和底栏平时显示，点一下正文收起来，
   // 再点一下浮出来；搜尋与设置面板由底栏按钮唤出，平时收起。
-  const [showChrome, setShowChrome] = createSignal(true);
   const [showSearch, setShowSearch] = createSignal(false);
   const [showSettings, setShowSettings] = createSignal(false);
   // 本章内滚动进度（0..1），驱动右边的竖向滑杆与全书进度。
   const [scrollFrac, setScrollFrac] = createSignal(0);
   // 底栏全书滑杆拖动中的值（null 表示没在拖），松手才跳章，免得拖动时反复加载。
   const [bookDrag, setBookDrag] = createSignal<number | null>(null);
+  // 竖向全书滑杆拖动提示：目标章节 + 全书百分比，停 1.2 秒后淡出消失。
+  const [bookTip, setBookTip] = createSignal<{ pct: number; chapter: number } | null>(null);
+  const [tipFading, setTipFading] = createSignal(false);
+  let tipTimer: ReturnType<typeof setTimeout> | undefined;
+  let tipClearTimer: ReturnType<typeof setTimeout> | undefined;
+  const showBookTip = (pct: number) => {
+    const n = toc().length;
+    if (n === 0) return;
+    const target = Math.min(n - 1, Math.max(0, Math.floor((pct / 100) * n)));
+    setBookTip({ pct, chapter: target });
+    setTipFading(false);
+    clearTimeout(tipTimer);
+    clearTimeout(tipClearTimer);
+    tipTimer = setTimeout(() => setTipFading(true), 1200);
+    tipClearTimer = setTimeout(() => setBookTip(null), 1500);
+  };
+  onCleanup(() => { clearTimeout(tipTimer); clearTimeout(tipClearTimer); });
+  // 进阅读界面时顶栏/底栏默认显示（之前若收起过，打开新书时恢复）。
+  onMount(() => setShowChrome(true));
 
   // 当前选中处定位：章节渲染好之后，把本章第 currentOccurrence 个
   // mark.search-hit 单独标亮（search-hit-current）并滚到它。只在当前
@@ -146,7 +166,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [converter, setConverter] = createSignal<{ fn: (s: string) => string } | null>(null);
   const disp = (t: string) => {
     const c = converter();
-    return c ? c.fn(t) : t;
+    const converted = c ? c.fn(t) : t;
+    return pangu.spaceText(converted);
   };
   const applyScript = async (script: ReaderSettings["script"]) => {
     if (script === "orig") {
@@ -726,16 +747,15 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
 
       <Show when={showChrome()}>
         <div class="reader-bottombar">
-          <div class="book-progress">
+          <div class="chapter-progress">
             <button disabled={idx() <= 0 || loading()} onClick={() => loadChapter(idx() - 1)}>‹</button>
             <input
               type="range" min="0" max="100" step="0.1"
-              value={bookDrag() ?? bookPct()}
-              onInput={(e) => setBookDrag(Number(e.currentTarget.value))}
-              onChange={(e) => { const v = Number(e.currentTarget.value); setBookDrag(null); jumpToBookPct(v); }}
-              aria-label="全书进度"
+              value={scrollFrac() * 100}
+              onInput={(e) => scrollToFrac(Number(e.currentTarget.value) / 100)}
+              aria-label="本章进度"
             />
-            <span class="muted">{Math.round(bookDrag() ?? bookPct())}%</span>
+            <span class="muted">{Math.round(scrollFrac() * 100)}%</span>
             <button disabled={idx() >= toc().length - 1 || loading()} onClick={() => loadChapter(idx() + 1)}>›</button>
           </div>
           <div class="bar-actions">
@@ -749,11 +769,17 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
 
       <input
         type="range" min="0" max="100" step="0.1"
-        value={scrollFrac() * 100}
-        onInput={(e) => scrollToFrac(Number(e.currentTarget.value) / 100)}
-        class="chapter-progress"
-        aria-label="本章进度"
+        value={bookDrag() ?? bookPct()}
+        onInput={(e) => { const v = Number(e.currentTarget.value); setBookDrag(v); showBookTip(v); }}
+        onChange={(e) => { const v = Number(e.currentTarget.value); setBookDrag(null); jumpToBookPct(v); showBookTip(v); }}
+        class="book-progress"
+        aria-label="全书进度"
       />
+      <Show when={bookTip()}>
+        <div class="book-tip" classList={{ fading: tipFading() }}>
+          第 {bookTip()!.chapter + 1} 章 / 共 {toc().length} 章 · {Math.round(bookTip()!.pct)}%
+        </div>
+      </Show>
     </div>
   );
 };

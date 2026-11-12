@@ -68,10 +68,10 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 
 /* 阅读页 */
 .reader { max-width: 720px; margin: 0 auto; }
-.reader-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 0; position: sticky; top: 0; background: var(--bg); z-index: 5; border-bottom: 1px solid var(--border); }
+.reader-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 12px; position: fixed; top: 0; left: 50%; transform: translateX(-50%); width: min(720px, 100%); box-sizing: border-box; background: var(--bg); z-index: 20; border-bottom: 1px solid var(--border); }
 .reader-bar select, .reader-bar input[type="number"] { width: auto; flex: 0 0 auto; }
 .reader-content { outline: none; }
-.reader-content p { margin: 0 0 0.6em; }
+.reader-content p { margin: 0 0 0.6em; text-align: justify; line-break: strict; hanging-punctuation: first; text-justify: inter-ideograph; }
 .reader-content img { max-width: 100%; display: block; margin: 8px auto; }
 .reader-content.page-mode { height: calc(100vh - 220px); overflow: hidden; }
 .reader-settings { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; font-size: 13px; }
@@ -87,14 +87,17 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .reader-content[data-reader-theme="light"], .reader-content[data-reader-theme="sepia"], .reader-content[data-reader-theme="dark"] { padding: 16px; border-radius: var(--radius); }
 /* 仿另一家阅读器：底部固定栏（全书进度滑杆 + 目录/搜索/朗读/设置），点正文唤出/收起。 */
 .reader-bottombar { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: min(720px, 100%); background: var(--bg); border-top: 1px solid var(--border); padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px)); z-index: 20; box-sizing: border-box; }
-.reader-bottombar .book-progress { display: flex; gap: 8px; align-items: center; }
-.reader-bottombar .book-progress input[type="range"] { flex: 1; min-width: 0; }
+.reader-bottombar .chapter-progress { display: flex; gap: 8px; align-items: center; }
+.reader-bottombar .chapter-progress input[type="range"] { flex: 1; min-width: 0; }
 .reader-bottombar .bar-actions { display: flex; gap: 8px; margin-top: 8px; }
 .reader-bottombar .bar-actions button { flex: 1; }
-/* 本章竖向进度滑杆：固定在右侧中部，拖动滚动本章。 */
-.chapter-progress { position: fixed; right: 4px; top: 50%; transform: translateY(-50%); height: 40vh; width: 18px; z-index: 15; opacity: 0.65; writing-mode: vertical-lr; direction: rtl; }
-/* 底栏显示时留出底部空间，免得固定底栏盖住正文末尾。 */
-.reader.chrome-on { padding-bottom: 120px; }
+/* 全书竖向进度滑杆：固定在右侧中部，拖动跳章；88vh 轨道更长，章数多时也好瞄准。 */
+.book-progress { position: fixed; right: 4px; top: 50%; transform: translateY(-50%); height: 88vh; width: 18px; z-index: 15; opacity: 0.65; writing-mode: vertical-lr; direction: rtl; }
+/* 拖动竖向滑杆时的提示：目标章节 + 全书百分比，停 1.2 秒后淡出。 */
+.book-tip { position: fixed; right: 32px; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.85); color: #fff; padding: 10px 14px; border-radius: 8px; z-index: 25; font-size: 14px; white-space: nowrap; opacity: 1; transition: opacity 0.3s; pointer-events: none; }
+.book-tip.fading { opacity: 0; }
+/* 顶栏/底栏显示时留出上下空间，免得固定顶栏/底栏盖住正文。 */
+.reader.chrome-on { padding-top: 52px; padding-bottom: 120px; }
 
 table.logs { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.logs td, table.logs th { border: 1px solid var(--border); padding: 4px 8px; text-align: left; vertical-align: top; }

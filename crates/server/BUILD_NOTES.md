@@ -254,3 +254,13 @@
 
 - run #18（apt 三遍重试，f5413cd）实质失败：amd64 在 `Install musl tools` 步挂了 19 分 20 秒，azure.archive.ubuntu.com 解析失败，重试 3 次仍失败；arm64 同一步卡了 21 分钟。结论：这不是一两分钟的抖动，是 Ubuntu 镜像 DNS 持续解析不到，重试修不了。
 - 改法：`Install musl tools`（apt）换成 `taiki-e/setup-cross-toolchain-action@v1`（target 由 matrix 传），从 GitHub 下载预编译交叉工具链，完全不经 apt、不依赖 Ubuntu 镜像。注意：它会设 CARGO_BUILD_TARGET，cargo test 随之跑 musl 目标（同架构 runner 上可直接运行，与发版二进制一致）。
+
+## 滑杆换功能 + 顶栏跟 chrome + 智能排版（2026-11-12）
+
+- 滑杆换功能（Ye 拍板）：底栏滑杆改成本章滚动（scrollFrac/scrollToFrac，显示本章百分比），竖向滑杆改成全书进度（bookPct/jumpToBookPct，拖动跳章）。竖向滑杆长度 40vh → 88vh（轨道更长，章数多时好瞄准）。
+- 竖向滑杆拖动提示：拖动时在滑杆左侧显示「第 X 章 / 共 N 章 · NN%」，停 1.2 秒后淡出（0.3 秒透明过渡）再移除。bookTip/tipFading 两个信号 + 两个定时器（淡出 1200ms、清除 1500ms），unmount 时清定时器。
+- 顶栏跟 chrome：新增 `frontend/src/lib/readerChrome.ts` 共用信号（readerChrome/setReaderChrome）。App.tsx 的顶栏导航包进 `<Show when={route().name !== "read" || readerChrome()}>`，进阅读界面后顶栏导航也随底栏一起点按隐藏/显示；离开阅读界面后导航恒显示。Reader.tsx 的 showChrome/setShowChrome 改成该共用信号的别名，余下代码不动；进阅读界面时 onMount 重置 chrome 为显示。
+- 顶栏拖动后不显示（bug）：`.reader-bar` 原来是 `position: sticky`，条件渲染（Show）后在已滚动的页面上复现时粘不住、藏在视口上方，底栏（fixed）却正常。改成 `position: fixed`（与底栏同样居中 `left: 50%; translateX(-50%); width: min(720px,100%)`，z-index 20），`.reader.chrome-on` 加 `padding-top: 52px` 免得顶栏盖住正文开头。
+- 智能排版：中文排版库用 pangu.js（v10.4.1，`pangu/browser` 入口——默认入口是 Node 版，用了 `node:fs`，Vite 打包会炸；方法名是 `spaceText` 不是旧版 `spacingText`）。`disp` 里繁简转换后过 `pangu.spaceText`，中英文/数字间自动加空格（「我爱iPhone」→「我爱 iPhone」）。高亮切分（splitOnTerm/renderTextWithHighlights）在 disp 之前按原文做，pangu 只在每段切分后加空格，不整坏搜索定位与批注。
+- CSS 中文排版：`.reader-content p` 加 `text-align: justify; line-break: strict; hanging-punctuation: first; text-justify: inter-ideograph`（两端对齐、严格断行、标点悬挂）。
+- 测试：前端构建通过；104 单元 + 2 端到端全绿。竖向滑杆方向（往下拖=往后翻）待线上实测确认，若反了再调 direction。

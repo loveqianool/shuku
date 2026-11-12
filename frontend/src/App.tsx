@@ -1,4 +1,5 @@
 import { createSignal, onCleanup, Show, type Component } from "solid-js";
+import { readerChrome } from "./lib/readerChrome";
 import Bookshelf from "./pages/Bookshelf";
 import SearchPage from "./pages/SearchPage";
 import Reader from "./pages/Reader";
@@ -53,6 +54,7 @@ const App: Component = () => {
 
   return (
     <div class="app">
+      <Show when={route().name !== "read" || readerChrome()}>
       <nav class="nav">
         <a href="#/" class={route().name === "books" ? "brand active" : "brand"}>📚 书库</a>
         <a href="#/search" class={route().name === "search" ? "active" : ""}>检索</a>
@@ -65,6 +67,7 @@ const App: Component = () => {
           {dark() ? "☀️ 浅色" : "🌙 深色"}
         </button>
       </nav>
+      </Show>
       <Show when={!navigator.onLine}>
         <div class="offline-note">离线状态：仅可查看已缓存的静态资源与最近阅读章节。</div>
       </Show>
