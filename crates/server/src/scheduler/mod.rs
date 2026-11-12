@@ -258,7 +258,8 @@ async fn process_scan_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) ->
     if task.r#type == "rebuild_index" {
         let payload: serde_json::Value = serde_json::from_str(&task.payload).unwrap_or(serde_json::json!({}));
         let pause = payload.get("pause_crawl").and_then(|v| v.as_bool()).unwrap_or(true);
-        return rebuild_index(sched, pause).await;
+        let full = payload.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+        return rebuild_index(sched, pause, full).await;
     }
     let payload: serde_json::Value = serde_json::from_str(&task.payload).unwrap_or(serde_json::json!({}));
     let path = payload.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -368,7 +369,7 @@ async fn process_crawl_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) -
     let search = sched.search.clone();
     let idx_title = if book_title.is_empty() { book_url.to_string() } else { book_title.clone() };
     let author_for_index = author.clone();
-    let n = tokio::task::spawn_blocking(move || search.index_book(book_id_num, &idx_title, &author_for_index, &indexed)).await??;
+    let n = tokio::task::spawn_blocking(move || search.index_book(book_id_num, &idx_title, &author_for_index, "cached", &indexed)).await??;
     sched
         .db
         .upsert_book(&crate::db::BookRow {
@@ -390,7 +391,7 @@ async fn process_crawl_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) -
             // Freshly crawled: the first periodic check is due after a full
             // interval, not on the worker's first round.
             last_update_check: now,
-            cover: String::new(),
+            cover_mime: String::new(),
         })
         .await?;
     sched.db.replace_chapters(&book_id, &titles).await?;
@@ -445,12 +446,24 @@ async fn source_by_id(sched: &Arc<Scheduler>, source_id: &str) -> Result<Option<
     Ok(Some(SourceDef::from_raw(&raw_json)))
 }
 
+/// Max chapters fetched in parallel. The per-domain token bucket
+/// (`rate_per_sec`) still caps the request rate; this only bounds the
+/// in-flight requests so a big book does not spawn hundreds of concurrent
+/// fetches, and hides network latency behind the rate limit.
+const CRAWL_CONCURRENCY: usize = 4;
+
 /// Fetch every chapter's content (rate-limited + breaker via the engine),
-/// writing each to data/chapters/<book_id>/<idx>.txt. The returned list is
-/// positional: one (title, text) pair per chapter, in TOC order. A chapter
-/// whose fetch fails gets an empty file and a warning instead of shifting
-/// the indices of the chapters after it (the old crawl skipped failures,
-/// which silently mis-indexed every later chapter).
+/// staging each to a temp directory and atomically swapping it into
+/// data/chapters/<book_id>/ only once every chapter is fetched. The
+/// returned list is positional: one (title, text) pair per chapter, in TOC
+/// order. A chapter whose fetch fails gets an empty file and a warning
+/// instead of shifting the indices of the chapters after it (the old crawl
+/// skipped failures, which silently mis-indexed every later chapter).
+/// If the fetch is interrupted (pause / error / crash) before the swap,
+/// the live directory still holds the old chapters intact — never a mix
+/// of old and new. A leftover backup from a crashed swap is restored.
+/// Chapters are fetched concurrently (bounded by CRAWL_CONCURRENCY) but
+/// written to the staging dir in TOC order.
 async fn fetch_chapter_texts(
     sched: &Arc<Scheduler>,
     source: &SourceDef,
@@ -458,11 +471,71 @@ async fn fetch_chapter_texts(
     chapters: &[crate::source::ChapterHit],
 ) -> Result<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::with_capacity(chapters.len());
+    let chapters_dir = sched.data_dir.join("chapters");
+    let dir = chapters_dir.join(book_id);
+    // Recover from an interrupted swap: live dir missing but a backup from
+    // the crashed swap exists — restore it instead of losing the chapters.
+    if !dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&chapters_dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&format!("{book_id}.old-")) {
+                    let _ = std::fs::rename(e.path(), &dir);
+                    break;
+                }
+            }
+        }
+    }
+    // Drop temp/backup dirs left behind by an interrupted earlier run.
+    if let Ok(entries) = std::fs::read_dir(&chapters_dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&format!("{book_id}.tmp-")) || name.starts_with(&format!("{book_id}.old-")) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    let tmp = chapters_dir.join(format!("{book_id}.tmp-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp)?;
+    // Fetch concurrently, bounded by the semaphore. Results are collected
+    // by index so the staging writes below stay in TOC order.
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(CRAWL_CONCURRENCY));
+    let mut set: tokio::task::JoinSet<(usize, crate::source::TestResult)> = tokio::task::JoinSet::new();
     for (i, ch) in chapters.iter().enumerate() {
         if sched.crawl_paused() {
+            set.abort_all();
+            let _ = std::fs::remove_dir_all(&tmp);
             return Err(anyhow!("crawl paused mid-task after {i} chapters"));
         }
-        let res = sched.engine.run_content(source, &ch.url, false).await;
+        let sem = sem.clone();
+        let engine = sched.engine.clone();
+        let source = source.clone();
+        let url = ch.url.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let res = match _permit {
+                Some(_p) => engine.run_content(&source, &url, false).await,
+                None => crate::source::TestResult {
+                    ok: false,
+                    elapsed_ms: 0,
+                    raw_status: None,
+                    raw_body_truncated: None,
+                    extracted: serde_json::Value::Null,
+                    js_output: vec![],
+                    error: Some("crawl semaphore closed".to_string()),
+                    logs: vec![],
+                },
+            };
+            (i, res)
+        });
+    }
+    let mut results: Vec<Option<crate::source::TestResult>> = (0..chapters.len()).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        let (i, res) = joined.map_err(|e| anyhow!("chapter fetch task failed: {e}"))?;
+        results[i] = Some(res);
+    }
+    for (i, ch) in chapters.iter().enumerate() {
+        let res = results[i].take().expect("all chapter results collected");
         let text = match res.ok {
             true => {
                 let paras: Vec<crate::source::Paragraph> = serde_json::from_value(res.extracted).unwrap_or_default();
@@ -473,11 +546,27 @@ async fn fetch_chapter_texts(
                 String::new()
             }
         };
-        let dir = sched.data_dir.join("chapters").join(book_id);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(format!("{i}.txt")), &text)?;
+        if let Err(e) = std::fs::write(tmp.join(format!("{i}.txt")), &text) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(anyhow!("write staged chapter {i}: {e}"));
+        }
         out.push((ch.name.clone(), text));
     }
+    // All chapters staged: atomically swap the temp dir into place.
+    let backup = chapters_dir.join(format!("{book_id}.old-{}", uuid::Uuid::new_v4()));
+    if dir.exists() {
+        if let Err(e) = std::fs::rename(&dir, &backup) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(anyhow!("move live chapters aside: {e}"));
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dir) {
+        // Swap failed after moving live aside: restore the old chapters.
+        let _ = std::fs::rename(&backup, &dir);
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(anyhow!("swap staged chapters into place: {e}"));
+    }
+    let _ = std::fs::remove_dir_all(&backup);
     Ok(out)
 }
 
@@ -523,23 +612,14 @@ pub(crate) async fn process_change_source(
         return Err(anyhow!("toc extracted 0 chapters"));
     }
     let indexed = fetch_chapter_texts(sched, &source, book_id, &chapters).await?;
-    // Drop stale files from a longer old TOC.
-    let dir = sched.data_dir.join("chapters").join(book_id);
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(n) = name.strip_suffix(".txt").and_then(|s| s.parse::<usize>().ok()) {
-                if n >= chapters.len() {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
-    }
+    // fetch_chapter_texts swapped the temp dir into place atomically, so
+    // the live directory already holds exactly the new chapters (no stale
+    // files from a longer old TOC to clean up).
     let titles: Vec<String> = chapters.iter().map(|c| c.name.clone()).collect();
     let id_num: u64 = book_id.parse().unwrap_or(0);
     let search = sched.search.clone();
     let (t, a) = (book.title.clone(), book.author.clone());
-    tokio::task::spawn_blocking(move || search.index_book(id_num, &t, &a, &indexed))
+    tokio::task::spawn_blocking(move || search.index_book(id_num, &t, &a, "cached", &indexed))
         .await
         .map_err(|e| anyhow!("spawn_blocking: {e}"))??;
     sched.db.replace_chapters(book_id, &titles).await?;
@@ -769,6 +849,12 @@ pub(crate) async fn process_check_update(sched: &Arc<Scheduler>, book_id: &str) 
     if chapters.len() <= existing {
         return Ok(format!("no update (toc {} <= stored {existing})", chapters.len()));
     }
+    // Fetch new chapters in TOC order. A failed chapter stops the run:
+    // it is NOT counted in chapter_count and NOT added to the chapter
+    // list, so the next check retries it (and everything after it) instead
+    // of silently skipping it forever. Previously a failed chapter got an
+    // empty file, was counted, and was never retried — the user saw a
+    // chapter title with no content.
     let mut fetched = 0usize;
     for (i, ch) in chapters.iter().enumerate().skip(existing) {
         if sched.crawl_paused() {
@@ -777,24 +863,25 @@ pub(crate) async fn process_check_update(sched: &Arc<Scheduler>, book_id: &str) 
         let dir = sched.data_dir.join("chapters").join(&book.id);
         std::fs::create_dir_all(&dir)?;
         let res = sched.engine.run_content(&source, &ch.url, false).await;
-        let text = match res.ok {
-            true => {
-                let paras: Vec<crate::source::Paragraph> = serde_json::from_value(res.extracted).unwrap_or_default();
-                fetched += 1;
-                paras.iter().filter_map(|p| p.text.clone()).collect::<Vec<_>>().join("\n")
-            }
-            false => {
-                warn!(target: "crawl", book_url, chapter = i, "new chapter fetch failed: {}", res.error.unwrap_or_default());
-                String::new()
-            }
-        };
+        if !res.ok {
+            warn!(target: "crawl", book_url, chapter = i, "new chapter fetch failed, stopping here so it is retried next check: {}", res.error.unwrap_or_default());
+            break;
+        }
+        let paras: Vec<crate::source::Paragraph> = serde_json::from_value(res.extracted).unwrap_or_default();
+        fetched += 1;
+        let text = paras.iter().filter_map(|p| p.text.clone()).collect::<Vec<_>>().join("\n");
         std::fs::write(dir.join(format!("{i}.txt")), &text)?;
     }
+    if fetched == 0 {
+        return Ok(format!("no new chapters fetched (toc {} > stored {existing}, first new chapter failed)", chapters.len()));
+    }
     // Re-index the whole book from its chapter files (index_book deletes
-    // the book's docs first, so this is append-safe).
+    // the book's docs first, so this is append-safe). Only the fetched
+    // prefix is added: failed chapters stay out of the list and out of
+    // chapter_count, so the next check retries them.
     let (old_titles, _) = sched.db.list_chapters(&book.id, 1, 100_000).await?;
     let mut titles: Vec<String> = old_titles.into_iter().map(|c| c.title).collect();
-    titles.extend(chapters.iter().skip(existing).map(|c| c.name.clone()));
+    titles.extend(chapters.iter().skip(existing).take(fetched).map(|c| c.name.clone()));
     let mut tuples: Vec<(String, String)> = Vec::with_capacity(titles.len());
     for (i, t) in titles.iter().enumerate() {
         let f = sched.data_dir.join("chapters").join(&book.id).join(format!("{i}.txt"));
@@ -804,7 +891,7 @@ pub(crate) async fn process_check_update(sched: &Arc<Scheduler>, book_id: &str) 
     let id_num: u64 = book.id.parse().unwrap_or(0);
     let search = sched.search.clone();
     let (t, a) = (book.title.clone(), book.author.clone());
-    tokio::task::spawn_blocking(move || search.index_book(id_num, &t, &a, &tuples))
+    tokio::task::spawn_blocking(move || search.index_book(id_num, &t, &a, "cached", &tuples))
         .await
         .map_err(|e| anyhow!("spawn_blocking: {e}"))??;
     sched.db.replace_chapters(&book.id, &titles).await?;
@@ -818,7 +905,7 @@ pub(crate) async fn process_check_update(sched: &Arc<Scheduler>, book_id: &str) 
 
 /// Rebuild the whole tantivy index from local books. Pauses the crawl
 /// worker while running when `pause_crawl` is set.
-pub async fn rebuild_index(sched: &Arc<Scheduler>, pause_crawl: bool) -> Result<String> {
+pub async fn rebuild_index(sched: &Arc<Scheduler>, pause_crawl: bool, full: bool) -> Result<String> {
     if pause_crawl {
         sched.pause_crawl(true);
     }
@@ -826,7 +913,7 @@ pub async fn rebuild_index(sched: &Arc<Scheduler>, pause_crawl: bool) -> Result<
     // EVERY exit path: previously an early `?` (delete_all / scan_once /
     // reindex_cached_books) left `pause_crawl` set forever and the crawl
     // queue stalled while the index was already empty.
-    let result = rebuild_index_inner(sched).await;
+    let result = rebuild_index_inner(sched, full).await;
     if pause_crawl {
         sched.pause_crawl(false);
     }
@@ -834,14 +921,20 @@ pub async fn rebuild_index(sched: &Arc<Scheduler>, pause_crawl: bool) -> Result<
     Ok(format!("rebuild done: {} local indexed, {} cached re-indexed, {} broken", report.indexed, cached, report.broken))
 }
 
-async fn rebuild_index_inner(sched: &Arc<Scheduler>) -> Result<(crate::scanner::ScanReport, usize)> {
-    let search = sched.search.clone();
-    tokio::task::spawn_blocking(move || search.delete_all()).await??;
-    info!(target: "search", "index cleared for rebuild");
-    // Force the incremental scanner to pick local books up again.
-    sched.db.reset_index_versions().await?;
+async fn rebuild_index_inner(sched: &Arc<Scheduler>, full: bool) -> Result<(crate::scanner::ScanReport, usize)> {
+    // Incremental by default: only books whose index_version is older
+    // than the current schema (or whose files changed / are broken) are
+    // re-indexed; the index stays usable throughout. A full rebuild
+    // (full=true) wipes the index and forces every book through again —
+    // only needed after index corruption.
+    if full {
+        let search = sched.search.clone();
+        tokio::task::spawn_blocking(move || search.delete_all()).await??;
+        info!(target: "search", "index cleared for full rebuild");
+        sched.db.reset_index_versions().await?;
+    }
     let report = crate::scanner::scan_once(&sched.db, &sched.search, &sched.books_dir, &sched.data_dir, true).await?;
-    let cached = crate::scanner::reindex_cached_books(&sched.db, &sched.search, &sched.data_dir).await?;
+    let cached = crate::scanner::reindex_cached_books(&sched.db, &sched.search, &sched.data_dir, full).await?;
     Ok((report, cached))
 }
 
