@@ -18,7 +18,7 @@ export interface Book {
   size?: number;
   has_update?: boolean;
   last_update_check?: number;
-  cover?: string;
+  cover_mime?: string;
   updated_at?: string;
   tags?: string[];
   [k: string]: unknown;
@@ -256,8 +256,8 @@ export const api = {
   getProgress: (id: string) => req<Progress>(`/api/books/${encodeURIComponent(id)}/progress`),
   saveProgress: (id: string, p: Progress) =>
     req<Progress>(`/api/books/${encodeURIComponent(id)}/progress`, { method: "PUT", body: JSON.stringify(p) }),
-  listTasks: (type?: "scan" | "crawl", status?: string) =>
-    req<Page<TaskItem>>("/api/tasks" + qs({ type, status })),
+  listTasks: (type?: "scan" | "crawl", status?: string, page = 1, page_size = 20) =>
+    req<Page<TaskItem>>("/api/tasks" + qs({ type, status, page, page_size })),
   taskStats: () => req<TaskStats>("/api/tasks/stats"),
   triggerScan: (path?: string) => req<TaskItem>("/api/tasks/scan", { method: "POST", body: JSON.stringify({ path }) }),
   enqueueCrawl: (source_id: string, book_url: string) =>

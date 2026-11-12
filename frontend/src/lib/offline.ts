@@ -29,31 +29,43 @@ export async function offlineChapterCount(bookId: string, total: number): Promis
   }
 }
 
-/** 下载整本：顺序预取全部章节（4 并发），另取书详情/目录/封面。 */
+/** 下载整本：顺序预取全部章节（4 并发），另取书详情/目录/封面。
+ * 传入 `options.signal` 可取消：进行中的章节请求会立即中断，
+ * worker 循环也会停下来，不再取下一章。 */
 export async function downloadBook(
   bookId: string,
   total: number,
   onProgress: (done: number) => void,
+  options?: { signal?: AbortSignal },
 ): Promise<void> {
+  const signal = options?.signal;
   // 书详情、目录、封面也进缓存（走各自的 workbox 规则）。
   await Promise.allSettled([
-    fetch(`/api/books/${encodeURIComponent(bookId)}`),
-    fetch(`/api/books/${encodeURIComponent(bookId)}/chapters?page=1&page_size=1`),
-    fetch(`/api/books/${encodeURIComponent(bookId)}/cover`),
+    fetch(`/api/books/${encodeURIComponent(bookId)}`, { signal }),
+    fetch(`/api/books/${encodeURIComponent(bookId)}/chapters?page=1&page_size=1`, { signal }),
+    fetch(`/api/books/${encodeURIComponent(bookId)}/cover`, { signal }),
   ]);
+  if (signal?.aborted) return;
   let done = 0;
   let next = 0;
   const worker = async () => {
     while (next < total) {
+      if (signal?.aborted) break;
       const idx = next;
       next += 1;
       try {
+        // 用户取消信号 + 单章 15 秒超时，任一触发即中断本次请求；
         // 失败的章节不计入 done（以前 catch 后照样 +1，进度到 100%
         // 其实有章节没下下来）；15 秒超时，免得一章挂住拖死整批。
-        await fetch(chapterUrl(bookId, idx), { signal: AbortSignal.timeout(15000) });
+        const s = signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(15000)])
+          : AbortSignal.timeout(15000);
+        await fetch(chapterUrl(bookId, idx), { signal: s });
         done += 1;
       } catch {
-        // 离线/失败的章节跳过，其余继续；已缓存数以实际为准。
+        // 取消后直接停，不再取下一章；离线/失败的章节跳过，其余继续；
+        // 已缓存数以实际为准。
+        if (signal?.aborted) break;
       }
       onProgress(done);
     }
