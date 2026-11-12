@@ -296,3 +296,12 @@
   - 其余（icons 等固定名文件）→ `public, max-age=3600`。
 - 用户侧：部署后刷新一次页面即可自愈（浏览器拿新 `sw.js` 后 SW 自动更新）；若旧 SW 已钉死多时仍不变，清一次该站点的网站数据即可。
 - 测试：107 单元 + 2 端到端全绿（新增 `static_files::tests::cache_headers`）。
+
+## PWA 改手动更新：长缓存 + 即时更新（2026-11-12）
+
+- Ye 要求：既要长缓存，又要能即时更新、可以手动。做法：PWA 由 `autoUpdate` 改 `prompt` 模式（`vite.config.ts` 的 `registerType`），不再后台自动更新，改由前端接管。
+- 前端（`src/App.tsx` 用 `virtual:pwa-register/solid` 的 `useRegisterSW`，新增 `src/vite-env.d.ts` 引用 `vite-plugin-pwa/client` 类型）：
+  - 新版 SW 就绪时（`needRefresh` 为 true）顶部弹更新横幅：「有新版本可用，点更新后立即生效（不会丢阅读进度）。」+「立即更新」（调 `updateServiceWorker(true)`，新 SW 接管并刷新）+「稍后」（关闭横幅）。
+  - 导航栏加「🔄 检查更新」按钮：调 `registration.update()` 手动查一次；有新版则横幅弹出，4 秒内无动静显示「已是最新版本」3 秒；未注册 SW 或检查失败也给提示。
+- 长缓存不变：带内容 hash 的 `assets/*` 仍 `immutable` 一年；`sw.js`/`index.html` 仍 `no-cache`，保证每次都能检测到新版。两者结合：平时走长缓存很快，有新版时手动一点即更新。
+- 构建验证：`registerSW.js` 不再自动注入（prompt 模式），`sw.js` 仍含 `skipWaiting`；新 bundle 含更新横幅与「检查更新」文案。测试：107 单元 + 2 端到端全绿。
