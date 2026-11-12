@@ -3031,7 +3031,7 @@ mod tests {
             source_url: Some(book_url.to_string()), source: "cached".into(),
             mtime: now, size: 0, index_version: 1, status: "ok".into(),
             chapter_count: n as i64, created_at: now, updated_at: now,
-            source_id: source_id.to_string(), has_update: false, last_update_check: 0, cover: String::new(),
+            source_id: source_id.to_string(), has_update: false, last_update_check: 0, cover_mime: String::new(),
         })
         .await
         .unwrap();
@@ -3187,7 +3187,7 @@ mod tests {
             source_url: Some(format!("http://127.0.0.1:{port}/toc-update")),
             source: "cached".into(), mtime: now, size: 0, index_version: 1,
             status: "ok".into(), chapter_count: 2, created_at: now, updated_at: now,
-            source_id: source.id.clone(), has_update: false, last_update_check: 0, cover: String::new(),
+            source_id: source.id.clone(), has_update: false, last_update_check: 0, cover_mime: String::new(),
         }).await.unwrap();
         db.replace_chapters(&book_id, &["第一章".to_string(), "第二章".to_string()]).await.unwrap();
         let dir = data_dir.join("chapters").join(&book_id);
