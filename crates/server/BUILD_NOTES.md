@@ -440,3 +440,8 @@ Ye 指令：剩下的待定全部做，做完再做一次全量检查、精简�
 - 設置改浮動面板（fixed，底欄上方居中，內容多時內部滾動，帶 ✕ 關閉）：基本排版（字號/行距/縮進/主題/繁簡/語速）+ 朗讀（讀當前視口章）+ 整本離線（狀態/下載/取消/刪除）+ 缺章檢查。離線/缺章/朗讀以前在閱讀器底部或底欄，讀到一半搵唔到，現收進設置隨時用到。底欄只留目錄/搜索/設置三掣。
 - 全书读完标记（— 全書完 —）+ 同作者推荐只在全部章节载入后出现；离线/缺章卡已移出结尾。
 - 测试：`npm run build`（tsc -b + vite）通过；`cargo test --release` 116 单元 + 2 端到端全绿（后端无改动）。
+
+## 2026-11-13 瀑布流卡住修復（前端）
+- 故障：Ye 報閱讀器卡在「加载下一章中…」，下一章永遠載唔到。後端核實正常（容器內直接攞第 1 章即返）；根因喺前端 `appendOne`/`prependOne` 的 `finally` 用 `if (seq === loadSeq)` 守住 `loadingMore`——跳章/拖滑杆令 `loadSeq` 自增時，過期的追加永遠清唔掉 `loadingMore`，之後所有追加都被 `loadingMore()` 擋住，永久卡住。
+- 修復：(a) `appendOne`/`prependOne` 的 `finally` 改無條件 `setLoadingMore(false)`（過期操作都要清，否則漏；新操作唔靠呢個旗標）；(b) 追加/前補真抓失敗（非序號過期）置 `loadMoreError`，顯示「加载下一章失败，点此重试」按鈕，唔再靜默卡住；(c) `resetToChapter` 與滾動換章的 `location.hash = ...` 改 `history.replaceState`（唔觸發 `hashchange` → App 路由重算，避免換書 effect 被重複觸發、loadSeq 自增令在途追加漏清）。`loading`（初始載入指示）保留序號守衛：由最新的 resetToChapter 管理，唔會漏。
+- 测试：`npm run build`（tsc -b + vite）通过；`cargo test --release`（後端無改動，例行全綠待核）。

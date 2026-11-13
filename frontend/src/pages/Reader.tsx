@@ -60,6 +60,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [loading, setLoading] = createSignal(false);
   // 逐章追加/前補進行中（防重入；初始載入用 loading）。
   const [loadingMore, setLoadingMore] = createSignal(false);
+  // 追加/前補抓章失敗時置真，顯示「點此重試」（抓失敗不應靜默卡住）。
+  const [loadMoreError, setLoadMoreError] = createSignal(false);
   // 批注按章存（瀑布流同時渲染多章，單一 highlights signal 不夠用）。
   const [highlightsByChapter, setHighlightsByChapter] = createSignal<Record<number, Highlight[]>>({});
   const [selText, setSelText] = createSignal("");
@@ -337,20 +339,25 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   };
 
   // 往后追加一章（滚到底触发）。返 false 表示没载入（已到底/在载/序号过期）。
+  // 注意：finally 必须无条件清 loadingMore。旧代码用 `if (seq === loadSeq)`
+  // 守住，跳章/拖滑杆令 loadSeq 自增时，过期的追加永远清不掉 loadingMore，
+  // 之后所有追加都被 `loadingMore()` 挡住，永久卡在「加载下一章中…」。
   const appendOne = async (): Promise<boolean> => {
     const total = toc().length;
     const next = maxLoaded() + 1;
     if (total === 0 || next >= total || loadingMore()) return false;
     setLoadingMore(true);
+    setLoadMoreError(false);
     const seq = loadSeq;
     try {
       const ch = await fetchOne(next, seq);
-      if (seq !== loadSeq || !ch) return false;
+      if (seq !== loadSeq) return false; // 过期：已有更新的操作接手，不是失败
+      if (!ch) { setLoadMoreError(true); return false; } // 真抓失败，显示重试
       loadHighlightsFor(next);
       setChapters((prev) => [...prev, ch]);
       return true;
     } finally {
-      if (seq === loadSeq) setLoadingMore(false);
+      setLoadingMore(false);
     }
   };
   // 往前补一章（滚到顶触发）。前补会把已读内容往下顶，载完按增加的高度
@@ -359,12 +366,14 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     const prev = minLoaded() - 1;
     if (prev < 0 || loadingMore()) return false;
     setLoadingMore(true);
+    setLoadMoreError(false);
     const seq = loadSeq;
     const beforeH = document.documentElement.scrollHeight;
     const beforeY = window.scrollY;
     try {
       const ch = await fetchOne(prev, seq);
-      if (seq !== loadSeq || !ch) return false;
+      if (seq !== loadSeq) return false;
+      if (!ch) { setLoadMoreError(true); return false; }
       loadHighlightsFor(prev);
       setChapters((prevChs) => [ch, ...prevChs]);
       requestAnimationFrame(() => {
@@ -374,7 +383,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       });
       return true;
     } finally {
-      if (seq === loadSeq) setLoadingMore(false);
+      setLoadingMore(false);
     }
   };
 
@@ -396,7 +405,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       setChapters([ch]);
       setIdx(i);
       setSelText("");
-      location.hash = `#/read/${encodeURIComponent(props.bookId)}/${i}`;
+      // 用 replaceState 更新深链（不触发 hashchange → App 路由重算，
+      // 免得换书 effect 被重複觸發、loadSeq 自增令在途的追加漏清 loadingMore）。
+      history.replaceState(null, "", `#/read/${encodeURIComponent(props.bookId)}/${i}`);
       // 后台先把下一章也载好，往下滚时无缝（不 await，不阻塞定位）。
       const total = toc().length;
       if (i + 1 < total) void appendOne();
@@ -538,7 +549,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     if (current === -1) current = Number((els[0] as HTMLElement).dataset.chapterIdx);
     if (current !== -1 && current !== idx()) {
       setIdx(current);
-      location.hash = `#/read/${encodeURIComponent(props.bookId)}/${current}`;
+      // 同上：replaceState 不触发 hashchange，滚动换章不惊动路由。
+      history.replaceState(null, "", `#/read/${encodeURIComponent(props.bookId)}/${current}`);
     }
   };
   // 整页滚动：同步当前章与章内进度、防抖保存进度，并触发瀑布流载入。
@@ -983,6 +995,12 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       </div>
       <Show when={loadingMore()}>
         <p class="muted">加载下一章中…</p>
+      </Show>
+      <Show when={loadMoreError() && !loadingMore()}>
+        <p class="muted">
+          加载下一章失败（网络或服务异常）{" "}
+          <button onClick={() => { setLoadMoreError(false); void appendOne(); }}>点此重试</button>
+        </p>
       </Show>
 
       {/* 全书读完：只有全部章节都载入后才出现（离线/缺章已收进设置，
