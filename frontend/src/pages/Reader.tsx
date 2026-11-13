@@ -42,16 +42,26 @@ function splitOnTerm(text: string, term: string) {
   return parts;
 }
 
+// 瀑布流阅读器：章节按顺序连续渲染，滚到底（前 1200px）自动载下一章，
+// 滚到顶（400px 内）自动补上一章，一直往下读到全书完。不再按章切页，
+// 仿真翻页模式已删（与瀑布流冲突）。进度按 {当前章, 章内像素偏移} 存，
+// 与旧 Progress 格式兼容（offset 是章内偏移，不是整页滚动值）。
 const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [book, setBook] = createSignal<Book | null>(null);
   const [toc, setToc] = createSignal<ChapterMeta[]>([]);
   const [showToc, setShowToc] = createSignal(false);
+  // 已载入的章节（按 idx 升序连续）。跳章/搜尋跳轉時重置窗口，只留目標章起
+  // 的內容，避免一次抓幾十章；自然滾動時逐章追加/前補。
+  const [chapters, setChapters] = createSignal<Chapter[]>([]);
+  // 当前在视口里的章节（由滚动位置定）：进度、目录高亮、朗读、批注都跟它。
   const [idx, setIdx] = createSignal(props.initialIdx);
-  const [chapter, setChapter] = createSignal<Chapter | null>(null);
   const [settings, setSettings] = createSignal<ReaderSettings>(loadSettings());
   const [error, setError] = createSignal("");
   const [loading, setLoading] = createSignal(false);
-  const [highlights, setHighlights] = createSignal<Highlight[]>([]);
+  // 逐章追加/前補進行中（防重入；初始載入用 loading）。
+  const [loadingMore, setLoadingMore] = createSignal(false);
+  // 批注按章存（瀑布流同時渲染多章，單一 highlights signal 不夠用）。
+  const [highlightsByChapter, setHighlightsByChapter] = createSignal<Record<number, Highlight[]>>({});
   const [selText, setSelText] = createSignal("");
   const [noteInput, setNoteInput] = createSignal("");
   const [inBookQ, setInBookQ] = createSignal("");
@@ -73,7 +83,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   // 再点一下浮出来；搜尋与设置面板由底栏按钮唤出，平时收起。
   const [showSearch, setShowSearch] = createSignal(false);
   const [showSettings, setShowSettings] = createSignal(false);
-  // 本章内滚动进度（0..1），驱动右边的竖向滑杆与全书进度。
+  // 当前章内滚动进度（0..1），驱动右边的竖向滑杆与全书进度。
   const [scrollFrac, setScrollFrac] = createSignal(0);
   // 竖向全书滑杆拖动中的值（null 表示没在拖），松手才跳章，免得拖动时反复加载。
   const [bookDrag, setBookDrag] = createSignal<number | null>(null);
@@ -110,19 +120,33 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   // 进阅读界面时顶栏/底栏默认隐藏（点正文唤出；之前若显示过，打开新书时恢复隐藏）。
   onMount(() => setShowChrome(false));
 
-  // 当前选中处定位：章节渲染好之后，把本章第 currentOccurrence 个
+  let contentRef: HTMLDivElement | undefined;
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // 已载入窗口的上下界（chapters() 按 idx 升序连续）。
+  const minLoaded = () => (chapters().length ? chapters()[0].chapter_idx : -1);
+  const maxLoaded = () => (chapters().length ? chapters()[chapters().length - 1].chapter_idx : -1);
+  const allLoaded = () => toc().length > 0 && maxLoaded() >= toc().length - 1;
+  // 某章的 <section> 元素（data-chapter-idx 定位，搜尋/跳轉時圈定範圍）。
+  const chapterEl = (i: number) =>
+    contentRef?.querySelector(`[data-chapter-idx="${i}"]`) as HTMLElement | null;
+  const currentChapter = () => chapters().find((c) => c.chapter_idx === idx()) ?? null;
+
+  // 当前选中处定位：目标章渲染好之后，把该章第 currentOccurrence 个
   // mark.search-hit 单独标亮（search-hit-current）并滚到它。只在当前
   // 章节就是选中处所在的章节时定位，避免换章途中用旧的序号去滚新章。
   createEffect(() => {
     const k = currentOccurrence();
     const term = searchTerm();
-    void chapter();
+    void chapters();
     if (k < 0 || !term) return;
     const m = inBookMatches()[currentMatch()];
     if (!m || m.chapter_idx !== idx()) return;
     requestAnimationFrame(() => {
-      const marks = contentRef?.querySelectorAll("mark.search-hit");
-      if (!marks || k >= marks.length) return;
+      const sec = chapterEl(m.chapter_idx);
+      if (!sec) return;
+      const marks = sec.querySelectorAll("mark.search-hit");
+      if (k >= marks.length) return;
       marks.forEach((el) => el.classList.remove("search-hit-current"));
       const el = marks[k];
       el.classList.add("search-hit-current");
@@ -249,7 +273,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       stopSpeaking();
       return;
     }
-    const text = (chapter()?.paragraphs ?? [])
+    // 朗读当前在视口里的那章（瀑布流没有“当前单章”，跟视口走）。
+    const text = (currentChapter()?.paragraphs ?? [])
       .map((p) => disp(p.text ?? ""))
       .filter(Boolean)
       .join("\n");
@@ -263,8 +288,6 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     synth.speak(u);
     setSpeaking(true);
   };
-  let contentRef: HTMLDivElement | undefined;
-  let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
   const patchSettings = (p: Partial<ReaderSettings>) => {
     const next = { ...settings(), ...p };
@@ -280,74 +303,137 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     saveSettings(next);
   };
 
-  const loadToc = async (seq?: number) => {
+  const loadToc = async (bid: string) => {
     const all: ChapterMeta[] = [];
     let page = 1;
     for (;;) {
-      const res = await api.listChapters(props.bookId, page, 200);
+      const res = await api.listChapters(bid, page, 200);
       all.push(...res.items);
       if (all.length >= res.total || res.items.length === 0) break;
       page += 1;
     }
-    if (seq !== undefined && seq !== loadSeq) return;
+    // 只认当前这本书：换书后旧的 TOC 响应直接丢弃。不用 loadSeq 守卫，
+    // 因为 resetToChapter 也会自增 loadSeq，会把目录误判为过期。
+    if (bid !== props.bookId) return;
     setToc(all);
   };
 
   // 序号守卫：换书/跳章时先到的响应不覆盖后到的（Bookshelf 同款 loadSeq）。
-  // 每次 loadChapter / 换书 effect 都自增，await 回来后对不上就丢弃。
+  // 每次载入 / 换书 effect 都自增，await 回来后对不上就丢弃。
   let loadSeq = 0;
 
-  // frac?: 0..1，换章后滚到章内对应位置（竖向全书滑杆按百分比定位时用）。
-  // offsetPx?: 恢复进度时用的像素偏移（读到的 offset 原样滚回去）。
-  // 两者都不传则滚到章首。滚动要等章节渲染好（scrollHeight 就绪）再做。
-  const loadChapter = async (i: number, frac?: number, offsetPx?: number) => {
+  // 抓一章正文（不改状态；seq 对不上或失败返 null）。
+  const fetchOne = async (i: number, seq: number): Promise<Chapter | null> => {
+    try {
+      const ch = await api.getChapter(props.bookId, i);
+      return seq === loadSeq ? ch : null;
+    } catch (e) {
+      if (seq === loadSeq) setError(e instanceof Error ? e.message : String(e));
+      return null;
+    }
+  };
+  const loadHighlightsFor = (i: number) => {
+    setHighlightsByChapter((prev) => ({ ...prev, [i]: loadHighlights(props.bookId, i) }));
+  };
+
+  // 往后追加一章（滚到底触发）。返 false 表示没载入（已到底/在载/序号过期）。
+  const appendOne = async (): Promise<boolean> => {
+    const total = toc().length;
+    const next = maxLoaded() + 1;
+    if (total === 0 || next >= total || loadingMore()) return false;
+    setLoadingMore(true);
+    const seq = loadSeq;
+    try {
+      const ch = await fetchOne(next, seq);
+      if (seq !== loadSeq || !ch) return false;
+      loadHighlightsFor(next);
+      setChapters((prev) => [...prev, ch]);
+      return true;
+    } finally {
+      if (seq === loadSeq) setLoadingMore(false);
+    }
+  };
+  // 往前补一章（滚到顶触发）。前补会把已读内容往下顶，载完按增加的高度
+  // 把滚动位置补回去，视口内容不动。
+  const prependOne = async (): Promise<boolean> => {
+    const prev = minLoaded() - 1;
+    if (prev < 0 || loadingMore()) return false;
+    setLoadingMore(true);
+    const seq = loadSeq;
+    const beforeH = document.documentElement.scrollHeight;
+    const beforeY = window.scrollY;
+    try {
+      const ch = await fetchOne(prev, seq);
+      if (seq !== loadSeq || !ch) return false;
+      loadHighlightsFor(prev);
+      setChapters((prevChs) => [ch, ...prevChs]);
+      requestAnimationFrame(() => {
+        if (seq !== loadSeq) return;
+        const afterH = document.documentElement.scrollHeight;
+        window.scrollTo(0, beforeY + (afterH - beforeH));
+      });
+      return true;
+    } finally {
+      if (seq === loadSeq) setLoadingMore(false);
+    }
+  };
+
+  // 跳转：把载入窗口重置到目标章（只留目标章，免得远跳时一次抓幾十章），
+  // 再滚到章内位置。opts.frac：章内 0..1；opts.offsetPx：恢复进度用的
+  // 章内像素偏移；opts.scroll=false 时只载入不滚动（搜尋定位由 effect 接手）。
+  const resetToChapter = async (
+    i: number,
+    opts?: { frac?: number; offsetPx?: number; scroll?: boolean },
+  ) => {
     const seq = ++loadSeq;
     setLoading(true);
     setError("");
     stopSpeaking();
     try {
-      const ch = await api.getChapter(props.bookId, i);
-      if (seq !== loadSeq) return;
-      setChapter(ch);
+      const ch = await fetchOne(i, seq);
+      if (seq !== loadSeq || !ch) return;
+      setHighlightsByChapter({ [i]: loadHighlights(props.bookId, i) });
+      setChapters([ch]);
       setIdx(i);
-      setHighlights(loadHighlights(props.bookId, i));
       setSelText("");
       location.hash = `#/read/${encodeURIComponent(props.bookId)}/${i}`;
-      if (frac === undefined && offsetPx === undefined) {
-        if (contentRef) contentRef.scrollTop = 0;
-        window.scrollTo(0, 0);
-        setScrollFrac(0);
-        // 进度：切章即保存
-        await api.saveProgress(props.bookId, { chapter_idx: i, offset: 0 }).catch(() => {});
-      } else {
-        // 等渲染好再滚到章内位置，并按实际 offset 保存进度。
-        requestAnimationFrame(() => {
-          if (seq !== loadSeq) return;
-          if (offsetPx !== undefined) {
-            // 按像素恢复：夹到最大滚动范围，免得换了字号/屏宽后越界。
-            if (settings().mode === "page") {
-              const el = contentRef;
-              if (el) el.scrollTop = Math.min(offsetPx, Math.max(0, el.scrollHeight - el.clientHeight));
-            } else {
-              window.scrollTo(0, Math.min(offsetPx, Math.max(0, document.documentElement.scrollHeight - window.innerHeight)));
-            }
-            setScrollFrac(getScrollFrac());
-            const offset = settings().mode === "page" ? (contentRef?.scrollTop ?? 0) : window.scrollY;
-            api.saveProgress(props.bookId, { chapter_idx: i, offset }).catch(() => {});
-          } else {
-            scrollToFrac(frac!);
-            setScrollFrac(frac!);
-            const offset = settings().mode === "page" ? (contentRef?.scrollTop ?? 0) : window.scrollY;
-            api.saveProgress(props.bookId, { chapter_idx: i, offset }).catch(() => {});
-          }
-        });
-      }
+      // 后台先把下一章也载好，往下滚时无缝（不 await，不阻塞定位）。
+      const total = toc().length;
+      if (i + 1 < total) void appendOne();
+      if (opts?.scroll === false) return;
+      requestAnimationFrame(() => {
+        if (seq !== loadSeq) return;
+        const el = chapterEl(i);
+        if (!el) return;
+        const max = Math.max(0, el.scrollHeight - window.innerHeight);
+        const top = el.offsetTop + (opts?.offsetPx !== undefined
+          ? Math.min(opts.offsetPx, max)
+          : (opts?.frac ?? 0) * max);
+        window.scrollTo(0, top);
+        setScrollFrac(getScrollFrac());
+        api.saveProgress(props.bookId, {
+          chapter_idx: i,
+          offset: Math.max(0, window.scrollY - el.offsetTop),
+        }).catch(() => {});
+      });
     } catch (e) {
       if (seq !== loadSeq) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (seq === loadSeq) setLoading(false);
     }
+  };
+
+  // 目录/滑杆/搜尋的跳章：已载入就直接滚过去，没载入才重置窗口。
+  const jumpToChapter = async (i: number, frac = 0) => {
+    const el = chapterEl(i);
+    if (el) {
+      const max = Math.max(0, el.scrollHeight - window.innerHeight);
+      window.scrollTo({ top: el.offsetTop + frac * max });
+      setIdx(i);
+      return;
+    }
+    await resetToChapter(i, { frac });
   };
 
   createEffect(() => {
@@ -372,7 +458,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setChapterIssues(null);
     setSameAuthor([]);
     setScrollFrac(0);
-    setChapter(null);
+    setChapters([]);
+    setHighlightsByChapter({});
     setBook(null);
     setToc([]);
     api.getBook(bid).then((b) => {
@@ -385,30 +472,25 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
           .catch(() => {});
       }
     }).catch((e) => { if (seq === loadSeq) setError(String(e)); });
-    loadToc(seq).catch((e) => { if (seq === loadSeq) setError(String(e)); });
-    // 恢复进度：无明确章节时跳到上次章节，并按像素偏移滚回去
+    loadToc(bid).catch((e) => { if (bid === props.bookId) setError(String(e)); });
+    // 恢复进度：无明确章节时跳到上次章节，并按章内像素偏移滚回去
     // （以前只跳章不恢复章内位置，读一半的章节每次都回章首）。
     api.getProgress(bid)
       .then((p) => {
         if (seq !== loadSeq) return;
-        if (props.initialIdx === 0) loadChapter(p.chapter_idx, undefined, p.offset);
-        else loadChapter(props.initialIdx);
+        if (props.initialIdx === 0) resetToChapter(p.chapter_idx, { offsetPx: p.offset });
+        else resetToChapter(props.initialIdx);
       })
-      .catch(() => { if (seq === loadSeq) loadChapter(props.initialIdx); });
+      .catch(() => { if (seq === loadSeq) resetToChapter(props.initialIdx); });
   });
 
-  // 滚动进度自动保存（防抖 1s）：仿真翻页模式走容器滚动，
-  // 滚动模式走整页滚动，两路共用同一防抖保存。
+  // 滚动进度自动保存（防抖 1s）。offset 是章内像素偏移（scrollY - 章节
+  // section 顶），与旧 Progress 格式兼容。
   const scheduleSaveProgress = (offset: number) => {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       api.saveProgress(props.bookId, { chapter_idx: idx(), offset }).catch(() => {});
     }, 1000);
-  };
-  const onScroll = () => {
-    if (!contentRef) return;
-    setScrollFrac(getScrollFrac());
-    scheduleSaveProgress(contentRef.scrollTop);
   };
   onCleanup(() => clearTimeout(saveTimer));
 
@@ -422,51 +504,58 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     api.addReadingTime(props.bookId, s).catch(() => {});
   };
   const readTimer = setInterval(() => {
-    if (document.visibilityState === "visible" && chapter()) {
+    if (document.visibilityState === "visible" && chapters().length > 0) {
       pendingSeconds += 1;
       if (pendingSeconds >= 60) flushReadingTime();
     }
   }, 1000);
   onCleanup(() => { clearInterval(readTimer); flushReadingTime(); stopSpeaking(); });
 
-  // 仿真翻页：按一屏滚动
-  const pageStep = (dir: 1 | -1) => {
-    if (!contentRef) return;
-    contentRef.scrollBy({ top: dir * contentRef.clientHeight * 0.92, behavior: "smooth" });
-  };
-
-  // 本章滚动进度：仿真翻页模式下正文容器自己滚，滚动模式下整页滚。
+  // 当前章内滚动进度（0..1）：章比视口矮时整章可见即算读完（frac=1）。
   const getScrollFrac = () => {
-    if (settings().mode === "page") {
-      const el = contentRef;
-      if (!el) return 0;
-      const max = el.scrollHeight - el.clientHeight;
-      return max > 0 ? Math.min(1, Math.max(0, el.scrollTop / max)) : 0;
-    }
-    const max = document.documentElement.scrollHeight - window.innerHeight;
-    return max > 0 ? Math.min(1, Math.max(0, window.scrollY / max)) : 0;
+    const el = chapterEl(idx());
+    if (!el) return 0;
+    const h = el.scrollHeight;
+    const off = window.scrollY - el.offsetTop;
+    if (h <= window.innerHeight) return off >= 0 ? 1 : 0;
+    return Math.min(1, Math.max(0, off / (h - window.innerHeight)));
   };
   const scrollToFrac = (f: number) => {
-    const v = Math.min(1, Math.max(0, f));
-    if (settings().mode === "page") {
-      const el = contentRef;
-      if (!el) return;
-      el.scrollTo({ top: v * (el.scrollHeight - el.clientHeight) });
-    } else {
-      window.scrollTo({ top: v * (document.documentElement.scrollHeight - window.innerHeight) });
+    const el = chapterEl(idx());
+    if (!el) return;
+    const max = Math.max(0, el.scrollHeight - window.innerHeight);
+    window.scrollTo({ top: el.offsetTop + Math.min(1, Math.max(0, f)) * max });
+  };
+  // 按滚动位置定当前章：视口顶部（120px 容差）所在的最后一章。
+  const updateCurrentFromScroll = () => {
+    const els = contentRef?.querySelectorAll("[data-chapter-idx]");
+    if (!els || els.length === 0) return;
+    let current = -1;
+    els.forEach((el) => {
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (r.top <= 120) current = Number((el as HTMLElement).dataset.chapterIdx);
+    });
+    if (current === -1) current = Number((els[0] as HTMLElement).dataset.chapterIdx);
+    if (current !== -1 && current !== idx()) {
+      setIdx(current);
+      location.hash = `#/read/${encodeURIComponent(props.bookId)}/${current}`;
     }
   };
-  // 滚动模式下整页滚，用 window 滚动事件同步本章进度并防抖保存
-  // （以前只同步滑杆不保存，滚动模式下读再久进度也不更新）。
+  // 整页滚动：同步当前章与章内进度、防抖保存进度，并触发瀑布流载入。
+  // 靠近底部 1200px 载下一章；靠近顶部 400px 补上一章。
   const onWinScroll = () => {
-    if (settings().mode === "page") return;
+    updateCurrentFromScroll();
     setScrollFrac(getScrollFrac());
-    scheduleSaveProgress(window.scrollY);
+    const el = chapterEl(idx());
+    if (el) scheduleSaveProgress(Math.max(0, window.scrollY - el.offsetTop));
+    const doc = document.documentElement;
+    if (window.innerHeight + window.scrollY >= doc.scrollHeight - 1200) void appendOne();
+    if (window.scrollY <= 400) void prependOne();
   };
   window.addEventListener("scroll", onWinScroll, { passive: true });
   onCleanup(() => window.removeEventListener("scroll", onWinScroll));
 
-  // 全书进度（0..100）：章节序号 + 本章内滚动进度，底栏滑杆用。
+  // 全书进度（0..100）：章节序号 + 本章内滚动进度。
   const bookPct = () => {
     const n = toc().length;
     if (n === 0) return 0;
@@ -486,11 +575,11 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     const n = toc().length;
     if (n === 0) return;
     const { target, frac } = pctToChapterPos(pct);
-    if (target === idx()) {
+    if (target === idx() && chapterEl(target)) {
       scrollToFrac(frac);
       return;
     }
-    loadChapter(target, frac);
+    void jumpToChapter(target, frac);
   };
   // 底栏「搜索」：只浮出搜索面板并聚焦输入框，不显示顶栏/底栏。
   // 回到结果列表时滚回上次点过的匹配处（jumpToMatch 会收起面板、卸载
@@ -515,14 +604,6 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setShowChrome(!showChrome());
   };
 
-  const onKey = (e: KeyboardEvent) => {
-    if (settings().mode !== "page") return;
-    if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === " ") { e.preventDefault(); pageStep(1); }
-    if (e.key === "ArrowLeft" || e.key === "ArrowUp") { e.preventDefault(); pageStep(-1); }
-  };
-  window.addEventListener("keydown", onKey);
-  onCleanup(() => window.removeEventListener("keydown", onKey));
-
   const onSelect = () => {
     const sel = window.getSelection();
     const t = sel?.toString().trim() ?? "";
@@ -532,9 +613,10 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const addHighlight = () => {
     const t = selText();
     if (!t) return;
-    const next = [...highlights(), { text: t, note: noteInput() || undefined, created_at: Date.now() }];
-    setHighlights(next);
-    saveHighlights(props.bookId, idx(), next);
+    const cur = idx();
+    const next = [...(highlightsByChapter()[cur] ?? []), { text: t, note: noteInput() || undefined, created_at: Date.now() }];
+    setHighlightsByChapter((prev) => ({ ...prev, [cur]: next }));
+    saveHighlights(props.bookId, cur, next);
     setSelText("");
     setNoteInput("");
     window.getSelection()?.removeAllRanges();
@@ -548,9 +630,11 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setCurrentOccurrence(-1);
     setInBookHits([]);
     setShowSearch(false);
-    await loadChapter(h.chapter_idx);
+    if (!chapterEl(h.chapter_idx)) {
+      await resetToChapter(h.chapter_idx, { scroll: false });
+    }
     requestAnimationFrame(() => {
-      contentRef?.querySelector("mark.search-hit")?.scrollIntoView({ block: "center" });
+      chapterEl(h.chapter_idx)?.querySelector("mark.search-hit")?.scrollIntoView({ block: "center" });
     });
   };
 
@@ -564,9 +648,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setShowSearch(false);
     // 该处在本章里的第几个出现处（用来单独标亮）。
     const k = inBookMatches().slice(0, i).filter((x) => x.chapter_idx === m.chapter_idx).length;
-    if (m.chapter_idx !== idx()) {
+    if (!chapterEl(m.chapter_idx)) {
       setCurrentOccurrence(-1);
-      await loadChapter(m.chapter_idx);
+      await resetToChapter(m.chapter_idx, { scroll: false });
     }
     setCurrentOccurrence(k);
   };
@@ -646,7 +730,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   };
 
   const s = () => settings();
-  const ch = () => chapter();
+  const curHighlights = () => highlightsByChapter()[idx()] ?? [];
 
   return (
     <div class="reader">
@@ -725,7 +809,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       <Show when={searchTerm() && showChrome()}>
         <div class="card row">
           <Show when={currentMatch() >= 0} fallback={
-            <span>搜索「{searchTerm()}」：本章 {(chapter()?.paragraphs ?? []).reduce((n, p) => n + (p.text ?? "").split(searchTerm()).length - 1, 0)} 处</span>
+            <span>搜索「{searchTerm()}」：本章 {(currentChapter()?.paragraphs ?? []).reduce((n, p) => n + (p.text ?? "").split(searchTerm()).length - 1, 0)} 处</span>
           }>
             <span>搜索「{searchTerm()}」：第 {currentMatch() + 1} / 共 {inBookMatchTotal()} 处</span>
             <button onClick={() => stepMatch(-1)}>‹ 上一处</button>
@@ -739,7 +823,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         <div class="toc">
           <For each={toc()}>
             {(c) => (
-              <button class={c.idx === idx() ? "current" : ""} onClick={() => { setShowToc(false); loadChapter(c.idx); }}>
+              <button class={c.idx === idx() ? "current" : ""} onClick={() => { setShowToc(false); void jumpToChapter(c.idx); }}>
                 {c.title}
               </button>
             )}
@@ -748,31 +832,76 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       </Show>
 
       <Show when={showSettings()}>
+      {/* 設置浮動面板（fixed 浮層，唔佔文檔流）：基本排版 + 朗讀 + 整本離線
+          + 缺章檢查。離線/缺章以前放閱讀器底部，讀到一半搵唔到，收進設置隨時用到。 */}
       <div class="reader-settings">
-        <label>字号 <input type="number" min={12} max={32} value={s().fontSize} onChange={(e) => patchSettings({ fontSize: Number(e.currentTarget.value) })} /></label>
-        <label>行距 <input type="number" step={0.1} min={1.2} max={3} value={s().lineHeight} onChange={(e) => patchSettings({ lineHeight: Number(e.currentTarget.value) })} /></label>
-        <label>缩进 <input type="number" step={0.5} min={0} max={4} value={s().indent} onChange={(e) => patchSettings({ indent: Number(e.currentTarget.value) })} /> em</label>
-        <label>主题
-          <select value={s().theme} onChange={(e) => patchSettings({ theme: e.currentTarget.value as ReaderSettings["theme"] })}>
-            <option value="dark">深色</option>
-            <option value="light">浅色</option>
-            <option value="sepia">米色</option>
-          </select>
-        </label>
-        <label>翻页
-          <select value={s().mode} onChange={(e) => patchSettings({ mode: e.currentTarget.value as ReaderSettings["mode"] })}>
-            <option value="scroll">滚动</option>
-            <option value="page">仿真翻页（按屏）</option>
-          </select>
-        </label>
-        <label>繁简
-          <select value={s().script} onChange={(e) => patchSettings({ script: e.currentTarget.value as ReaderSettings["script"] })}>
-            <option value="orig">原文</option>
-            <option value="trad">繁體</option>
-            <option value="simp">简体</option>
-          </select>
-        </label>
-        <label>语速 <input type="number" step={0.1} min={0.5} max={2} value={ttsRate()} onChange={(e) => setTtsRate(Number(e.currentTarget.value))} /></label>
+        <div class="settings-head">
+          <strong>设置</strong>
+          <button onClick={() => setShowSettings(false)}>✕</button>
+        </div>
+        <div class="settings-row">
+          <label>字号 <input type="number" min={12} max={32} value={s().fontSize} onChange={(e) => patchSettings({ fontSize: Number(e.currentTarget.value) })} /></label>
+          <label>行距 <input type="number" step={0.1} min={1.2} max={3} value={s().lineHeight} onChange={(e) => patchSettings({ lineHeight: Number(e.currentTarget.value) })} /></label>
+          <label>缩进 <input type="number" step={0.5} min={0} max={4} value={s().indent} onChange={(e) => patchSettings({ indent: Number(e.currentTarget.value) })} /> em</label>
+          <label>主题
+            <select value={s().theme} onChange={(e) => patchSettings({ theme: e.currentTarget.value as ReaderSettings["theme"] })}>
+              <option value="dark">深色</option>
+              <option value="light">浅色</option>
+              <option value="sepia">米色</option>
+            </select>
+          </label>
+          <label>繁简
+            <select value={s().script} onChange={(e) => patchSettings({ script: e.currentTarget.value as ReaderSettings["script"] })}>
+              <option value="orig">原文</option>
+              <option value="trad">繁體</option>
+              <option value="simp">简体</option>
+            </select>
+          </label>
+          <label>语速 <input type="number" step={0.1} min={0.5} max={2} value={ttsRate()} onChange={(e) => setTtsRate(Number(e.currentTarget.value))} /></label>
+        </div>
+        <div class="settings-section">
+          <div class="row">
+            <strong>朗读</strong>
+            <button onClick={speakChapter}>{speaking() ? "⏹ 停止朗读" : "🔊 朗读本章"}</button>
+            <span class="muted">读当前在视口里的章节</span>
+          </div>
+        </div>
+        <div class="settings-section">
+          <strong>整本离线</strong>
+          <div class="row">
+            <span class="muted">
+              离线：{offlineCount() === null ? "检查中…" : `${offlineCount()} / ${toc().length} 章已缓存`}
+            </span>
+            <button disabled={downloading() || toc().length === 0} onClick={downloadWholeBook}>
+              {downloading() ? `下载中 ${downloadProgress()} / ${toc().length}` : "下载整本离线读"}
+            </button>
+            <Show when={downloading()}>
+              <button onClick={cancelDownload}>取消</button>
+            </Show>
+            <Show when={(offlineCount() ?? 0) > 0 && !downloading()}>
+              <button onClick={clearOffline}>删除离线缓存</button>
+            </Show>
+          </div>
+          <span class="muted">整本离线与全库共享缓存：最多 5000 章、保留 30 天</span>
+        </div>
+        <div class="settings-section">
+          <strong>缺章检查</strong>
+          <div class="row">
+            <button disabled={checkingChapters()} onClick={checkChapters}>检查缺章</button>
+            <Show when={chapterIssues() !== null}>
+              <span class="muted">
+                {chapterIssues()!.length === 0 ? "章节连续，无缺章" : `${chapterIssues()!.length} 个问题`}
+              </span>
+            </Show>
+          </div>
+          <Show when={chapterIssues() !== null && chapterIssues()!.length > 0}>
+            <For each={chapterIssues()!}>
+              {(iss) => (
+                <p class="muted">第 {iss.idx + 1} 章 {iss.title}：{iss.detail}</p>
+              )}
+            </For>
+          </Show>
+        </div>
       </div>
       </Show>
 
@@ -788,61 +917,86 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
-      <Show when={ch()}>
-        <div onClick={toggleChrome}>
-        <h2>{disp(ch()!.title)}</h2>
-        <div
-          ref={contentRef}
-          class="reader-content"
-          classList={{ "page-mode": s().mode === "page" }}
-          data-reader-theme={s().theme}
-          style={{
-            "font-size": `${s().fontSize}px`,
-            "line-height": String(s().lineHeight),
-            "text-indent": `${s().indent}em`,
-          }}
-          onScroll={onScroll}
-          onMouseUp={onSelect}
-        >
-          <For each={ch()!.paragraphs}>
-            {(p) => (
-              <Show when={p.img} fallback={
-                <p>
-                  <For each={renderTextWithHighlights(p.text ?? "", highlights())}>
-                    {(part) => part.anno ? (
-                      <mark class="anno" title={highlights().find((h) => h.text === part.text)?.note ?? ""}>
-                        {/* 批注内也要切搜索词，否则词落在批注里就标不出来、定位不到 */}
-                        <For each={splitOnTerm(part.text, searchTerm())}>
-                          {(sp) => sp.hit ? <mark class="search-hit">{disp(sp.text)}</mark> : <>{disp(sp.text)}</>}
-                        </For>
-                      </mark>
-                    ) : (
-                      <For each={splitOnTerm(part.text, searchTerm())}>
-                        {(sp) => sp.hit ? <mark class="search-hit">{disp(sp.text)}</mark> : <>{disp(sp.text)}</>}
+      {/* 瀑布流正文：已载章节按顺序连续渲染，整页滚动。点正文开合顶栏/底栏。 */}
+      <div
+        ref={contentRef}
+        class="reader-content"
+        data-reader-theme={s().theme}
+        style={{
+          "font-size": `${s().fontSize}px`,
+          "line-height": String(s().lineHeight),
+          "text-indent": `${s().indent}em`,
+        }}
+        onClick={toggleChrome}
+        onMouseUp={onSelect}
+      >
+        <For each={chapters()}>
+          {(ch) => (
+            <section class="reader-chapter" data-chapter-idx={ch.chapter_idx}>
+              <h2>{disp(ch.title)}</h2>
+              <For each={ch.paragraphs}>
+                {(p) => (
+                  <Show when={p.img} fallback={
+                    <p>
+                      <For each={renderTextWithHighlights(p.text ?? "", highlightsByChapter()[ch.chapter_idx] ?? [])}>
+                        {(part) => part.anno ? (
+                          <mark class="anno" title={(highlightsByChapter()[ch.chapter_idx] ?? []).find((h) => h.text === part.text)?.note ?? ""}>
+                            {/* 批注内也要切搜索词，否则词落在批注里就标不出来、定位不到 */}
+                            <For each={splitOnTerm(part.text, searchTerm())}>
+                              {(sp) => sp.hit ? <mark class="search-hit">{disp(sp.text)}</mark> : <>{disp(sp.text)}</>}
+                            </For>
+                          </mark>
+                        ) : (
+                          <For each={splitOnTerm(part.text, searchTerm())}>
+                            {(sp) => sp.hit ? <mark class="search-hit">{disp(sp.text)}</mark> : <>{disp(sp.text)}</>}
+                          </For>
+                        )}
                       </For>
+                    </p>
+                  }>
+                    {/* 图片懒加载 */}
+                    <img src={p.img} alt="" loading="lazy" />
+                  </Show>
+                )}
+              </For>
+              {/* 当前章的批注列表（跟在该章末尾，只在当前章有批注时显示）。 */}
+              <Show when={ch.chapter_idx === idx() && curHighlights().length > 0}>
+                <div class="card">
+                  <strong>本章批注（{curHighlights().length}）</strong>
+                  <For each={curHighlights()}>
+                    {(h, i) => (
+                      <p class="muted">
+                        <mark class="anno">{h.text.slice(0, 40)}</mark> {h.note ?? ""}
+                        <button onClick={() => {
+                          const next = curHighlights().filter((_, j) => j !== i());
+                          setHighlightsByChapter((prev) => ({ ...prev, [idx()]: next }));
+                          saveHighlights(props.bookId, idx(), next);
+                        }}>删</button>
+                      </p>
                     )}
                   </For>
-                </p>
-              }>
-                {/* 图片懒加载 */}
-                <img src={p.img} alt="" loading="lazy" />
+                </div>
               </Show>
-            )}
-          </For>
-        </div>
-        </div>
-        <Show when={highlights().length > 0}>
+            </section>
+          )}
+        </For>
+      </div>
+      <Show when={loadingMore()}>
+        <p class="muted">加载下一章中…</p>
+      </Show>
+
+      {/* 全书读完：只有全部章节都载入后才出现（离线/缺章已收进设置，
+          这里只留完本标记与同作者推荐，免得读到一半误以为书已读完）。 */}
+      <Show when={allLoaded()}>
+        <p class="muted book-end">— 全书完 —</p>
+        <Show when={sameAuthor().length > 0}>
           <div class="card">
-            <strong>本章批注（{highlights().length}）</strong>
-            <For each={highlights()}>
-              {(h, i) => (
-                <p class="muted">
-                  <mark class="anno">{h.text.slice(0, 40)}</mark> {h.note ?? ""}
-                  <button onClick={() => {
-                    const next = highlights().filter((_, j) => j !== i());
-                    setHighlights(next);
-                    saveHighlights(props.bookId, idx(), next);
-                  }}>删</button>
+            <strong>同作者的其他书（{sameAuthor().length}）</strong>
+            <For each={sameAuthor()}>
+              {(b) => (
+                <p>
+                  <a href={`#/read/${encodeURIComponent(b.id)}`}>{b.title}</a>
+                  <span class="muted"> · {b.chapter_count} 章</span>
                 </p>
               )}
             </For>
@@ -850,71 +1004,11 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </Show>
       </Show>
 
-      <Show when={sameAuthor().length > 0}>
-        <div class="card">
-          <strong>同作者的其他书（{sameAuthor().length}）</strong>
-          <For each={sameAuthor()}>
-            {(b) => (
-              <p>
-                <a href={`#/read/${encodeURIComponent(b.id)}`}>{b.title}</a>
-                <span class="muted"> · {b.chapter_count} 章</span>
-              </p>
-            )}
-          </For>
-        </div>
-      </Show>
-
-      <div class="card row">
-        <span class="muted">
-          离线：{offlineCount() === null ? "检查中…" : `${offlineCount()} / ${toc().length} 章已缓存`}
-        </span>
-        <button disabled={downloading() || toc().length === 0} onClick={downloadWholeBook}>
-          {downloading() ? `下载中 ${downloadProgress()} / ${toc().length}` : "下载整本离线读"}
-        </button>
-        <Show when={downloading()}>
-          <button onClick={cancelDownload}>取消</button>
-        </Show>
-        <Show when={(offlineCount() ?? 0) > 0 && !downloading()}>
-          <button onClick={clearOffline}>删除离线缓存</button>
-        </Show>
-        <span class="muted">整本离线与全库共享缓存：最多 5000 章、保留 30 天</span>
-      </div>
-
-      <div class="card row">
-        <button disabled={checkingChapters()} onClick={checkChapters}>检查缺章</button>
-        <Show when={chapterIssues() !== null}>
-          <span class="muted">
-            {chapterIssues()!.length === 0 ? "章节连续，无缺章" : `${chapterIssues()!.length} 个问题`}
-          </span>
-        </Show>
-      </div>
-      <Show when={chapterIssues() !== null && chapterIssues()!.length > 0}>
-        <div class="card">
-          <For each={chapterIssues()!}>
-            {(iss) => (
-              <p>第 {iss.idx + 1} 章 {iss.title}：{iss.detail}</p>
-            )}
-          </For>
-        </div>
-      </Show>
-
       <Show when={showChrome()}>
         <div class="reader-bottombar">
-          <div class="chapter-progress">
-            <button disabled={idx() <= 0 || loading()} onClick={() => loadChapter(idx() - 1)}>‹</button>
-            <input
-              type="range" min="0" max="100" step="0.1"
-              value={scrollFrac() * 100}
-              onInput={(e) => scrollToFrac(Number(e.currentTarget.value) / 100)}
-              aria-label="本章进度"
-            />
-            <span class="muted">{Math.round(scrollFrac() * 100)}%</span>
-            <button disabled={idx() >= toc().length - 1 || loading()} onClick={() => loadChapter(idx() + 1)}>›</button>
-          </div>
           <div class="bar-actions">
             <button onClick={() => setShowToc(!showToc())}>📑 目录</button>
             <button onClick={openSearch}>🔍 搜索</button>
-            <button onClick={speakChapter}>{speaking() ? "⏹ 停止朗读" : "🔊 朗读"}</button>
             <button onClick={() => setShowSettings(!showSettings())}>⚙️ 设置</button>
           </div>
         </div>
@@ -934,7 +1028,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
           // 避免拖动途中反复发请求。
           if (toc().length > 0) {
             const { target, frac } = pctToChapterPos(pct);
-            if (target === idx()) scrollToFrac(frac);
+            if (target === idx() && chapterEl(target)) scrollToFrac(frac);
           }
         }}
         onChange={(e) => { const v = Number(e.currentTarget.value); setBookDrag(null); jumpToBookPct(100 - v); showBookTip(100 - v); }}

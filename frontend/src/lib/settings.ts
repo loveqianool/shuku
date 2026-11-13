@@ -1,6 +1,6 @@
 // 阅读设置：localStorage 持久化（key: shuku.reader.settings）
 // 2026-11-11 改名 legado-server -> shuku：旧键 legado.* 仍读一次并迁移。
-export type ReaderMode = "scroll" | "page";
+// 2026-11-13 阅读器改瀑布流：刪 mode（仿真翻页按章分頁，與瀑布流衝突），只留滾動。
 export type ReaderTheme = "light" | "dark" | "sepia";
 export type ReaderScript = "orig" | "trad" | "simp";
 
@@ -9,7 +9,6 @@ export interface ReaderSettings {
   lineHeight: number;
   indent: number; // em 首行缩进
   theme: ReaderTheme;
-  mode: ReaderMode;
   script: ReaderScript;
 }
 
@@ -21,7 +20,6 @@ export const DEFAULT_SETTINGS: ReaderSettings = {
   lineHeight: 1.9,
   indent: 2,
   theme: "dark",
-  mode: "scroll",
   script: "orig",
 };
 
@@ -29,7 +27,10 @@ export function loadSettings(): ReaderSettings {
   try {
     const raw = localStorage.getItem(KEY) ?? localStorage.getItem(LEGACY_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
-    const s = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<ReaderSettings>) };
+    // 旧存档可能带已删的 mode 字段，剥掉（瀑布流不再分頁）。
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    delete parsed.mode;
+    const s = { ...DEFAULT_SETTINGS, ...(parsed as Partial<ReaderSettings>) };
     if (localStorage.getItem(KEY) === null) {
       try {
         localStorage.setItem(KEY, JSON.stringify(s));

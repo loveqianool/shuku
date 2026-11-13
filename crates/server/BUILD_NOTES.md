@@ -431,3 +431,12 @@ Ye 指令：剩下的待定全部做，做完再做一次全量检查、精简�
 - `list_books_by_ids` IN 子句最多 1000 个占位符，rusqlite 捆绑的 SQLite（≥3.32）上限 32766，无问题。
 - 文档同步：`docs/API.md`（错误码 404/400/500、rebuild-index 的 full、get_book 的 cover_mime）、`docs/ARCHITECTURE.md`（搜索/联想/书库列表走 tantivy）、本 BUILD_NOTES。
 - 测试：`cargo test --release` 115 单元 + 2 端到端全绿（基线 111 + 新增 5：xpath 分组 1、chapter_cache 2、search source 1、search_book_ids 1；删 suggest_books 测试 1）。
+
+## 2026-11-13 阅读器改瀑布流（前端）
+- Reader.tsx 重写为瀑布流无限滚动：章节按顺序连续渲染，整页滚动；滚到底（1200px 内）自动载下一章，滚到顶（400px 内）自动补上一章（前补时按增加高度补回滚动位置，视口不动），一直往下读到全书完。跳章/搜尋/滑杆远跳时重置载入窗口（只留目标章起），免得一次抓幾十章。
+- 仿真翻页模式已删（与瀑布流冲突）：settings.ts 刪 `mode`（ReaderMode 類型、DEFAULT_SETTINGS、舊存檔的 mode 字段在 loadSettings 剝掉）；Reader 删 pageStep/鍵盤翻頁/`page-mode` CSS、底栏本章滑杆与上下章按钮。
+- 进度按 {当前章, 章内像素偏移} 存（与旧 Progress 格式兼容）：当前章由滚动位置定（视口顶部 120px 容差内最后一章）；批注按章存（highlightsByChapter）；朗读读当前视口章；搜尋跳轉圈定到目标章的 <section data-chapter-idx> 内定位。
+- 修复 loadToc 競態：目录改用 bookId 守卫（不用 loadSeq——resetToChapter 也会自增 loadSeq，进到恢复时目录会被误判过期丢掉）。
+- 設置改浮動面板（fixed，底欄上方居中，內容多時內部滾動，帶 ✕ 關閉）：基本排版（字號/行距/縮進/主題/繁簡/語速）+ 朗讀（讀當前視口章）+ 整本離線（狀態/下載/取消/刪除）+ 缺章檢查。離線/缺章/朗讀以前在閱讀器底部或底欄，讀到一半搵唔到，現收進設置隨時用到。底欄只留目錄/搜索/設置三掣。
+- 全书读完标记（— 全書完 —）+ 同作者推荐只在全部章节载入后出现；离线/缺章卡已移出结尾。
+- 测试：`npm run build`（tsc -b + vite）通过；`cargo test --release` 116 单元 + 2 端到端全绿（后端无改动）。

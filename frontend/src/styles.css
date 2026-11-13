@@ -73,9 +73,22 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .reader-content { outline: none; }
 .reader-content p { margin: 0 0 0.6em; line-break: strict; hanging-punctuation: first; text-wrap: pretty; overflow-wrap: break-word; }
 .reader-content img { max-width: 100%; display: block; margin: 8px auto; }
-.reader-content.page-mode { height: calc(100dvh - 220px); overflow: hidden; }
-.reader-settings { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; font-size: 13px; }
-.reader-settings label { display: flex; gap: 4px; align-items: center; }
+/* 瀑布流：每章一个 <section>，章与章之间留空；scroll-margin-top 让
+   scrollIntoView 跳章时标题不被顶部固定栏盖住。 */
+.reader-chapter { scroll-margin-top: 120px; }
+.reader-chapter + .reader-chapter { margin-top: 2em; }
+.reader-chapter h2 { margin: 0.2em 0 0.8em; }
+/* 全书读完标记（只在全部章节载入后出现）。 */
+.book-end { text-align: center; margin: 2.5em 0 1em; }
+/* 设置浮動面板：fixed 浮層（底欄上方居中），唔佔文檔流，內容多時內部滾動。
+   入面分三組：基本排版一行、朗讀、整本離線、缺章檢查。 */
+.reader-settings { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); max-height: 62dvh; overflow: auto; z-index: 30; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; box-sizing: border-box; box-shadow: 0 8px 24px rgba(0,0,0,0.35); display: flex; flex-direction: column; gap: 12px; font-size: 13px; }
+.reader-settings .settings-head { display: flex; justify-content: space-between; align-items: center; }
+.reader-settings .settings-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.reader-settings .settings-row label { display: flex; gap: 4px; align-items: center; }
+.reader-settings .settings-section { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.reader-settings .settings-section .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.reader-settings .settings-section p { margin: 0; }
 .toc { max-height: 40dvh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
 .toc button { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; padding: 8px 12px; }
 .toc button:hover, .toc button.current { background: var(--surface2); color: var(--accent); }
@@ -85,11 +98,10 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .reader-content[data-reader-theme="sepia"] { background: #f4ecd8; color: #433422; }
 .reader-content[data-reader-theme="dark"] { background: #1a1a1a; color: #d8d8d8; }
 .reader-content[data-reader-theme="light"], .reader-content[data-reader-theme="sepia"], .reader-content[data-reader-theme="dark"] { padding: 16px; border-radius: var(--radius); }
-/* 仿另一家阅读器：底部固定栏（全书进度滑杆 + 目录/搜索/朗读/设置），点正文唤出/收起。 */
+/* 仿另一家阅读器：底部固定栏（目录/搜索/朗读/设置），点正文唤出/收起。
+   瀑布流不再分章，底栏的本章滑杆与上下章按钮已删，只留操作按钮。 */
 .reader-bottombar { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: min(720px, 100%); background: var(--bg); border-top: 1px solid var(--border); padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px)); z-index: 20; box-sizing: border-box; }
-.reader-bottombar .chapter-progress { display: flex; gap: 8px; align-items: center; }
-.reader-bottombar .chapter-progress input[type="range"] { flex: 1; min-width: 0; }
-.reader-bottombar .bar-actions { display: flex; gap: 8px; margin-top: 8px; }
+.reader-bottombar .bar-actions { display: flex; gap: 8px; }
 .reader-bottombar .bar-actions button { flex: 1; }
 /* 全书竖向进度滑杆：固定在右侧，上下避开顶栏/底栏浮层（以前 88vh 居中，
    上下两端都压在两栏底下，点不到也拖不动）；28px 宽，触屏好抓。 */
