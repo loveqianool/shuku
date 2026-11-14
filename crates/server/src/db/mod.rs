@@ -313,11 +313,20 @@ impl Database {
                 // backfill. Each batch re-queries — updated rows drop out
                 // of the WHERE clause — so the loop ends when none remain.
                 // Pinyin is computed before the transaction opens.
+                //
+                // Only IS NULL rows are selected, never `title_pinyin = ''`:
+                // a non-Chinese title legitimately has empty pinyin, so
+                // `= ''` re-selects those rows forever — the UPDATE writes
+                // '' back and the loop never ends (bricked startup on the
+                // deployed box: migrate spun at 100% CPU, server never
+                // listened). The column is NOT NULL DEFAULT '', so in
+                // practice this matches nothing — upsert already fills
+                // pinyin — but the guard stays for any NULL that slips in.
                 const BACKFILL_BATCH: i64 = 1000;
                 loop {
                     let rows: Vec<(String, String)> = {
                         let mut stmt = c.prepare(
-                            "SELECT id, title FROM books WHERE title_pinyin = '' OR title_pinyin IS NULL LIMIT ?1",
+                            "SELECT id, title FROM books WHERE title_pinyin IS NULL LIMIT ?1",
                         )?;
                         let rows = stmt
                             .query_map(params![BACKFILL_BATCH], |r| {
@@ -1746,6 +1755,39 @@ mod tests {
         db.cache_put("h1", "https://a/1", "search", "body", 3600).await.unwrap();
         let now = chrono::Utc::now().timestamp();
         assert!(db.cache_get("h1", now).await.unwrap().is_some(), "UNIQUE(url_hash) still indexes lookups");
+    }
+
+    #[tokio::test]
+    async fn migrate_backfill_terminates_on_empty_pinyin() {
+        // Regression (2026-11-14): the batched title_pinyin backfill
+        // selected `title_pinyin = '' OR title_pinyin IS NULL`. A
+        // non-Chinese title legitimately has empty pinyin, so the UPDATE
+        // wrote '' back and the row was re-selected forever — migrate spun
+        // at 100% CPU and the server never started. Only IS NULL rows may
+        // be selected.
+        let db = Database::open_in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mk = |id: &str, title: &str| BookRow {
+            id: id.into(), title: title.into(), author: "".into(), path: None,
+            source_url: None, source: "local".into(),
+            mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 1,
+            created_at: now, updated_at: now, source_id: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
+        };
+        db.upsert_book(&mk("en", "Hello World")).await.unwrap();
+        db.upsert_book(&mk("zh", "武林沉沦")).await.unwrap();
+        // A second migrate must return promptly (old code looped forever).
+        db.migrate().await.unwrap();
+        let py: String = db
+            .call_db(|c| c.query_row("SELECT title_pinyin FROM books WHERE id='en'", [], |r| r.get::<_, String>(0)))
+            .await
+            .unwrap();
+        assert_eq!(py, "");
+        let py: String = db
+            .call_db(|c| c.query_row("SELECT title_pinyin FROM books WHERE id='zh'", [], |r| r.get::<_, String>(0)))
+            .await
+            .unwrap();
+        assert!(py.contains("wulin"), "chinese title keeps its pinyin: {py}");
     }
 
     #[tokio::test]
