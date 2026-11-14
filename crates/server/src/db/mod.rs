@@ -6,10 +6,16 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio_rusqlite::Connection;
+use tracing::warn;
 
 use crate::chapter_check::ChapterIssue;
 
 pub const MIGRATION_SQL: &str = include_str!("../../migrations/001_init.sql");
+
+/// Drop redundant indexes (see 002_drop_redundant_indexes.sql). Runs on
+/// every migrate: 001 used to create them, and deleting the lines from
+/// 001 alone would not remove them from databases that already have them.
+pub const MIGRATION_002_SQL: &str = include_str!("../../migrations/002_drop_redundant_indexes.sql");
 
 /// Full books column list, in row_book order.
 const BOOK_COLS: &str = "id,title,author,path,source_url,source,mtime,size,index_version,status,chapter_count,created_at,updated_at,source_id,has_update,last_update_check,cover_mime";
@@ -78,6 +84,68 @@ pub struct BookRow {
     pub cover_mime: String,
 }
 
+impl BookRow {
+    /// A freshly scanned local book (defaults: source "local", status
+    /// "ok", no source id / update flag / cover).
+    #[allow(clippy::too_many_arguments)]
+    pub fn local(
+        id: String,
+        title: String,
+        author: String,
+        path: String,
+        mtime: i64,
+        size: i64,
+        index_version: i64,
+        chapter_count: i64,
+        now: i64,
+        cover_mime: String,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            author,
+            path: Some(path),
+            source_url: None,
+            source: "local".into(),
+            mtime,
+            size,
+            index_version,
+            status: "ok".into(),
+            chapter_count,
+            created_at: now,
+            updated_at: now,
+            source_id: String::new(),
+            has_update: false,
+            last_update_check: 0,
+            cover_mime,
+        }
+    }
+
+    /// A book whose file failed to parse: kept as a visible "broken" row
+    /// so the next scan can retry it, never indexed (index_version 0).
+    pub fn broken(id: String, title: String, path: String, mtime: i64, size: i64, now: i64) -> Self {
+        Self {
+            id,
+            title,
+            author: String::new(),
+            path: Some(path),
+            source_url: None,
+            source: "local".into(),
+            mtime,
+            size,
+            index_version: 0,
+            status: "broken".into(),
+            chapter_count: 0,
+            created_at: now,
+            updated_at: now,
+            source_id: String::new(),
+            has_update: false,
+            last_update_check: 0,
+            cover_mime: String::new(),
+        }
+    }
+}
+
 /// A book with its last-read position, for the 最近阅读 list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecentBook {
@@ -144,6 +212,8 @@ impl Database {
         self.call_db(move |c| {
                 c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000; PRAGMA temp_store=MEMORY;")?;
                 c.execute_batch(&sql)?;
+                // 002: drop indexes that duplicate UNIQUE constraints.
+                c.execute_batch(MIGRATION_002_SQL)?;
                 // Indexes for hot paths (idempotent; old DBs pick them up).
                 // Task claim: both workers poll every 3s on (status,
                 // next_retry_at, created_at); without these it is a full
@@ -188,20 +258,16 @@ impl Database {
                 // type data). Idempotent: only when the old column exists
                 // and the new one does not; runs before the ALTER loop
                 // below so a fresh DB gets cover_mime directly.
-                let has_cover: bool = c
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name='cover'",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map(|n| n > 0)?;
-                let has_cover_mime: bool = c
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name='cover_mime'",
-                        [],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map(|n| n > 0)?;
+                // One pragma read for both columns (was two COUNT queries).
+                let mut stmt = c.prepare(
+                    "SELECT name FROM pragma_table_info('books') WHERE name IN ('cover', 'cover_mime')",
+                )?;
+                let cols: Vec<String> = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+                let has_cover = cols.iter().any(|n| n == "cover");
+                let has_cover_mime = cols.iter().any(|n| n == "cover_mime");
                 if has_cover && !has_cover_mime {
                     c.execute_batch("ALTER TABLE books RENAME COLUMN cover TO cover_mime")?;
                 }
@@ -240,23 +306,35 @@ impl Database {
                 // every migrate (not only when the column is first added):
                 // a previous backfill that failed mid-way would otherwise
                 // leave the column present with rows permanently missing
-                // pinyin. Wrapped in a transaction so a failure rolls back
-                // cleanly instead of leaving a partial backfill.
-                {
-                    let tx = c.transaction()?;
+                // pinyin. In batches of 1000 rows per transaction: the old
+                // code loaded every missing row into one Vec and computed
+                // pinyin inside a single write transaction, so a big
+                // library upgrade held the write lock for the whole
+                // backfill. Each batch re-queries — updated rows drop out
+                // of the WHERE clause — so the loop ends when none remain.
+                // Pinyin is computed before the transaction opens.
+                const BACKFILL_BATCH: i64 = 1000;
+                loop {
                     let rows: Vec<(String, String)> = {
-                        let mut stmt = tx.prepare(
-                            "SELECT id, title FROM books WHERE title_pinyin = '' OR title_pinyin IS NULL",
+                        let mut stmt = c.prepare(
+                            "SELECT id, title FROM books WHERE title_pinyin = '' OR title_pinyin IS NULL LIMIT ?1",
                         )?;
                         let rows = stmt
-                            .query_map([], |r| {
+                            .query_map(params![BACKFILL_BATCH], |r| {
                                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                             })?
                             .collect::<Result<Vec<_>, _>>()?;
                         rows
                     };
-                    for (id, title) in rows {
-                        let py = crate::search::pinyin_text(&title);
+                    if rows.is_empty() {
+                        break;
+                    }
+                    let filled: Vec<(String, String)> = rows
+                        .into_iter()
+                        .map(|(id, title)| (id, crate::search::pinyin_text(&title)))
+                        .collect();
+                    let tx = c.transaction()?;
+                    for (id, py) in &filled {
                         tx.execute(
                             "UPDATE books SET title_pinyin = ?1 WHERE id = ?2",
                             params![py, id],
@@ -321,55 +399,13 @@ impl Database {
         page: i64,
         page_size: i64,
     ) -> Result<(Vec<BookRow>, i64)> {
-        let order = match sort {
-            "title" => "title COLLATE NOCASE ASC",
-            "author" => "author COLLATE NOCASE ASC",
-            _ => "updated_at DESC",
-        }
-        .to_string();
+        let order = book_list_order(sort);
         let (q, author, tag) = (q.unwrap_or_default(), author.unwrap_or_default(), tag.unwrap_or_default());
         let offset = (page.max(1) - 1) * page_size.max(1);
         let limit = page_size.max(1);
         self.call_db(move |c| {
-                // NOTE: title/author filtering here is metadata filtering, NOT
-                // full-text search (full-text search is tantivy only).
-                let mut where_sql = String::from("1=1");
-                let mut args: Vec<String> = vec![];
-                if !q.is_empty() {
-                    // exact-substring metadata filter on title, plus pinyin:
-                    // the title's pinyin (syllables + concatenated + initials
-                    // prefixes, see search::pinyin_text) lets "wlcl" match
-                    // 武林沉沦. Use `instr` (not LIKE) to stay out of the
-                    // LIKE-search ban; `lower()` makes pinyin matching
-                    // case-insensitive.
-                    where_sql.push_str(" AND (instr(title, ?1) > 0 OR instr(title_pinyin, lower(?1)) > 0)");
-                    args.push(q);
-                }
-                if !author.is_empty() {
-                    where_sql.push_str(&format!(" AND instr(author, ?{}) > 0", args.len() + 1));
-                    args.push(author);
-                }
-                let tag_join = if tag.is_empty() {
-                    String::new()
-                } else {
-                    // Parameterised like q/author: the old code interpolated
-                    // the tag with manual ''-escaping, which was correct
-                    // but is the only user input spliced into SQL in the
-                    // whole codebase — one place to keep in sync.
-                    let n = args.len() + 1;
-                    args.push(tag);
-                    format!(" AND id IN (SELECT book_id FROM tags WHERE tag = ?{n})")
-                };
-                let total_sql = format!("SELECT COUNT(*) FROM books WHERE {where_sql}{tag_join}");
-                let total: i64 = c.query_row(&total_sql, rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
-                let list_sql = format!(
-                    "SELECT {BOOK_COLS} FROM books WHERE {where_sql}{tag_join} ORDER BY {order} LIMIT {limit} OFFSET {offset}"
-                );
-                let mut stmt = c.prepare(&list_sql)?;
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(args.iter()), row_book)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((rows, total))
+                let (where_sql, args) = book_list_filter(&q, &[], &author, &tag);
+                book_list_query(c, &where_sql, &args, &order, limit, offset)
             })
             .await
     }
@@ -387,62 +423,25 @@ impl Database {
         page: i64,
         page_size: i64,
     ) -> Result<(Vec<BookRow>, i64)> {
-        let order = match sort {
-            "title" => "title COLLATE NOCASE ASC",
-            "author" => "author COLLATE NOCASE ASC",
-            _ => "updated_at DESC",
-        }
-        .to_string();
+        let order = book_list_order(sort);
         let (author, tag) = (author.unwrap_or_default(), tag.unwrap_or_default());
         let offset = (page.max(1) - 1) * page_size.max(1);
         let limit = page_size.max(1);
         // Book ids are TEXT in SQLite; bind them as strings.
         let id_strs: Vec<String> = ids.iter().map(|n| n.to_string()).collect();
         self.call_db(move |c| {
-                let mut where_sql = String::from("1=1");
-                let mut args: Vec<String> = vec![];
                 if id_strs.is_empty() {
                     return Ok((vec![], 0));
                 }
-                let placeholders: Vec<String> =
-                    (1..=id_strs.len()).map(|i| format!("?{i}")).collect();
-                where_sql.push_str(&format!(" AND id IN ({})", placeholders.join(",")));
-                args.extend(id_strs);
-                if !author.is_empty() {
-                    where_sql.push_str(&format!(" AND instr(author, ?{}) > 0", args.len() + 1));
-                    args.push(author);
-                }
-                let tag_join = if tag.is_empty() {
-                    String::new()
-                } else {
-                    let n = args.len() + 1;
-                    args.push(tag);
-                    format!(" AND id IN (SELECT book_id FROM tags WHERE tag = ?{n})")
-                };
-                let total_sql = format!("SELECT COUNT(*) FROM books WHERE {where_sql}{tag_join}");
-                let total: i64 = c.query_row(&total_sql, rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
-                let list_sql = format!(
-                    "SELECT {BOOK_COLS} FROM books WHERE {where_sql}{tag_join} ORDER BY {order} LIMIT {limit} OFFSET {offset}"
-                );
-                let mut stmt = c.prepare(&list_sql)?;
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(args.iter()), row_book)?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok((rows, total))
+                let (where_sql, args) = book_list_filter("", &id_strs, &author, &tag);
+                book_list_query(c, &where_sql, &args, &order, limit, offset)
             })
             .await
     }
 
     pub async fn upsert_book(&self, b: &BookRow) -> Result<()> {
         let b = b.clone();
-        self.call_db(move |c| {
-                c.execute(
-                    UPSERT_BOOK_SQL,
-                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover_mime, crate::search::pinyin_text(&b.title)],
-                )?;
-                Ok(())
-            })
-            .await
+        self.call_db(move |c| exec_upsert_book(c, &b)).await
     }
 
     /// Publish a whole scan batch in ONE SQLite transaction: one commit
@@ -459,19 +458,10 @@ impl Database {
         self.call_db(move |c| {
             let tx = c.transaction()?;
             for b in &books {
-                tx.execute(
-                    UPSERT_BOOK_SQL,
-                    params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover_mime, crate::search::pinyin_text(&b.title)],
-                )?;
+                exec_upsert_book(&tx, b)?;
             }
             for (book_id, titles) in &chapters {
-                tx.execute("DELETE FROM chapters WHERE book_id=?1", params![book_id])?;
-                for (i, t) in titles.iter().enumerate() {
-                    tx.execute(
-                        "INSERT INTO chapters(book_id, idx, title, created_at) VALUES(?1,?2,?3,?4)",
-                        params![book_id, i as i64, t, now],
-                    )?;
-                }
+                replace_chapters_tx(&tx, book_id, titles, now)?;
             }
             tx.commit()?;
             Ok(())
@@ -578,13 +568,7 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.call_db(move |c| {
                 let tx = c.transaction()?;
-                tx.execute("DELETE FROM chapters WHERE book_id=?1", params![book_id])?;
-                for (i, t) in titles.iter().enumerate() {
-                    tx.execute(
-                        "INSERT INTO chapters(book_id, idx, title, created_at) VALUES(?1,?2,?3,?4)",
-                        params![book_id, i as i64, t, now],
-                    )?;
-                }
+                replace_chapters_tx(&tx, &book_id, &titles, now)?;
                 tx.commit()?;
                 Ok(())
             })
@@ -628,7 +612,60 @@ impl Database {
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut out = vec![];
                 for raw in rows {
-                    out.push(serde_json::from_str::<serde_json::Value>(&raw).unwrap_or(serde_json::json!({})));
+                    match serde_json::from_str::<serde_json::Value>(&raw) {
+                        Ok(v) => out.push(v),
+                        // A corrupt row must not kill the whole list, but
+                        // it must not silently become an empty source either.
+                        Err(e) => {
+                            warn!("list_sources: bad raw_json, using empty object: {e}");
+                            out.push(serde_json::json!({}));
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .await
+    }
+
+    /// Sources with their health + subscription columns inlined (one
+    /// SELECT): the API list used to issue two extra queries per source
+    /// (`source_health` + `get_source_subscription`), but those five
+    /// columns live on the sources row already. The raw_json values are
+    /// the source definitions; the extra columns are the live state the
+    /// list UI shows.
+    pub async fn list_sources_with_meta(&self) -> Result<Vec<serde_json::Value>> {
+        self.call_db(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT raw_json, health, health_error, last_check_time, subscription_url, subscription_updated_at FROM sources ORDER BY custom_order ASC, name ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, i64>(5)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut out = vec![];
+                for (raw, health, error, checked, sub_url, _sub_updated) in rows {
+                    let mut v: serde_json::Value = match serde_json::from_str(&raw) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("list_sources: bad raw_json, using empty object: {e}");
+                            serde_json::json!({})
+                        }
+                    };
+                    v["health"] = serde_json::json!(health);
+                    v["healthError"] = serde_json::json!(error);
+                    v["lastCheckTime"] = serde_json::json!(checked);
+                    if !sub_url.is_empty() {
+                        v["subscriptionUrl"] = serde_json::json!(sub_url);
+                    }
+                    out.push(v);
                 }
                 Ok(out)
             })
@@ -1005,35 +1042,37 @@ impl Database {
                     "DELETE FROM source_cache WHERE fetched_at + ttl_seconds <= ?1",
                     params![now],
                 )? as i64;
-                let mut overflow = 0i64;
-                loop {
-                    let (rows, bytes): (i64, i64) = c.query_row(
+                let cache_size = |c: &rusqlite::Connection| -> rusqlite::Result<(i64, i64)> {
+                    c.query_row(
                         "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(body AS BLOB))), 0) FROM source_cache",
                         [],
                         |r| Ok((r.get(0)?, r.get(1)?)),
-                    )?;
-                    if rows <= max_rows && bytes <= max_bytes {
-                        break;
-                    }
-                    // Delete only the excess rows. When only the byte
-                    // cap is over, estimate the count from the average
-                    // body size (the loop re-checks and corrects).
-                    let n = if rows > max_rows {
-                        rows - max_rows
-                    } else {
-                        let avg = (bytes / rows).max(1);
-                        ((bytes - max_bytes) / avg).max(1)
-                    };
-                    let deleted = c.execute(
-                        "DELETE FROM source_cache WHERE id IN \
-                         (SELECT id FROM source_cache ORDER BY fetched_at ASC, id ASC LIMIT ?1)",
-                        params![n],
-                    )? as i64;
-                    overflow += deleted;
-                    if deleted == 0 {
-                        break;
-                    }
-                }
+                    )
+                };
+                let overflow = prune_until_below_cap(
+                    c,
+                    |c| {
+                        let (rows, bytes) = cache_size(c)?;
+                        Ok(rows > max_rows || bytes > max_bytes)
+                    },
+                    |c| {
+                        let (rows, bytes) = cache_size(c)?;
+                        // Delete only the excess rows. When only the byte
+                        // cap is over, estimate the count from the average
+                        // body size (the loop re-checks and corrects).
+                        let n = if rows > max_rows {
+                            rows - max_rows
+                        } else {
+                            let avg = (bytes / rows).max(1);
+                            ((bytes - max_bytes) / avg).max(1)
+                        };
+                        Ok(c.execute(
+                            "DELETE FROM source_cache WHERE id IN \
+                             (SELECT id FROM source_cache ORDER BY fetched_at ASC, id ASC LIMIT ?1)",
+                            params![n],
+                        )? as i64)
+                    },
+                )?;
                 Ok((expired, overflow))
             })
             .await
@@ -1058,46 +1097,44 @@ impl Database {
                         params![cutoff],
                     )? as i64;
                 }
-                let mut overflow = 0i64;
-                loop {
-                    let total: i64 = c.query_row(
-                        "SELECT (SELECT COUNT(*) FROM scan_tasks) + (SELECT COUNT(*) FROM crawl_tasks)",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    if total <= max_rows {
-                        break;
-                    }
-                    // Find which table holds the oldest terminal task, and
-                    // delete a batch from it (oldest first). The loop
-                    // re-checks, so the split across tables stays fair.
-                    let oldest: Option<(String, i64)> = c
-                        .query_row(
-                            "SELECT 'scan_tasks', MIN(created_at) FROM scan_tasks WHERE status IN ('done','failed') \
-                             UNION ALL \
-                             SELECT 'crawl_tasks', MIN(created_at) FROM crawl_tasks WHERE status IN ('done','failed') \
-                             ORDER BY 2 ASC LIMIT 1",
+                let overflow = prune_until_below_cap(
+                    c,
+                    |c| {
+                        let total: i64 = c.query_row(
+                            "SELECT (SELECT COUNT(*) FROM scan_tasks) + (SELECT COUNT(*) FROM crawl_tasks)",
                             [],
-                            |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?)),
-                        )
-                        .ok()
-                        .and_then(|(t, m)| m.map(|v| (t, v)));
-                    let Some((table, _)) = oldest else {
-                        break; // No terminal tasks left to prune.
-                    };
-                    let deleted = c.execute(
-                        &format!(
-                            "DELETE FROM {table} WHERE id IN \
-                             (SELECT id FROM {table} WHERE status IN ('done','failed') \
-                              ORDER BY created_at ASC, id ASC LIMIT 500)"
-                        ),
-                        [],
-                    )? as i64;
-                    overflow += deleted;
-                    if deleted == 0 {
-                        break;
-                    }
-                }
+                            |r| r.get(0),
+                        )?;
+                        Ok(total > max_rows)
+                    },
+                    |c| {
+                        // Find which table holds the oldest terminal task, and
+                        // delete a batch from it (oldest first). The loop
+                        // re-checks, so the split across tables stays fair.
+                        let oldest: Option<(String, i64)> = c
+                            .query_row(
+                                "SELECT 'scan_tasks', MIN(created_at) FROM scan_tasks WHERE status IN ('done','failed') \
+                                 UNION ALL \
+                                 SELECT 'crawl_tasks', MIN(created_at) FROM crawl_tasks WHERE status IN ('done','failed') \
+                                 ORDER BY 2 ASC LIMIT 1",
+                                [],
+                                |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?)),
+                            )
+                            .ok()
+                            .and_then(|(t, m)| m.map(|v| (t, v)));
+                        let Some((table, _)) = oldest else {
+                            return Ok(0); // No terminal tasks left to prune.
+                        };
+                        Ok(c.execute(
+                            &format!(
+                                "DELETE FROM {table} WHERE id IN \
+                                 (SELECT id FROM {table} WHERE status IN ('done','failed') \
+                                  ORDER BY created_at ASC, id ASC LIMIT 500)"
+                            ),
+                            [],
+                        )? as i64)
+                    },
+                )?;
                 Ok((expired, overflow))
             })
             .await
@@ -1137,10 +1174,17 @@ impl Database {
                     )
                     .optional()?;
                 if let Some(t) = &row {
-                    c.execute(
+                    // The UPDATE is guarded by the same status set the
+                    // SELECT used; if another worker claimed the row first
+                    // it affects 0 rows — report "nothing claimed" instead
+                    // of returning a row we do not own.
+                    let n = c.execute(
                         &format!("UPDATE {table} SET status='running', updated_at=?1 WHERE id=?2 AND status IN ('pending','failed')"),
                         params![now, t.id],
                     )?;
+                    if n != 1 {
+                        return Ok(None);
+                    }
                 }
                 Ok(row)
             })
@@ -1157,7 +1201,13 @@ impl Database {
                         params![now, id],
                     )?;
                 } else {
-                    let attempts: i64 = c.query_row(&format!("SELECT attempts FROM {table} WHERE id=?1"), params![id], |r| r.get(0)).unwrap_or(0);
+                    // A missing row has no attempts (backoff 60s); a real
+                    // DB error must propagate instead of silently picking
+                    // the same default.
+                    let attempts: i64 = c
+                        .query_row(&format!("SELECT attempts FROM {table} WHERE id=?1"), params![id], |r| r.get(0))
+                        .optional()?
+                        .unwrap_or(0);
                     let backoff = 60 * 2_i64.pow(attempts.min(6) as u32);
                     c.execute(
                         &format!("UPDATE {table} SET status='failed', attempts=attempts+1, next_retry_at=?1, error=?2, updated_at=?3 WHERE id=?4"),
@@ -1309,13 +1359,17 @@ impl Database {
                      ORDER BY rp.updated_at DESC LIMIT ?1"
                 );
                 let mut stmt = c.prepare(&sql)?;
+                // The two appended columns sit right after the BOOK_COLS
+                // columns: derive the offset instead of hard-coding 17/18
+                // (adding a column to BOOK_COLS used to silently shift them).
+                let base = BOOK_COLS.split(',').count();
                 let rows = stmt
                     .query_map(params![limit], |r| {
                         let book = row_book(r)?;
                         Ok(RecentBook {
                             book,
-                            last_read_at: r.get(17)?,
-                            last_chapter_idx: r.get(18)?,
+                            last_read_at: r.get(base)?,
+                            last_chapter_idx: r.get(base + 1)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1481,6 +1535,128 @@ impl Database {
     }
 }
 
+fn book_list_order(sort: &str) -> String {
+    match sort {
+        "title" => "title COLLATE NOCASE ASC",
+        "author" => "author COLLATE NOCASE ASC",
+        _ => "updated_at DESC",
+    }
+    .to_string()
+}
+
+/// Shared WHERE builder for `list_books` / `list_books_by_ids`, in arg
+/// order: id filter, then q, author, tag. `ids` is the tantivy id filter
+/// (empty = no id filter); `q` is the SQLite instr/pinyin filter.
+fn book_list_filter(q: &str, ids: &[String], author: &str, tag: &str) -> (String, Vec<String>) {
+    let mut where_sql = String::from("1=1");
+    let mut args: Vec<String> = vec![];
+    if !ids.is_empty() {
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+        where_sql.push_str(&format!(" AND id IN ({})", placeholders.join(",")));
+        args.extend(ids.iter().cloned());
+    }
+    if !q.is_empty() {
+        // NOTE: title/author filtering here is metadata filtering, NOT
+        // full-text search (full-text search is tantivy only).
+        // Exact-substring metadata filter on title, plus pinyin: the
+        // title's pinyin (syllables + concatenated + initials prefixes,
+        // see search::pinyin_text) lets "wlcl" match 武林沉沦. Use
+        // `instr` (not LIKE) to stay out of the LIKE-search ban;
+        // `lower()` makes pinyin matching case-insensitive.
+        let n = args.len() + 1;
+        where_sql.push_str(&format!(" AND (instr(title, ?{n}) > 0 OR instr(title_pinyin, lower(?{n})) > 0)"));
+        args.push(q.to_string());
+    }
+    if !author.is_empty() {
+        where_sql.push_str(&format!(" AND instr(author, ?{}) > 0", args.len() + 1));
+        args.push(author.to_string());
+    }
+    if !tag.is_empty() {
+        // Parameterised like q/author: the old code interpolated the tag
+        // with manual ''-escaping, which was correct but is the only user
+        // input spliced into SQL in the whole codebase — one place to
+        // keep in sync.
+        let n = args.len() + 1;
+        args.push(tag.to_string());
+        where_sql.push_str(&format!(" AND id IN (SELECT book_id FROM tags WHERE tag = ?{n})"));
+    }
+    (where_sql, args)
+}
+
+/// Shared count + paged list for `list_books` / `list_books_by_ids`.
+fn book_list_query(
+    c: &rusqlite::Connection,
+    where_sql: &str,
+    args: &[String],
+    order: &str,
+    limit: i64,
+    offset: i64,
+) -> rusqlite::Result<(Vec<BookRow>, i64)> {
+    let total_sql = format!("SELECT COUNT(*) FROM books WHERE {where_sql}");
+    let total: i64 = c.query_row(&total_sql, rusqlite::params_from_iter(args.iter()), |r| r.get(0))?;
+    let list_sql = format!(
+        "SELECT {BOOK_COLS} FROM books WHERE {where_sql} ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+    );
+    let mut stmt = c.prepare(&list_sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args.iter()), row_book)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((rows, total))
+}
+
+/// Execute the shared 18-column upsert for one row (used by
+/// `upsert_book` and `upsert_books_batch` so the column list and the
+/// params can never drift apart — the old code repeated the 18 params
+/// verbatim in both places).
+fn exec_upsert_book(c: &rusqlite::Connection, b: &BookRow) -> rusqlite::Result<()> {
+    c.execute(
+        UPSERT_BOOK_SQL,
+        params![b.id, b.title, b.author, b.path, b.source_url, b.source, b.mtime, b.size, b.index_version, b.status, b.chapter_count, b.created_at, b.updated_at, b.source_id, b.has_update, b.last_update_check, b.cover_mime, crate::search::pinyin_text(&b.title)],
+    )?;
+    Ok(())
+}
+
+/// Delete + re-insert one book's chapter titles inside `tx` (shared by
+/// `replace_chapters` and `upsert_books_batch`).
+fn replace_chapters_tx(
+    tx: &rusqlite::Transaction,
+    book_id: &str,
+    titles: &[String],
+    now: i64,
+) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM chapters WHERE book_id=?1", params![book_id])?;
+    for (i, t) in titles.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO chapters(book_id, idx, title, created_at) VALUES(?1,?2,?3,?4)",
+            params![book_id, i as i64, t, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Run `delete_batch` repeatedly until `over_cap` is false (or a batch
+/// deletes nothing). Shared by `prune_source_cache` and `prune_tasks`:
+/// both are "delete the oldest rows in batches until below the cap".
+/// Returns the total rows deleted.
+fn prune_until_below_cap(
+    c: &rusqlite::Connection,
+    over_cap: impl Fn(&rusqlite::Connection) -> rusqlite::Result<bool>,
+    delete_batch: impl Fn(&rusqlite::Connection) -> rusqlite::Result<i64>,
+) -> rusqlite::Result<i64> {
+    let mut deleted = 0i64;
+    loop {
+        if !over_cap(c)? {
+            break;
+        }
+        let n = delete_batch(c)?;
+        deleted += n;
+        if n == 0 {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
 fn row_book(r: &rusqlite::Row) -> rusqlite::Result<BookRow> {
     Ok(BookRow {
         id: r.get(0)?,
@@ -1535,6 +1711,41 @@ mod tests {
         for t in ["books", "chapters", "sources", "source_cache", "scan_tasks", "crawl_tasks", "bookmarks", "reading_progress", "tags"] {
             assert!(tables.iter().any(|x| x == t), "missing table {t}");
         }
+    }
+
+    #[tokio::test]
+    async fn migrate_drops_redundant_indexes() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Simulate an old database: recreate the two indexes that
+        // duplicate UNIQUE constraints, run the 002 drop, check they
+        // are gone while the UNIQUEs still work.
+        db.call_db(|c| {
+            c.execute_batch("CREATE INDEX idx_cache_hash ON source_cache(url_hash)")?;
+            c.execute_batch("CREATE INDEX idx_chapters_book ON chapters(book_id, idx)")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.call_db(|c| {
+            c.execute_batch(MIGRATION_002_SQL)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let names: Vec<String> = db
+            .call_db(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_cache_hash','idx_chapters_book')",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        assert!(names.is_empty(), "redundant indexes must be gone: {names:?}");
+        db.cache_put("h1", "https://a/1", "search", "body", 3600).await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(db.cache_get("h1", now).await.unwrap().is_some(), "UNIQUE(url_hash) still indexes lookups");
     }
 
     #[tokio::test]

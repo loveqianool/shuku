@@ -24,7 +24,9 @@ export default defineConfig({
       },
       workbox: {
         // 仅预缓存构建产物（静态资源）；绝不预缓存书库/搜索结果。
-        // 繁简词典（cn2t/t2cn）不预缓存，只在用户第一次切换繁简时按需加载。
+        // 繁简词典（cn2t/t2cn）不预缓存（cn2t 约 1MB），只在用户第一次
+        // 切换繁简时按需加载；下面的 CacheFirst runtimeCaching 让首次
+        // 切换后离线也能用（方案 A，不改 precache）。
         globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
         globIgnores: ["**/cn2t-*.js", "**/t2cn-*.js"],
         navigateFallback: "/index.html",
@@ -66,6 +68,18 @@ export default defineConfig({
             options: {
               cacheName: "recent-book-meta",
               expiration: { maxEntries: 30, maxAgeSeconds: 24 * 3600 },
+              cacheableResponse: { statuses: [200] },
+            },
+          },
+          {
+            // 繁简词典 chunk（opencc-js/cn2t、t2cn）：不预缓存（globIgnores
+            // 仍排除），首次切换下载后 CacheFirst 进缓存，离线时繁简切换
+            // 不再静默回落原文。
+            urlPattern: ({ url }) => /\/assets\/(cn2t|t2cn)-.+\.js$/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "opencc-dicts",
+              expiration: { maxEntries: 4, maxAgeSeconds: 30 * 24 * 3600 },
               cacheableResponse: { statuses: [200] },
             },
           },

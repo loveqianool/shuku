@@ -10,7 +10,7 @@
 # BuildKit's predefined per-platform value (it resolves to empty).
 FROM alpine:3.21
 ARG TARGETARCH
-RUN mkdir -p /tmp /data /books
+RUN mkdir -p /data /books
 COPY --chmod=755 bin-${TARGETARCH}/shuku /shuku
 EXPOSE 8080
 ENV SHUKU_HOME=/ \

@@ -6,7 +6,7 @@ import { json } from "@codemirror/lang-json";
 interface Props {
   value: string;
   onChange: (v: string) => void;
-  /** 切换编辑对象时传不同 key（父组件用 key 属性重挂载即可） */
+  /** 外部改值（父组件换编辑对象）走下面的 effect 同步进 doc，无需 key 重挂载 */
 }
 
 /** CodeMirror 6 JSON 编辑器：用于书源 JSON 编辑。 */

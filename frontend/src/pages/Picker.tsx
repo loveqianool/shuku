@@ -166,7 +166,7 @@ const JsonNode: Component<{
           </button>
         </Show>
         <span class="json-key">{props.label}</span>
-        <span class="muted">{isObj ? summary : summary}</span>
+        <span class="muted">{summary}</span>
       </div>
       <Show when={isObj && open()}>
         <For each={entries}>

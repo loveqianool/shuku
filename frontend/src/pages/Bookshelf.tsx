@@ -144,26 +144,25 @@ const Bookshelf: Component = () => {
             {(x) => {
               const item = x.item;
               const book = x.book;
-              const b = () => book;
               return (
                 <div
                   class="vlist-item"
                   style={{ position: "absolute", top: "0", left: "0", width: "100%", transform: `translateY(${item.start}px)`, height: `${item.size}px`, display: "flex", gap: "8px", "align-items": "center" }}
-                  onClick={() => (location.hash = `#/read/${encodeURIComponent(b().id)}`)}
+                  onClick={() => (location.hash = `#/read/${encodeURIComponent(book.id)}`)}
                 >
-                  <Show when={b().cover_mime}>
-                    <img src={`/api/books/${encodeURIComponent(b().id)}/cover`} alt="" style={{ height: "56px", width: "40px", "object-fit": "cover", "flex-shrink": "0" }} />
+                  <Show when={book.cover_mime}>
+                    <img src={`/api/books/${encodeURIComponent(book.id)}/cover`} alt="" style={{ height: "56px", width: "40px", "object-fit": "cover", "flex-shrink": "0" }} />
                   </Show>
                   <div style={{ "min-width": "0" }}>
-                  <strong>{b().title}</strong>
-                  <span class="muted"> {b().author ?? ""}</span>
-                  <Show when={b().has_update}>
+                  <strong>{book.title}</strong>
+                  <span class="muted"> {book.author ?? ""}</span>
+                  <Show when={book.has_update}>
                     <span class="badge" style={{ "background": "#b45309", "color": "#fff" }}> 有更新</span>
                   </Show>
                   <div>
-                    <span class="badge">{b().source ?? "local"}</span>
-                    <Show when={b().chapter_count != null}><span class="badge"> {b().chapter_count} 章</span></Show>
-                    <For each={b().tags ?? []}>{(t) => <span class="badge"> {t}</span>}</For>
+                    <span class="badge">{book.source ?? "local"}</span>
+                    <Show when={book.chapter_count != null}><span class="badge"> {book.chapter_count} 章</span></Show>
+                    <For each={book.tags ?? []}>{(t) => <span class="badge"> {t}</span>}</For>
                   </div>
                   </div>
                 </div>

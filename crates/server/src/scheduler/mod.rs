@@ -5,7 +5,7 @@
 use crate::db::Database;
 use crate::search::{SearchIndex, INDEX_VERSION};
 use crate::source::{Engine, SourceDef};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,13 +27,19 @@ impl TokenBucket {
         Self { rate_per_sec, capacity, state: Mutex::new((capacity, Instant::now())) }
     }
 
-    /// Non-blocking attempt; returns true if a token was taken.
-    pub fn try_acquire(&self) -> bool {
-        let mut s = self.state.lock().unwrap();
+    /// Refill from the elapsed time; shared by `try_acquire` and
+    /// `available` (the two used to spell out the same four lines).
+    fn refill(&self, s: &mut (f64, Instant)) {
         let now = Instant::now();
         let elapsed = now.duration_since(s.1).as_secs_f64();
         s.0 = (s.0 + elapsed * self.rate_per_sec).min(self.capacity);
         s.1 = now;
+    }
+
+    /// Non-blocking attempt; returns true if a token was taken.
+    pub fn try_acquire(&self) -> bool {
+        let mut s = crate::lock_or_poisoned(&self.state);
+        self.refill(&mut s);
         if s.0 >= 1.0 {
             s.0 -= 1.0;
             true
@@ -43,11 +49,8 @@ impl TokenBucket {
     }
 
     pub fn available(&self) -> f64 {
-        let mut s = self.state.lock().unwrap();
-        let now = Instant::now();
-        let elapsed = now.duration_since(s.1).as_secs_f64();
-        s.0 = (s.0 + elapsed * self.rate_per_sec).min(self.capacity);
-        s.1 = now;
+        let mut s = crate::lock_or_poisoned(&self.state);
+        self.refill(&mut s);
         s.0
     }
 
@@ -73,7 +76,7 @@ impl RateLimiter {
     }
 
     pub fn bucket_for(&self, domain: &str) -> Arc<TokenBucket> {
-        let mut map = self.buckets.lock().unwrap();
+        let mut map = crate::lock_or_poisoned(&self.buckets);
         map.entry(domain.to_string())
             .or_insert_with(|| Arc::new(TokenBucket::new(self.rate, self.capacity)))
             .clone()
@@ -85,9 +88,7 @@ impl RateLimiter {
     }
 
     pub fn snapshot(&self) -> Vec<(String, f64)> {
-        self.buckets
-            .lock()
-            .unwrap()
+        crate::lock_or_poisoned(&self.buckets)
             .iter()
             .map(|(d, b)| (d.clone(), b.available()))
             .collect()
@@ -104,15 +105,22 @@ pub struct CircuitBreaker {
     cooldown: Duration,
 }
 
+/// Open when failures reached the threshold inside the cooldown window.
+/// Shared by `CircuitBreaker::check` and `snapshot` (the two used to
+/// spell out the same condition).
+fn breaker_open(n: u32, since: Instant, threshold: u32, cooldown: Duration) -> bool {
+    n >= threshold && since.elapsed() < cooldown
+}
+
 impl CircuitBreaker {
     pub fn new(threshold: u32, cooldown: Duration) -> Self {
         Self { failures: Mutex::new(HashMap::new()), threshold, cooldown }
     }
 
     pub fn check(&self, domain: &str) -> Result<()> {
-        let map = self.failures.lock().unwrap();
+        let map = crate::lock_or_poisoned(&self.failures);
         if let Some((n, since)) = map.get(domain) {
-            if *n >= self.threshold && since.elapsed() < self.cooldown {
+            if breaker_open(*n, *since, self.threshold, self.cooldown) {
                 return Err(anyhow!(
                     "circuit open for {domain}: {} failures, cooling down for {}s",
                     n,
@@ -124,11 +132,11 @@ impl CircuitBreaker {
     }
 
     pub fn record_success(&self, domain: &str) {
-        self.failures.lock().unwrap().remove(domain);
+        crate::lock_or_poisoned(&self.failures).remove(domain);
     }
 
     pub fn record_failure(&self, domain: &str) {
-        let mut map = self.failures.lock().unwrap();
+        let mut map = crate::lock_or_poisoned(&self.failures);
         let e = map.entry(domain.to_string()).or_insert((0, Instant::now()));
         e.0 += 1;
         if e.0 >= self.threshold {
@@ -143,11 +151,9 @@ impl CircuitBreaker {
     }
 
     pub fn snapshot(&self) -> Vec<(String, u32, bool)> {
-        self.failures
-            .lock()
-            .unwrap()
+        crate::lock_or_poisoned(&self.failures)
             .iter()
-            .map(|(d, (n, since))| (d.clone(), *n, *n >= self.threshold && since.elapsed() < self.cooldown))
+            .map(|(d, (n, since))| (d.clone(), *n, breaker_open(*n, *since, self.threshold, self.cooldown)))
             .collect()
     }
 }
@@ -163,11 +169,13 @@ pub struct Scheduler {
     pub crawl_paused: AtomicBool,
     pub books_dir: std::path::PathBuf,
     pub data_dir: std::path::PathBuf,
+    /// Parallel scan width, from Config (`SHUKU_SCAN_WORKERS`).
+    pub scan_workers: usize,
 }
 
 impl Scheduler {
-    pub fn new(db: Database, search: Arc<SearchIndex>, engine: Arc<Engine>, books_dir: std::path::PathBuf, data_dir: std::path::PathBuf) -> Self {
-        Self { db, search, engine, crawl_paused: AtomicBool::new(false), books_dir, data_dir }
+    pub fn new(db: Database, search: Arc<SearchIndex>, engine: Arc<Engine>, books_dir: std::path::PathBuf, data_dir: std::path::PathBuf, scan_workers: usize) -> Self {
+        Self { db, search, engine, crawl_paused: AtomicBool::new(false), books_dir, data_dir, scan_workers }
     }
 
     pub fn pause_crawl(&self, paused: bool) {
@@ -180,30 +188,48 @@ impl Scheduler {
     }
 }
 
-pub async fn run_scan_worker(sched: Arc<Scheduler>) {
+/// Shared poll loop for the two task queues: sleep 3s → claim → log →
+/// process → finish(ok/err). The crawl worker additionally stops when
+/// `crawl_paused` is set; the scan worker never pauses. `label` is
+/// "scan" / "crawl" (in the messages: tracing targets must be literals,
+/// so the label cannot be the target).
+async fn run_task_worker(
+    sched: Arc<Scheduler>,
+    table: &'static str,
+    label: &'static str,
+    check_paused: bool,
+    process: impl for<'a> Fn(&'a Arc<Scheduler>, &'a crate::db::TaskRow) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>>,
+) {
     loop {
         tokio::time::sleep(Duration::from_secs(3)).await;
-        let task = match sched.db.claim_task("scan_tasks").await {
+        if check_paused && sched.crawl_paused() {
+            continue;
+        }
+        let task = match sched.db.claim_task(table).await {
             Ok(t) => t,
             Err(e) => {
-                error!(target: "scan", "claim scan task: {e}");
+                error!("claim {label} task: {e}");
                 continue;
             }
         };
         let Some(task) = task else { continue };
-        info!(target: "scan", task_id = %task.id, r#type = %task.r#type, "processing scan task");
-        let res = process_scan_task(&sched, &task).await;
+        info!(task_id = %task.id, r#type = %task.r#type, "processing {label} task");
+        let res = process(&sched, &task).await;
         match res {
             Ok(msg) => {
-                info!(target: "scan", task_id = %task.id, "{msg}");
-                let _ = sched.db.finish_task("scan_tasks", &task.id, true, "").await;
+                info!(task_id = %task.id, "{msg}");
+                let _ = sched.db.finish_task(table, &task.id, true, "").await;
             }
             Err(e) => {
-                error!(target: "scan", task_id = %task.id, "scan task failed: {e}");
-                let _ = sched.db.finish_task("scan_tasks", &task.id, false, &e.to_string()).await;
+                error!(task_id = %task.id, "{label} task failed: {e}");
+                let _ = sched.db.finish_task(table, &task.id, false, &e.to_string()).await;
             }
         }
     }
+}
+
+pub async fn run_scan_worker(sched: Arc<Scheduler>) {
+    run_task_worker(sched, "scan_tasks", "scan", false, |s, t| Box::pin(process_scan_task(s, t))).await
 }
 
 /// Full-library chapter check (scan task `chapter_check`): title-number
@@ -219,25 +245,15 @@ async fn check_all_chapters(sched: &Arc<Scheduler>) -> Result<String> {
         let titles = sched.db.list_chapter_titles(&id).await?;
         let mut issues = crate::chapter_check::detect_gaps(&titles);
         if source == "cached" {
-            for (idx, title) in &titles {
-                let f = sched
-                    .data_dir
-                    .join("chapters")
-                    .join(&id)
-                    .join(format!("{idx}.txt"));
-                let empty = match std::fs::metadata(&f) {
+            let data_dir = sched.data_dir.clone();
+            let book_id = id.clone();
+            issues.extend(crate::chapter_check::empty_file_issues(&titles, |idx| {
+                let f = data_dir.join("chapters").join(&book_id).join(format!("{idx}.txt"));
+                match std::fs::metadata(&f) {
                     Ok(m) => m.len() == 0,
                     Err(_) => true, // missing file = missing chapter
-                };
-                if empty {
-                    issues.push(crate::chapter_check::ChapterIssue {
-                        idx: *idx,
-                        title: title.clone(),
-                        kind: "empty".into(),
-                        detail: "章节文件为空或缺失（抓取失败）".into(),
-                    });
                 }
-            }
+            }));
         }
         sched.db.replace_chapter_issues(&id, &issues).await?;
         checked += 1;
@@ -256,12 +272,14 @@ async fn process_scan_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) ->
         return check_all_chapters(sched).await;
     }
     if task.r#type == "rebuild_index" {
-        let payload: serde_json::Value = serde_json::from_str(&task.payload).unwrap_or(serde_json::json!({}));
+        // A corrupt payload must fail the task loudly, not run with
+        // default parameters (the old unwrap_or({}) did the latter).
+        let payload: serde_json::Value = serde_json::from_str(&task.payload)?;
         let pause = payload.get("pause_crawl").and_then(|v| v.as_bool()).unwrap_or(true);
         let full = payload.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
         return rebuild_index(sched, pause, full).await;
     }
-    let payload: serde_json::Value = serde_json::from_str(&task.payload).unwrap_or(serde_json::json!({}));
+    let payload: serde_json::Value = serde_json::from_str(&task.payload)?;
     let path = payload.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
     let dir = match &path {
         Some(p) => std::path::PathBuf::from(p),
@@ -271,37 +289,27 @@ async fn process_scan_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) ->
     // A single file (watcher) or subdirectory scan must not: it only walks
     // part of the library, so every other book would look "vanished".
     let full_scan = path.is_none() || dir == sched.books_dir;
-    let report = crate::scanner::scan_once(&sched.db, &sched.search, &dir, &sched.data_dir, full_scan).await?;
+    let report = crate::scanner::scan_once(&sched.db, &sched.search, &dir, &sched.data_dir, sched.scan_workers, full_scan).await?;
     Ok(format!("scan done: {} new/updated, {} broken, {} unchanged", report.indexed, report.broken, report.unchanged))
 }
 
 pub async fn run_crawl_worker(sched: Arc<Scheduler>) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        if sched.crawl_paused() {
-            continue;
-        }
-        let task = match sched.db.claim_task("crawl_tasks").await {
-            Ok(t) => t,
-            Err(e) => {
-                error!(target: "crawl", "claim crawl task: {e}");
-                continue;
-            }
-        };
-        let Some(task) = task else { continue };
-        info!(target: "crawl", task_id = %task.id, r#type = %task.r#type, "processing crawl task");
-        let res = process_crawl_task(&sched, &task).await;
-        match res {
-            Ok(msg) => {
-                info!(target: "crawl", task_id = %task.id, "{msg}");
-                let _ = sched.db.finish_task("crawl_tasks", &task.id, true, "").await;
-            }
-            Err(e) => {
-                error!(target: "crawl", task_id = %task.id, "crawl task failed: {e}");
-                let _ = sched.db.finish_task("crawl_tasks", &task.id, false, &e.to_string()).await;
-            }
-        }
+    run_task_worker(sched, "crawl_tasks", "crawl", true, |s, t| Box::pin(process_crawl_task(s, t))).await
+}
+
+/// Fetch + parse one TOC: run_toc, fail loudly on fetch failure, parse
+/// the extracted chapters. Shared by the crawl, change-source and
+/// update-check paths, which spelled it out thrice. (Deliberately no
+/// empty-TOC error here: update checks treat an empty/shrunk TOC as
+/// "no update", while crawl and change-source reject it at their own
+/// call sites.)
+async fn fetch_toc_chapters(engine: &Engine, source: &SourceDef, url: &str) -> Result<Vec<crate::source::ChapterHit>> {
+    let toc = engine.run_toc(source, url, false).await;
+    if !toc.ok {
+        return Err(anyhow!("toc fetch failed: {}", toc.error.unwrap_or_default()));
     }
+    let chapters: Vec<crate::source::ChapterHit> = serde_json::from_value(toc.extracted)?;
+    Ok(chapters)
 }
 
 async fn process_crawl_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) -> Result<String> {
@@ -348,11 +356,7 @@ async fn process_crawl_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) -
         .ok_or_else(|| anyhow!("source not found: {source_id}"))?;
     let raw_json: serde_json::Value = serde_json::from_str(&raw)?;
     let source = SourceDef::from_raw(&raw_json);
-    let toc = sched.engine.run_toc(&source, book_url, false).await;
-    if !toc.ok {
-        return Err(anyhow!("toc fetch failed: {}", toc.error.unwrap_or_default()));
-    }
-    let chapters: Vec<crate::source::ChapterHit> = serde_json::from_value(toc.extracted)?;
+    let chapters = fetch_toc_chapters(&sched.engine, &source, book_url).await?;
     if chapters.is_empty() {
         return Err(anyhow!("toc extracted 0 chapters"));
     }
@@ -365,7 +369,7 @@ async fn process_crawl_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) -
     let titles: Vec<String> = chapters.iter().map(|c| c.name.clone()).collect();
     let now = chrono::Utc::now().timestamp();
     // Index first, then publish the DB row (same reason as the scanner).
-    let book_id_num: u64 = book_id.parse().unwrap_or(0);
+    let book_id_num: u64 = book_id.parse().context("cached book id is not numeric")?;
     let search = sched.search.clone();
     let idx_title = if book_title.is_empty() { book_url.to_string() } else { book_title.clone() };
     let author_for_index = author.clone();
@@ -398,23 +402,56 @@ async fn process_crawl_task(sched: &Arc<Scheduler>, task: &crate::db::TaskRow) -
     Ok(format!("crawled {} chapters ({} indexed)", chapters.len(), n))
 }
 
+/// Shared "list → one task per item → count + log" shape of the three
+/// periodic enqueuers. `after` runs after each enqueue (update checks
+/// mark the book checked so the next round skips it; the others pass a
+/// no-op).
+async fn enqueue_all<T, F, Fut>(
+    db: &Database,
+    table: &str,
+    task_type: &str,
+    items: Vec<T>,
+    payload: impl Fn(&T) -> String,
+    after: F,
+    log_msg: &str,
+) -> Result<usize>
+where
+    F: Fn(&T) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send,
+{
+    let mut n = 0;
+    for item in &items {
+        db.enqueue_task(table, task_type, &payload(item)).await?;
+        after(item).await?;
+        n += 1;
+    }
+    if n > 0 {
+        info!(target: "crawl", enqueued = n, "{log_msg}");
+    }
+    Ok(n)
+}
+
 /// Enqueue one `check_update` crawl task per due cached book (at most
 /// `limit`), marking each checked so the next round does not re-enqueue it
 /// until a full interval has passed. Returns the number enqueued.
 pub async fn enqueue_due_updates(sched: &Arc<Scheduler>, interval_secs: i64, limit: i64) -> Result<usize> {
     let now = chrono::Utc::now().timestamp();
     let due = sched.db.due_update_books(now - interval_secs, limit).await?;
-    let mut n = 0;
-    for book in due {
-        let payload = serde_json::json!({"book_id": book.id}).to_string();
-        sched.db.enqueue_task("crawl_tasks", "check_update", &payload).await?;
-        sched.db.mark_update_checked(&book.id).await?;
-        n += 1;
-    }
-    if n > 0 {
-        info!(target: "crawl", enqueued = n, "update checks queued");
-    }
-    Ok(n)
+    let db = sched.db.clone();
+    enqueue_all(
+        &sched.db,
+        "crawl_tasks",
+        "check_update",
+        due,
+        |book| serde_json::json!({"book_id": book.id}).to_string(),
+        move |book: &crate::db::BookRow| {
+            let db = db.clone();
+            let id = book.id.clone();
+            async move { db.mark_update_checked(&id).await }
+        },
+        "update checks queued",
+    )
+    .await
 }
 
 /// Periodic worker: every `interval_secs`, queue update checks for cached
@@ -473,24 +510,23 @@ async fn fetch_chapter_texts(
     let mut out: Vec<(String, String)> = Vec::with_capacity(chapters.len());
     let chapters_dir = sched.data_dir.join("chapters");
     let dir = chapters_dir.join(book_id);
-    // Recover from an interrupted swap: live dir missing but a backup from
-    // the crashed swap exists — restore it instead of losing the chapters.
-    if !dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&chapters_dir) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with(&format!("{book_id}.old-")) {
-                    let _ = std::fs::rename(e.path(), &dir);
-                    break;
-                }
-            }
-        }
-    }
-    // Drop temp/backup dirs left behind by an interrupted earlier run.
+    let old_prefix = format!("{book_id}.old-");
+    let tmp_prefix = format!("{book_id}.tmp-");
+    // One read_dir pass: restore a backup left by an interrupted swap
+    // (live dir missing) and drop temp/backup leftovers. (Was two passes
+    // over the same directory, rebuilding the prefix strings per entry.)
+    let mut restored = false;
     if let Ok(entries) = std::fs::read_dir(&chapters_dir) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&format!("{book_id}.tmp-")) || name.starts_with(&format!("{book_id}.old-")) {
+            if name.starts_with(&old_prefix) {
+                if !dir.exists() && !restored {
+                    let _ = std::fs::rename(e.path(), &dir);
+                    restored = true;
+                } else {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            } else if name.starts_with(&tmp_prefix) {
                 let _ = std::fs::remove_dir_all(e.path());
             }
         }
@@ -538,7 +574,15 @@ async fn fetch_chapter_texts(
         let res = results[i].take().expect("all chapter results collected");
         let text = match res.ok {
             true => {
-                let paras: Vec<crate::source::Paragraph> = serde_json::from_value(res.extracted).unwrap_or_default();
+                // Extraction succeeded but the shape is wrong: warn and
+                // store an empty chapter instead of silently doing so.
+                let paras: Vec<crate::source::Paragraph> = match serde_json::from_value(res.extracted) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(target: "crawl", chapter = i, "chapter extraction shape unexpected, storing empty chapter: {e}");
+                        Vec::new()
+                    }
+                };
                 paras.iter().filter_map(|p| p.text.clone()).collect::<Vec<_>>().join("\n")
             }
             false => {
@@ -603,11 +647,7 @@ pub(crate) async fn process_change_source(
             hit.book_url
         }
     };
-    let toc = sched.engine.run_toc(&source, &book_url, false).await;
-    if !toc.ok {
-        return Err(anyhow!("toc fetch failed: {}", toc.error.unwrap_or_default()));
-    }
-    let chapters: Vec<crate::source::ChapterHit> = serde_json::from_value(toc.extracted)?;
+    let chapters = fetch_toc_chapters(&sched.engine, &source, &book_url).await?;
     if chapters.is_empty() {
         return Err(anyhow!("toc extracted 0 chapters"));
     }
@@ -616,7 +656,7 @@ pub(crate) async fn process_change_source(
     // the live directory already holds exactly the new chapters (no stale
     // files from a longer old TOC to clean up).
     let titles: Vec<String> = chapters.iter().map(|c| c.name.clone()).collect();
-    let id_num: u64 = book_id.parse().unwrap_or(0);
+    let id_num: u64 = book_id.parse().context("book id is not numeric")?;
     let search = sched.search.clone();
     let (t, a) = (book.title.clone(), book.author.clone());
     tokio::task::spawn_blocking(move || search.index_book(id_num, &t, &a, "cached", &indexed))
@@ -638,19 +678,16 @@ pub(crate) async fn process_change_source(
 /// runs them one at a time (rate-limited per domain by the engine).
 pub async fn enqueue_health_checks(sched: &Arc<Scheduler>) -> Result<usize> {
     let sources = sched.db.list_sources_full().await?;
-    let mut n = 0;
-    for (id, _, enabled) in sources {
-        if !enabled {
-            continue;
-        }
-        let payload = serde_json::json!({"source_id": id}).to_string();
-        sched.db.enqueue_task("crawl_tasks", "health_check", &payload).await?;
-        n += 1;
-    }
-    if n > 0 {
-        info!(target: "crawl", enqueued = n, "health checks queued");
-    }
-    Ok(n)
+    enqueue_all(
+        &sched.db,
+        "crawl_tasks",
+        "health_check",
+        sources.into_iter().filter(|(_, _, enabled)| *enabled).collect(),
+        |(id, _, _)| serde_json::json!({"source_id": id}).to_string(),
+        |_| async { Ok(()) },
+        "health checks queued",
+    )
+    .await
 }
 
 /// Periodic worker: every `interval_secs`, queue a health probe for every
@@ -693,6 +730,9 @@ pub async fn run_cache_worker(
 ) {
     tokio::time::sleep(Duration::from_secs(60)).await;
     loop {
+        // In-memory cache entries expire here too (the DB prune below
+        // only covers source_cache rows).
+        sched.engine.cache.prune_expired();
         match sched.db.prune_source_cache(max_rows, max_bytes).await {
             Ok((expired, overflow)) => {
                 if expired > 0 || overflow > 0 {
@@ -716,16 +756,16 @@ pub async fn run_cache_worker(
 /// Enqueue one `refresh_subscription` task per distinct subscription URL.
 pub async fn enqueue_subscription_refreshes(sched: &Arc<Scheduler>) -> Result<usize> {
     let urls = sched.db.list_subscriptions().await?;
-    let mut n = 0;
-    for url in urls {
-        let payload = serde_json::json!({"url": url}).to_string();
-        sched.db.enqueue_task("crawl_tasks", "refresh_subscription", &payload).await?;
-        n += 1;
-    }
-    if n > 0 {
-        info!(target: "crawl", enqueued = n, "subscription refreshes queued");
-    }
-    Ok(n)
+    enqueue_all(
+        &sched.db,
+        "crawl_tasks",
+        "refresh_subscription",
+        urls,
+        |url| serde_json::json!({"url": url}).to_string(),
+        |_| async { Ok(()) },
+        "subscription refreshes queued",
+    )
+    .await
 }
 
 /// Fetch a rule subscription URL (JSON array of sources, or a single source
@@ -781,7 +821,7 @@ pub(crate) async fn process_health_check(sched: &Arc<Scheduler>, source_id: &str
         if !res.ok {
             (false, res.error.unwrap_or_default())
         } else {
-            let hits: Vec<crate::source::BookHit> = serde_json::from_value(res.extracted).unwrap_or_default();
+            let hits: Vec<crate::source::BookHit> = serde_json::from_value(res.extracted)?;
             if hits.is_empty() {
                 (false, format!("search for {keyword:?} returned no results"))
             } else {
@@ -793,7 +833,7 @@ pub(crate) async fn process_health_check(sched: &Arc<Scheduler>, source_id: &str
         if !res.ok {
             (false, res.error.unwrap_or_default())
         } else {
-            let hits: Vec<crate::source::BookHit> = serde_json::from_value(res.extracted).unwrap_or_default();
+            let hits: Vec<crate::source::BookHit> = serde_json::from_value(res.extracted)?;
             if hits.is_empty() {
                 (false, "explore returned no results".into())
             } else {
@@ -840,11 +880,7 @@ pub(crate) async fn process_check_update(sched: &Arc<Scheduler>, book_id: &str) 
         Err(_) => return Ok("skip: source raw_json is corrupt".into()),
     };
     let source = SourceDef::from_raw(&raw_json);
-    let toc = sched.engine.run_toc(&source, &book_url, false).await;
-    if !toc.ok {
-        return Err(anyhow!("toc fetch failed: {}", toc.error.unwrap_or_default()));
-    }
-    let chapters: Vec<crate::source::ChapterHit> = serde_json::from_value(toc.extracted)?;
+    let chapters = fetch_toc_chapters(&sched.engine, &source, &book_url).await?;
     let existing = book.chapter_count as usize;
     if chapters.len() <= existing {
         return Ok(format!("no update (toc {} <= stored {existing})", chapters.len()));
@@ -855,43 +891,48 @@ pub(crate) async fn process_check_update(sched: &Arc<Scheduler>, book_id: &str) 
     // of silently skipping it forever. Previously a failed chapter got an
     // empty file, was counted, and was never retried — the user saw a
     // chapter title with no content.
+    let dir = sched.data_dir.join("chapters").join(&book.id);
+    std::fs::create_dir_all(&dir)?;
     let mut fetched = 0usize;
+    let mut new_tuples: Vec<(usize, String, String)> = Vec::new();
     for (i, ch) in chapters.iter().enumerate().skip(existing) {
         if sched.crawl_paused() {
             return Err(anyhow!("crawl paused mid-check after {} new chapters", i - existing));
         }
-        let dir = sched.data_dir.join("chapters").join(&book.id);
-        std::fs::create_dir_all(&dir)?;
         let res = sched.engine.run_content(&source, &ch.url, false).await;
         if !res.ok {
             warn!(target: "crawl", book_url, chapter = i, "new chapter fetch failed, stopping here so it is retried next check: {}", res.error.unwrap_or_default());
             break;
         }
-        let paras: Vec<crate::source::Paragraph> = serde_json::from_value(res.extracted).unwrap_or_default();
+        // Extraction succeeded but the shape is wrong: stop here so the
+        // chapter is retried next check, like a failed fetch — the old
+        // code counted it as fetched with empty text.
+        let paras: Vec<crate::source::Paragraph> = match serde_json::from_value(res.extracted) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(target: "crawl", book_url, chapter = i, "new chapter extraction failed, stopping here so it is retried next check: {e}");
+                break;
+            }
+        };
         fetched += 1;
         let text = paras.iter().filter_map(|p| p.text.clone()).collect::<Vec<_>>().join("\n");
         std::fs::write(dir.join(format!("{i}.txt")), &text)?;
+        new_tuples.push((i, ch.name.clone(), text));
     }
     if fetched == 0 {
         return Ok(format!("no new chapters fetched (toc {} > stored {existing}, first new chapter failed)", chapters.len()));
     }
-    // Re-index the whole book from its chapter files (index_book deletes
-    // the book's docs first, so this is append-safe). Only the fetched
-    // prefix is added: failed chapters stay out of the list and out of
-    // chapter_count, so the next check retries them.
+    // Append only the fetched chapters to the index (index_book_append
+    // adds docs without deleting the book's existing ones). Only the
+    // fetched prefix is added: failed chapters stay out of the list and
+    // out of chapter_count, so the next check retries them.
     let (old_titles, _) = sched.db.list_chapters(&book.id, 1, 100_000).await?;
     let mut titles: Vec<String> = old_titles.into_iter().map(|c| c.title).collect();
     titles.extend(chapters.iter().skip(existing).take(fetched).map(|c| c.name.clone()));
-    let mut tuples: Vec<(String, String)> = Vec::with_capacity(titles.len());
-    for (i, t) in titles.iter().enumerate() {
-        let f = sched.data_dir.join("chapters").join(&book.id).join(format!("{i}.txt"));
-        let text = tokio::fs::read_to_string(&f).await.unwrap_or_default();
-        tuples.push((t.clone(), text));
-    }
-    let id_num: u64 = book.id.parse().unwrap_or(0);
+    let id_num: u64 = book.id.parse().context("book id is not numeric")?;
     let search = sched.search.clone();
     let (t, a) = (book.title.clone(), book.author.clone());
-    tokio::task::spawn_blocking(move || search.index_book(id_num, &t, &a, "cached", &tuples))
+    tokio::task::spawn_blocking(move || search.index_book_append(id_num, &t, &a, "cached", &new_tuples))
         .await
         .map_err(|e| anyhow!("spawn_blocking: {e}"))??;
     sched.db.replace_chapters(&book.id, &titles).await?;
@@ -933,7 +974,7 @@ async fn rebuild_index_inner(sched: &Arc<Scheduler>, full: bool) -> Result<(crat
         info!(target: "search", "index cleared for full rebuild");
         sched.db.reset_index_versions().await?;
     }
-    let report = crate::scanner::scan_once(&sched.db, &sched.search, &sched.books_dir, &sched.data_dir, true).await?;
+    let report = crate::scanner::scan_once(&sched.db, &sched.search, &sched.books_dir, &sched.data_dir, sched.scan_workers, true).await?;
     let cached = crate::scanner::reindex_cached_books(&sched.db, &sched.search, &sched.data_dir, full).await?;
     Ok((report, cached))
 }

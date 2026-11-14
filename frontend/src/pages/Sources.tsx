@@ -1,4 +1,4 @@
-import { createSignal, For, Show, type Component } from "solid-js";
+import { createSignal, For, Show, onMount, type Component } from "solid-js";
 import { api, type Source } from "../lib/api";
 import JsonEditor from "../components/JsonEditor";
 
@@ -28,7 +28,7 @@ const Sources: Component = () => {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
-  refresh();
+  onMount(refresh);
 
   const startEdit = (s: Source) => {
     setEditing(s);

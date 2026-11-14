@@ -5,7 +5,6 @@
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -251,10 +250,8 @@ fn end_to_end_txt_book() {
     }
 }
 
-#[allow(dead_code)]
-fn _unused(_p: PathBuf) {}
-
-fn crc32(data: &[u8]) -> u32 {
+/// CRC-32 (IEEE) table, built once (was rebuilt on every call).
+static CRC32_TABLE: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::new(|| {
     let mut table = [0u32; 256];
     for i in 0..256u32 {
         let mut c = i;
@@ -263,9 +260,13 @@ fn crc32(data: &[u8]) -> u32 {
         }
         table[i as usize] = c;
     }
+    table
+});
+
+fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+        crc = CRC32_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
 }

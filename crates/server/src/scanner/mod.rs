@@ -5,7 +5,7 @@
 use crate::db::{BookRow, Database};
 use crate::parser;
 use crate::search::{SearchIndex, INDEX_VERSION};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -41,22 +41,15 @@ const INDEX_BATCH: usize = 64;
 const INDEX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 /// Stable book id: FNV-1a 64 of the canonical path (or URL for cached books).
+/// The hash itself lives in `crate::cache` (shared with `url_hash`);
+/// the algorithm must never change — book ids depend on it.
 pub fn book_id_for_path(path: &Path) -> u64 {
     let s = path.to_string_lossy();
-    fnv(&s)
+    crate::cache::fnv1a_64(&s)
 }
 
 pub fn book_id_for_url(url: &str) -> String {
-    fnv(url).to_string()
-}
-
-fn fnv(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    crate::cache::fnv1a_64(url).to_string()
 }
 
 fn mtime_secs(path: &Path) -> i64 {
@@ -75,24 +68,6 @@ fn is_book_file(path: &Path) -> bool {
     )
 }
 
-/// Parallel scan width: `SHUKU_SCAN_WORKERS`, else half the CPU count
-/// (1..=8). Parse workers and tantivy writer threads share the same cores,
-/// so both default to half: total compute threads stay near core count
-/// (measured best on 4 cores: 2 parse + 2 index; 4+4 was slower).
-pub fn scan_workers() -> usize {
-    std::env::var("SHUKU_SCAN_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|n| n.clamp(1, 32))
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .div_ceil(2)
-                .clamp(1, 8)
-        })
-}
-
 /// One parsed book, ready to be indexed + published.
 struct PublishItem {
     id_num: u64,
@@ -108,6 +83,14 @@ struct PublishItem {
     chapter_tuples: Vec<(String, String)>,
     /// (bytes, mime) of the epub cover, if the epub declares one.
     cover: Option<(Vec<u8>, String)>,
+}
+
+/// Mark every book in a failed batch broken (the next scan re-picks them
+/// up). Shared by the three failure exits of `publish_batch`.
+async fn mark_batch_broken(db: &Database, batch: &[PublishItem]) {
+    for item in batch {
+        let _ = db.mark_book_status(&item.id, "broken").await;
+    }
 }
 
 /// Index a batch with ONE commit, then publish each book's DB row.
@@ -129,16 +112,12 @@ async fn publish_batch(
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             error!(target: "scan", books = batch.len(), "batch index: {e}");
-            for item in &batch {
-                let _ = db.mark_book_status(&item.id, "broken").await;
-            }
+            mark_batch_broken(db, &batch).await;
             return batch.into_iter().map(|_| ScanOutcome::Broken).collect();
         }
         Err(e) => {
             error!(target: "scan", books = batch.len(), "batch index task failed: {e}");
-            for item in &batch {
-                let _ = db.mark_book_status(&item.id, "broken").await;
-            }
+            mark_batch_broken(db, &batch).await;
             return batch.into_iter().map(|_| ScanOutcome::Broken).collect();
         }
     };
@@ -171,33 +150,26 @@ async fn publish_batch(
         .iter()
         .zip(counts.iter())
         .zip(cover_mimes.iter())
-        .map(|((item, n), cover)| BookRow {
-            id: item.id.clone(),
-            title: item.title.clone(),
-            author: item.author.clone(),
-            path: Some(item.path_str.clone()),
-            source_url: None,
-            source: "local".into(),
-            mtime: item.mtime,
-            size: item.size,
-            index_version: INDEX_VERSION,
-            status: "ok".into(),
-            chapter_count: *n as i64,
-            created_at: now,
-            updated_at: now,
-            source_id: String::new(),
-            has_update: false,
-            last_update_check: 0,
-            cover_mime: cover.clone(),
+        .map(|((item, n), cover)| {
+            BookRow::local(
+                item.id.clone(),
+                item.title.clone(),
+                item.author.clone(),
+                item.path_str.clone(),
+                item.mtime,
+                item.size,
+                INDEX_VERSION,
+                *n as i64,
+                now,
+                cover.clone(),
+            )
         })
         .collect();
     let chaps: Vec<(String, Vec<String>)> =
         batch.iter().map(|item| (item.id.clone(), item.titles.clone())).collect();
     if let Err(e) = db.upsert_books_batch(rows, chaps).await {
         error!(target: "scan", books = batch.len(), "batch upsert: {e}");
-        for item in &batch {
-            let _ = db.mark_book_status(&item.id, "broken").await;
-        }
+        mark_batch_broken(db, &batch).await;
         return batch.into_iter().map(|_| ScanOutcome::Broken).collect();
     }
     for (item, n) in batch.iter().zip(counts.iter()) {
@@ -256,25 +228,14 @@ async fn parse_one_file(
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "未知".into());
             let _ = db
-                .upsert_book(&BookRow {
-                    id: id.clone(),
-                    title: stem,
-                    author: String::new(),
-                    path: Some(path_str.to_string()),
-                    source_url: None,
-                    source: "local".into(),
+                .upsert_book(&BookRow::broken(
+                    id.clone(),
+                    stem,
+                    path_str.to_string(),
                     mtime,
                     size,
-                    index_version: 0,
-                    status: "broken".into(),
-                    chapter_count: 0,
-                    created_at: now,
-                    updated_at: now,
-                    source_id: String::new(),
-                    has_update: false,
-                    last_update_check: 0,
-                    cover_mime: String::new(),
-                })
+                    now,
+                ))
                 .await;
             None
         }
@@ -289,7 +250,8 @@ async fn parse_one_file(
 /// every known book, so a partial scan (one file from the watcher, or a
 /// subdirectory from POST /api/tasks/scan) would otherwise mark the whole
 /// library broken. A partial scan only (re)indexes what it walks.
-pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, data_dir: &Path, full_scan: bool) -> Result<ScanReport> {
+/// `workers` is the parallel parse width, from Config (`SHUKU_SCAN_WORKERS`).
+pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, data_dir: &Path, workers: usize, full_scan: bool) -> Result<ScanReport> {
     let mut report = ScanReport::default();
     if !dir.exists() {
         info!(target: "scan", dir = %dir.display(), "books dir does not exist, skipping");
@@ -341,7 +303,7 @@ pub async fn scan_once(db: &Database, search: &Arc<SearchIndex>, dir: &Path, dat
     // The semaphore bounds in-flight files; the tantivy writer mutex inside
     // index_book serializes commits, and DB writes go through
     // tokio-rusqlite's single background connection.
-    let workers = scan_workers();
+    let workers = workers.max(1);
     report.workers = workers;
     info!(target: "scan", total = todo.len(), workers, "parallel scan starting");
     // Producer/consumer: parse tasks run concurrently (bounded by the
@@ -444,7 +406,7 @@ pub async fn reindex_cached_books(db: &Database, search: &Arc<SearchIndex>, data
             let text = tokio::fs::read_to_string(&f).await.unwrap_or_default();
             tuples.push((ch.title, text));
         }
-        let id_num: u64 = id.parse().unwrap_or(0);
+        let id_num: u64 = id.parse().context("cached book id is not numeric")?;
         let search2 = search.clone();
         let (t, a) = (title, author);
         tokio::task::spawn_blocking(move || search2.index_book(id_num, &t, &a, "cached", &tuples))
@@ -508,16 +470,16 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         let book = write_txt(&tmp, "test.txt", "第一章 开始\n少年修仙。\n第二章 练功\n打坐修炼。\n");
-        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert_eq!(r1.indexed, 1);
         assert_eq!(r1.broken, 0);
-        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert_eq!(r2.indexed, 0, "unchanged book must not be re-indexed");
         assert_eq!(r2.unchanged, 1);
         // Touch the file: new mtime forces re-index.
         let later = SystemTime::now() + std::time::Duration::from_secs(2);
         filetime_set(&book, later);
-        let r3 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r3 = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert_eq!(r3.indexed, 1, "mtime change must trigger re-index");
         // Search must see the content.
         let (hits, _) = search.search("修仙", None, None, 10, 0).unwrap();
@@ -537,10 +499,10 @@ mod tests {
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         write_txt(&tmp, "a.txt", "第一章 甲\n内容甲。\n");
         let b = write_txt(&tmp, "b.txt", "第一章 乙\n内容乙。\n");
-        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert_eq!(r1.indexed, 2);
         // Partial scan of a single file (what the watcher enqueues).
-        let r2 = scan_once(&db, &search, &b, &tmp.join("data"), false).await.unwrap();
+        let r2 = scan_once(&db, &search, &b, &tmp.join("data"), 2, false).await.unwrap();
         assert_eq!(r2.broken, 0, "partial scan must not mark other books broken");
         let (books, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         assert_eq!(books.len(), 2);
@@ -548,7 +510,7 @@ mod tests {
         // And a broken book heals on the next full scan even if its mtime
         // did not change (needs_index also keys on status == "broken").
         db.mark_book_status(&books[0].id, "broken").await.unwrap();
-        let r3 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r3 = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert_eq!(r3.indexed, 1, "broken book must be re-indexed by a full scan");
         let (books3, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         assert!(books3.iter().all(|bk| bk.status == "ok"));
@@ -563,7 +525,7 @@ mod tests {
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         std::fs::write(tmp.join("图册.epub"), crate::parser::test_epub_with_cover()).unwrap();
         let data = tmp.join("data");
-        let r = scan_once(&db, &search, &tmp, &data, true).await.unwrap();
+        let r = scan_once(&db, &search, &tmp, &data, 2, true).await.unwrap();
         assert_eq!(r.indexed, 1);
         let (books, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         assert_eq!(books.len(), 1);
@@ -573,7 +535,7 @@ mod tests {
         assert_eq!(std::fs::read(&cover_file).unwrap().as_slice(), b"\xff\xd8\xff\xe0fake-cover");
         // A txt book has no cover.
         write_txt(&tmp, "plain.txt", "第一章 开始\n内容。\n");
-        let r2 = scan_once(&db, &search, &tmp, &data, true).await.unwrap();
+        let r2 = scan_once(&db, &search, &tmp, &data, 2, true).await.unwrap();
         assert_eq!(r2.indexed, 1);
         let (books2, _) = db.list_books(None, None, None, "updated", 1, 10).await.unwrap();
         let plain = books2.iter().find(|b| b.title == "plain").unwrap();
@@ -590,7 +552,7 @@ mod tests {
         write_txt(&tmp, "good.txt", "第一章 好书\n内容正常。\n");
         let bad = tmp.join("bad.epub");
         std::fs::write(&bad, b"not a zip").unwrap();
-        let r = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert_eq!(r.indexed, 1);
         assert_eq!(r.broken, 1);
         let bad_row = db.get_book_by_path(&bad.to_string_lossy()).await.unwrap().unwrap();
@@ -610,7 +572,7 @@ mod tests {
             write_txt(&tmp, &format!("book{i:02}.txt"), &content);
         }
         std::fs::write(tmp.join("bad.epub"), b"not a zip").unwrap();
-        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r1 = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert!(r1.workers >= 1, "workers must be reported");
         assert_eq!(r1.indexed, 20, "all 20 txt books must be indexed, got {r1:?}");
         assert_eq!(r1.broken, 1, "broken epub must be counted, not block the queue");
@@ -622,7 +584,7 @@ mod tests {
         let (hits, total) = search.search("故事继续发展", None, None, 100, 0).unwrap();
         assert_eq!(total, 20, "all 20 books share the phrase, hits: {}", hits.len());
         // Second scan: txt books unchanged, broken epub retried (index_version 0).
-        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data"), true).await.unwrap();
+        let r2 = scan_once(&db, &search, &tmp, &tmp.join("data"), 2, true).await.unwrap();
         assert_eq!(r2.indexed, 0);
         assert_eq!(r2.unchanged, 20);
         assert_eq!(r2.broken, 1);
@@ -699,7 +661,7 @@ mod tests {
         let idx_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join(format!("probe-idx-{}", uuid::Uuid::new_v4()));
-        let search = Arc::new(SearchIndex::open(&idx_dir).unwrap());
+        let search = Arc::new(SearchIndex::open(&idx_dir, crate::config::default_index_threads(), crate::config::default_index_heap_mb()).unwrap());
         let t1 = std::time::Instant::now();
         let mut total_ch = 0usize;
         for chunk in books.chunks(16) {

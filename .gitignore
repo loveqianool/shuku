@@ -1,5 +1,4 @@
 # Rust build artifacts
-/target/
 crates/server/target/
 # Frontend generated files
 frontend/node_modules/

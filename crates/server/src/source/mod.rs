@@ -115,22 +115,27 @@ static REGEX_CACHE: LazyLock<RwLock<HashMap<String, Arc<Regex>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub fn get_selector(s: &str) -> Result<Arc<Selector>> {
-    if let Some(v) = SELECTOR_CACHE.read().unwrap().get(s) {
+    // Check-then-insert under ONE write lock. (A read-lock check first
+    // raced with another thread compiling the same selector: both would
+    // compile, and the second insert silently dropped the first's Arc.)
+    // Compilation only happens on the cold path, so the write lock costs
+    // nothing once the cache is warm.
+    let mut cache = crate::rw_write_or_poisoned(&SELECTOR_CACHE);
+    if let Some(v) = cache.get(s) {
         return Ok(v.clone());
     }
-    let sel = Selector::parse(s).map_err(|e| anyhow!("invalid selector {s:?}: {e:?}"))?;
-    let sel = Arc::new(sel);
-    SELECTOR_CACHE.write().unwrap().insert(s.to_string(), sel.clone());
+    let sel = Arc::new(Selector::parse(s).map_err(|e| anyhow!("invalid selector {s:?}: {e:?}"))?);
+    cache.insert(s.to_string(), sel.clone());
     Ok(sel)
 }
 
 pub fn get_regex(s: &str) -> Result<Arc<Regex>> {
-    if let Some(v) = REGEX_CACHE.read().unwrap().get(s) {
+    let mut cache = crate::rw_write_or_poisoned(&REGEX_CACHE);
+    if let Some(v) = cache.get(s) {
         return Ok(v.clone());
     }
-    let re = Regex::new(s).map_err(|e| anyhow!("invalid regex {s:?}: {e}"))?;
-    let re = Arc::new(re);
-    REGEX_CACHE.write().unwrap().insert(s.to_string(), re.clone());
+    let re = Arc::new(Regex::new(s).map_err(|e| anyhow!("invalid regex {s:?}: {e}"))?);
+    cache.insert(s.to_string(), re.clone());
     Ok(re)
 }
 
@@ -372,55 +377,86 @@ pub fn run_js_ext(
     run_js_inner(script, input, &[], js_lib, timeout, false, base, prelude)
 }
 
-fn run_js_inner(script: &str, input: &str, vars: &[(&str, &str)], js_lib: &str, timeout: Duration, syntax_only: bool, base: &str, prelude: &str) -> Result<String> {
+/// Shared QuickJS evaluation used by `run_js_inner` (rule scripts) and
+/// `login_ui::run_login_ui` (loginUi scripts): new Runtime (memory limit
+/// + 256 KiB stack + deadline interrupt) -> full Context -> run `setup`,
+/// then the script by direct eval so its completion value is the output
+/// (expression scripts like `result.toUpperCase()` work); a script using
+/// `return` is retried inside a function wrapper (eval forbids top-level
+/// return). The caller-supplied `result_expr` is what the wrapper
+/// returns; a script error comes back as the string
+/// `<err_prefix><message>` and is turned into an Err with the message
+/// (the caller adds its own "js exec:" / "loginUi exec:" label).
+/// The prelude (jsLib + vars + aliases + java.* helpers + the caller's
+/// prelude) is part of `setup`, so `return`-style scripts see the same
+/// bindings on the retry path. Blocking: call from spawn_blocking only.
+pub(crate) fn eval_js_with_setup(
+    setup: &str,
+    script: &str,
+    timeout: Duration,
+    err_prefix: &str,
+    result_expr: &str,
+) -> Result<String> {
     let rt = rquickjs::Runtime::new().context("create js runtime")?;
     rt.set_memory_limit(JS_MEMORY_LIMIT);
     rt.set_max_stack_size(256 * 1024);
     let deadline = std::time::Instant::now() + timeout;
     rt.set_interrupt_handler(Some(Box::new(move || std::time::Instant::now() > deadline)));
     let ctx = rquickjs::Context::full(&rt).context("create js context")?;
-    let script = script.to_string();
+    let script_json = serde_json::to_string(script)?;
+    // JSON-escaped copy of the setup, for the `return`-retry path below.
+    let setup_json = serde_json::to_string(setup)?;
+    let code = format!(
+        "(function(){{ try {{ {setup} let __out; try {{ __out = eval({script_json}); }} catch(e) {{ if (String(e).indexOf('return') !== -1) {{ __out = (new Function({setup_json} + \"\\n\" + {script_json}))(); }} else {{ throw e; }} }} return {result_expr}; }} catch(e) {{ return '{err_prefix}' + String(e); }} }})()"
+    );
+    let out: String = ctx
+        .with(|ctx| ctx.eval::<String, _>(code))
+        .map_err(|e| anyhow!("{e}"))?;
+    if let Some(msg) = out.strip_prefix(err_prefix) {
+        return Err(anyhow!("{msg}"));
+    }
+    Ok(out)
+}
+
+fn run_js_inner(script: &str, input: &str, vars: &[(&str, &str)], js_lib: &str, timeout: Duration, syntax_only: bool, base: &str, prelude: &str) -> Result<String> {
+    if syntax_only {
+        // Compile only: `new Function(body)` never runs the body.
+        let rt = rquickjs::Runtime::new().context("create js runtime")?;
+        rt.set_memory_limit(JS_MEMORY_LIMIT);
+        rt.set_max_stack_size(256 * 1024);
+        let ctx = rquickjs::Context::full(&rt).context("create js context")?;
+        ctx.with(|ctx| {
+            let code = format!("new Function({})", serde_json::to_string(script)?);
+            let _f: rquickjs::Function = ctx.eval(code).map_err(|e| anyhow!("js compile: {e}"))?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        return Ok(String::new());
+    }
+    // Semantics: `result` holds the input string. The script is run via
+    // direct eval so its completion value is the output (expression
+    // scripts like `result.toUpperCase()` work); if it only mutates
+    // `result`, the mutated value is used. Scripts using `return` are
+    // retried inside a function wrapper (eval forbids top-level return).
     let input_json = serde_json::to_string(input)?;
-    let js_lib = js_lib.to_string();
     let base_json = serde_json::to_string(base)?;
-    let prelude = prelude.to_string();
     let vars_code: String = vars
         .iter()
         .map(|(k, v)| format!("let {} = {};", k, serde_json::to_string(v).unwrap_or_default()))
         .collect();
-    ctx.with(|ctx| {
-        if syntax_only {
-            // Compile only: `new Function(body)` never runs the body.
-            let code = format!("new Function({})", serde_json::to_string(&script)?);
-            let _f: rquickjs::Function = ctx.eval(code).map_err(|e| anyhow!("js compile: {e}"))?;
-            return Ok(String::new());
-        }
-        // Semantics: `result` holds the input string. The script is run via
-        // direct eval so its completion value is the output (expression
-        // scripts like `result.toUpperCase()` work); if it only mutates
-        // `result`, the mutated value is used. Scripts using `return` are
-        // retried inside a function wrapper (eval forbids top-level return).
-        // The prelude (jsLib + vars + aliases + java.* helpers + the
-        // caller's prelude) is shared by both paths so `return`-style
-        // scripts see the same bindings.
-        // A script returning an array/object yields its JSON text (the
-        // source doc: js: rules returning arrays/objects are handed to
-        // the next stage as JSON strings).
-        let script_json = serde_json::to_string(&script)?;
-        let setup = format!(
-            "{js_lib} {vars_code} let result = {input_json}; let input = result; let src = result; let base_url = {base_json}; let baseUrl = base_url; let url = base_url; {JS_HELPERS} {prelude}"
-        );
-        // JSON-escaped copy of the setup, for the `return`-retry path below.
-        let setup_json = serde_json::to_string(&setup)?;
-        let code = format!(
-            "(function(){{ try {{ {setup} let __out; try {{ __out = eval({script_json}); }} catch(e) {{ if (String(e).indexOf('return') !== -1) {{ __out = (new Function({setup_json} + \"\\n\" + {script_json}))(); }} else {{ throw e; }} }} return (typeof __out === 'object' && __out !== null) ? JSON.stringify(__out) : String(__out === undefined ? result : __out); }} catch(e) {{ return 'JS_ERROR:' + String(e); }} }})()"
-        );
-        let out: String = ctx.eval(code).map_err(|e| anyhow!("js exec: {e}"))?;
-        if let Some(msg) = out.strip_prefix("JS_ERROR:") {
-            return Err(anyhow!("js exec: {msg}"));
-        }
-        Ok(out)
-    })
+    let setup = format!(
+        "{js_lib} {vars_code} let result = {input_json}; let input = result; let src = result; let base_url = {base_json}; let baseUrl = base_url; let url = base_url; {JS_HELPERS} {prelude}"
+    );
+    // A script returning an array/object yields its JSON text (the
+    // source doc: js: rules returning arrays/objects are handed to the
+    // next stage as JSON strings).
+    eval_js_with_setup(
+        &setup,
+        script,
+        timeout,
+        "JS_ERROR:",
+        "(typeof __out === 'object' && __out !== null) ? JSON.stringify(__out) : String(__out === undefined ? result : __out)",
+    )
+    .map_err(|e| anyhow!("js exec: {e}"))
 }
 
 /// Pure-JS helpers available to every rule script (Reader Next JS doc):
@@ -468,7 +504,7 @@ pub struct RequestSpec {
 /// remaining `{{expr}}` as JS (`key`, `page`, `result` bound to the keyword).
 /// Double-brace forms are replaced first: `{{key}}` contains `{key}`.
 fn render_template(template: &str, keyword: &str, page: i64, js_lib: &str) -> Result<String> {
-    let encoded = urlencoding(keyword);
+    let encoded = urlencode(keyword, false);
     let page_s = page.to_string();
     let mut out = template
         .replace("{{key}}", &encoded)
@@ -1075,26 +1111,39 @@ fn opt_json_field(item: &Value, rule: &Value, key: &str, fallbacks: &[&str], js_
     }
 }
 
+/// Shared assembly of a `BookHit` from its fields: the caller supplies
+/// `name` (empty means "not a book") and one field fetcher used for the
+/// other eight fields; `book_url` / `cover_url` are resolved against
+/// `base` here. HTML and JSON differ only in how a field is fetched
+/// (rule eval vs. rule eval with JSON key fallbacks).
+fn book_hit_from_fields(
+    name: String,
+    mut get_field: impl FnMut(&str) -> Result<String>,
+    base: &Url,
+) -> Result<Option<BookHit>> {
+    if name.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(BookHit {
+        name: name.trim().to_string(),
+        author: get_field("author")?.trim().to_string(),
+        book_url: resolve_url(base, &get_field("bookUrl")?),
+        cover_url: resolve_url(base, &get_field("coverUrl")?),
+        intro: get_field("intro")?.trim().to_string(),
+        kind: get_field("kind")?.trim().to_string(),
+        last_chapter: get_field("lastChapter")?.trim().to_string(),
+        update_time: get_field("updateTime")?.trim().to_string(),
+        word_count: get_field("wordCount")?.trim().to_string(),
+    }))
+}
+
 /// One book from an HTML element (None when the name is empty).
 fn book_hit_from_html(node: &Node, rule: &Value, base: &Url, js_lib: &str, js_out: &mut Vec<String>) -> Result<Option<BookHit>> {
     let name = match sub_rule(rule, "name") {
         Some(r) => eval_rule_first(node, r, js_lib, js_out, base)?,
         None => node.text(),
     };
-    if name.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(BookHit {
-        name: name.trim().to_string(),
-        author: opt_html_field(node, rule, "author", js_lib, js_out, base)?.trim().to_string(),
-        book_url: resolve_url(base, &opt_html_field(node, rule, "bookUrl", js_lib, js_out, base)?),
-        cover_url: resolve_url(base, &opt_html_field(node, rule, "coverUrl", js_lib, js_out, base)?),
-        intro: opt_html_field(node, rule, "intro", js_lib, js_out, base)?.trim().to_string(),
-        kind: opt_html_field(node, rule, "kind", js_lib, js_out, base)?.trim().to_string(),
-        last_chapter: opt_html_field(node, rule, "lastChapter", js_lib, js_out, base)?.trim().to_string(),
-        update_time: opt_html_field(node, rule, "updateTime", js_lib, js_out, base)?.trim().to_string(),
-        word_count: opt_html_field(node, rule, "wordCount", js_lib, js_out, base)?.trim().to_string(),
-    }))
+    book_hit_from_fields(name, |key| opt_html_field(node, rule, key, js_lib, js_out, base), base)
 }
 
 /// One book from a JSON item (None when the name is empty).
@@ -1103,20 +1152,25 @@ fn book_hit_from_json(item: &Value, rule: &Value, base: &Url, js_lib: &str, js_o
         Some(r) => eval_json_rule_first(item, r, js_lib, js_out, base)?,
         None => json_field(item, &["name", "title"]),
     };
-    if name.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(BookHit {
-        name: name.trim().to_string(),
-        author: opt_json_field(item, rule, "author", &["author"], js_lib, js_out, base)?.trim().to_string(),
-        book_url: resolve_url(base, &opt_json_field(item, rule, "bookUrl", &["bookUrl", "url"], js_lib, js_out, base)?),
-        cover_url: resolve_url(base, &opt_json_field(item, rule, "coverUrl", &["coverUrl", "cover"], js_lib, js_out, base)?),
-        intro: opt_json_field(item, rule, "intro", &["intro", "description"], js_lib, js_out, base)?.trim().to_string(),
-        kind: opt_json_field(item, rule, "kind", &["kind"], js_lib, js_out, base)?.trim().to_string(),
-        last_chapter: opt_json_field(item, rule, "lastChapter", &["lastChapter", "latestChapter"], js_lib, js_out, base)?.trim().to_string(),
-        update_time: opt_json_field(item, rule, "updateTime", &["updateTime", "updated"], js_lib, js_out, base)?.trim().to_string(),
-        word_count: opt_json_field(item, rule, "wordCount", &["wordCount", "words"], js_lib, js_out, base)?.trim().to_string(),
-    }))
+    // Fallback keys for the plain-JSON path (no rule for the field).
+    let fallbacks: &[(&str, &[&str])] = &[
+        ("author", &["author"]),
+        ("bookUrl", &["bookUrl", "url"]),
+        ("coverUrl", &["coverUrl", "cover"]),
+        ("intro", &["intro", "description"]),
+        ("kind", &["kind"]),
+        ("lastChapter", &["lastChapter", "latestChapter"]),
+        ("updateTime", &["updateTime", "updated"]),
+        ("wordCount", &["wordCount", "words"]),
+    ];
+    book_hit_from_fields(
+        name,
+        |key| {
+            let keys = fallbacks.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or(&[]);
+            opt_json_field(item, rule, key, keys, js_lib, js_out, base)
+        },
+        base,
+    )
 }
 
 /// A `js:` / `<js>...</js>` list rule: run it on the whole page (HTML
@@ -1161,10 +1215,11 @@ pub fn extract_toc(html: &str, rule: &Value, base: &Url, js_lib: &str) -> Result
 /// ruleToc.formatJs rewrites each title afterwards (bindings `index`,
 /// `title`, `chapter`).
 pub fn extract_toc_page(html: &str, rule: &Value, base: &Url, js_lib: &str) -> Result<(Vec<ChapterHit>, String, Vec<String>)> {
-    let mut html_owned = html.to_string();
+    // Borrowed until a rewrite (preUpdateJs) forces a copy.
+    let mut html_owned: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(html);
     if let Some(Value::String(s)) = sub_rule(rule, "preUpdateJs") {
         if !s.trim().is_empty() {
-            html_owned = run_js_ext(strip_js_wrapper(s), &html_owned, js_lib, base.as_str(), "", JS_TIMEOUT)?;
+            html_owned = std::borrow::Cow::Owned(run_js_ext(strip_js_wrapper(s), &html_owned, js_lib, base.as_str(), "", JS_TIMEOUT)?);
         }
     }
     if looks_like_json(&html_owned) {
@@ -1331,10 +1386,11 @@ pub fn extract_content(html: &str, rule: &Value, base: &Url, js_lib: &str) -> Re
 /// Returns (paragraphs, next-page URL, js outputs).
 pub fn extract_content_page(html: &str, rule: &Value, base: &Url, js_lib: &str) -> Result<(Vec<Paragraph>, String, Vec<String>)> {
     let mut js_out = Vec::new();
-    let mut html_owned = html.to_string();
+    // Borrowed until a rewrite (sourceRegex / webJs) forces a copy.
+    let mut html_owned: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(html);
     if let Some(Value::String(s)) = sub_rule(rule, "sourceRegex") {
         if !s.trim().is_empty() {
-            html_owned = apply_regex_replace(&html_owned, s)?;
+            html_owned = std::borrow::Cow::Owned(apply_regex_replace(&html_owned, s)?);
         }
     }
     if let Some(Value::String(s)) = sub_rule(rule, "webJs") {
@@ -1348,7 +1404,7 @@ pub fn extract_content_page(html: &str, rule: &Value, base: &Url, js_lib: &str) 
             } else {
                 out.clone()
             });
-            html_owned = out;
+            html_owned = std::borrow::Cow::Owned(out);
         }
     }
     let doc = Html::parse_document(&html_owned);
@@ -1364,7 +1420,7 @@ pub fn extract_content_page(html: &str, rule: &Value, base: &Url, js_lib: &str) 
     let content_rule = sub_rule(rule, "content").cloned().unwrap_or_else(|| rule.clone());
     let mut paras: Vec<Paragraph> = Vec::new();
     if let Value::String(s) = &content_rule {
-        let parsed = parse_rule_str(&s.clone());
+        let parsed = parse_rule_str(s);
         if parsed.js.is_some() {
             let root = Node::Root(&doc);
             let vals = eval_rule_str(&root, s, js_lib, &mut js_out2, base)?;
@@ -1513,6 +1569,28 @@ fn render_item_template(template: &str, item: &Value, js_lib: &str, base: &Url) 
             out = out.replace(&format!("{{{{{k}}}}}"), &crate::jsonpath::value_to_string(v));
         }
     }
+    // Hoisted out of the {{...}} loop: the variable bindings and the
+    // prelude depend only on the item, not on the expression being
+    // rendered. (Was rebuilt — including a QuickJS prelude string — on
+    // every iteration.)
+    let vars: Vec<(String, String)> = item
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter(|(k, _)| {
+                    let mut cs = k.chars();
+                    matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+                        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                })
+                .map(|(k, v)| (k.clone(), crate::jsonpath::value_to_string(v)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let prelude: String = vars
+        .iter()
+        .map(|(k, v)| format!("let {} = {};", k, serde_json::to_string(v).unwrap_or_default()))
+        .collect();
+    let input = crate::jsonpath::value_to_string(item);
     loop {
         let Some(start) = out.find("{{") else { break };
         let Some(end_rel) = out[start + 2..].find("}}") else { break };
@@ -1521,24 +1599,6 @@ fn render_item_template(template: &str, item: &Value, js_lib: &str, base: &Url) 
         if expr.is_empty() {
             break;
         }
-        let vars: Vec<(String, String)> = item
-            .as_object()
-            .map(|o| {
-                o.iter()
-                    .filter(|(k, _)| {
-                        let mut cs = k.chars();
-                        matches!(cs.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
-                            && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-                    })
-                    .map(|(k, v)| (k.clone(), crate::jsonpath::value_to_string(v)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let prelude: String = vars
-            .iter()
-            .map(|(k, v)| format!("let {} = {};", k, serde_json::to_string(v).unwrap_or_default()))
-            .collect();
-        let input = crate::jsonpath::value_to_string(item);
         let val = run_js_ext(&expr, &input, js_lib, base.as_str(), &prelude, JS_TIMEOUT)
             .map_err(|e| anyhow!("js in json template {{{{{expr}}}}}: {e}"))?;
         out.replace_range(start..end + 2, &val);
@@ -1765,6 +1825,44 @@ pub struct TestResult {
     pub logs: Vec<LogEntry>,
 }
 
+impl TestResult {
+    /// Success: `extracted` is the stage output, `js_output` any JS
+    /// side-channel lines, `raw_*` the first page's raw response.
+    pub fn ok(
+        extracted: Value,
+        js_output: Vec<String>,
+        raw_status: Option<u16>,
+        raw_body_truncated: Option<String>,
+        logs: Vec<LogEntry>,
+        t0: std::time::Instant,
+    ) -> Self {
+        Self {
+            ok: true,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            raw_status,
+            raw_body_truncated,
+            extracted,
+            js_output,
+            error: None,
+            logs,
+        }
+    }
+
+    /// Failure: `extracted` is null, `error` carries the message.
+    pub fn fail(logs: Vec<LogEntry>, err: String, t0: std::time::Instant) -> Self {
+        Self {
+            ok: false,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            raw_status: None,
+            raw_body_truncated: None,
+            extracted: Value::Null,
+            js_output: vec![],
+            error: Some(err),
+            logs,
+        }
+    }
+}
+
 pub struct Engine {
     pub pool: HttpPool,
     pub buckets: crate::scheduler::RateLimiter,
@@ -1810,10 +1908,6 @@ impl Engine {
         }
     }
 
-    /// Fetch with 3-level cache + per-domain token bucket + circuit breaker.
-    /// `source` supplies per-source headers and the cookie jar; a 401/403
-    /// triggers one loginUrl attempt + retry when `allow_login_retry`.
-    /// Cache key includes method + body, so POST searches cache per query.
     /// Fetch with 3-level cache + per-domain token bucket + circuit breaker.
     /// `source` supplies per-source headers and the cookie jar; a 401/403
     /// triggers one loginUrl attempt + retry when `allow_login_retry`.
@@ -2035,7 +2129,7 @@ impl Engine {
             return Ok((false, "no loginUrl".into()));
         }
         if !force {
-            if let Some(at) = self.login_state.read().unwrap().get(&source.id) {
+            if let Some(at) = crate::rw_read_or_poisoned(&self.login_state).get(&source.id) {
                 if at.elapsed() < LOGIN_TTL {
                     return Ok((true, "already logged in".into()));
                 }
@@ -2084,7 +2178,7 @@ impl Engine {
             check.trim().eq_ignore_ascii_case("true")
         };
         if ok {
-            self.login_state.write().unwrap().insert(source.id.clone(), std::time::Instant::now());
+            crate::rw_write_or_poisoned(&self.login_state).insert(source.id.clone(), std::time::Instant::now());
             logs.push(LogEntry { level: "info".into(), module: "login".into(), msg: "login ok".into(), ms: t0.elapsed().as_millis() as u64 });
         } else {
             logs.push(LogEntry { level: "warn".into(), module: "login".into(), msg: format!("login check failed (output: {check:?})"), ms: t0.elapsed().as_millis() as u64 });
@@ -2096,16 +2190,6 @@ impl Engine {
     pub async fn run_login(&self, source: &SourceDef, force_refresh: bool) -> TestResult {
         let t0 = std::time::Instant::now();
         let mut logs = vec![];
-        let fail = |logs: Vec<LogEntry>, err: String, t0: std::time::Instant| TestResult {
-            ok: false,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status: None,
-            raw_body_truncated: None,
-            extracted: Value::Null,
-            js_output: vec![],
-            error: Some(err),
-            logs,
-        };
         match self.login(source, force_refresh, &mut logs, t0).await {
             Ok((ok, check)) => TestResult {
                 ok,
@@ -2117,7 +2201,7 @@ impl Engine {
                 error: if ok { None } else { Some("login check failed".into()) },
                 logs,
             },
-            Err(e) => fail(logs, e.to_string(), t0),
+            Err(e) => TestResult::fail(logs, e.to_string(), t0),
         }
     }
 
@@ -2126,34 +2210,24 @@ impl Engine {
     pub async fn run_explore(&self, source: &SourceDef, page: i64, force_refresh: bool) -> TestResult {
         let t0 = std::time::Instant::now();
         let mut logs = vec![];
-        let fail = |logs: Vec<LogEntry>, err: String, t0: std::time::Instant| TestResult {
-            ok: false,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status: None,
-            raw_body_truncated: None,
-            extracted: Value::Null,
-            js_output: vec![],
-            error: Some(err),
-            logs,
-        };
         if source.explore_url.is_empty() {
-            return fail(logs, "source has no exploreUrl".into(), t0);
+            return TestResult::fail(logs, "source has no exploreUrl".into(), t0);
         }
         self.maybe_login(source, &mut logs, t0).await;
         let (template, js_lib) = (source.explore_url.clone(), source.js_lib.clone());
         let base_url = source.base_url();
         let spec = match tokio::task::spawn_blocking(move || parse_request_rule(&template, &base_url, "", page, &js_lib)).await {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => return fail(logs, format!("bad explore url: {e}"), t0),
-            Err(e) => return fail(logs, format!("blocking task: {e}"), t0),
+            Ok(Err(e)) => return TestResult::fail(logs, format!("bad explore url: {e}"), t0),
+            Err(e) => return TestResult::fail(logs, format!("blocking task: {e}"), t0),
         };
         let base = match Url::parse(&spec.url) {
             Ok(u) => u,
-            Err(e) => return fail(logs, format!("bad explore url: {e}"), t0),
+            Err(e) => return TestResult::fail(logs, format!("bad explore url: {e}"), t0),
         };
         let (status, body) = match self.fetch_spec(source, &spec, CacheKind::Search, force_refresh, &mut logs, t0, true).await {
             Ok(v) => v,
-            Err(e) => return fail(logs, e.to_string(), t0),
+            Err(e) => return TestResult::fail(logs, e.to_string(), t0),
         };
         let raw_body_truncated: String = body.chars().take(8192).collect();
         let (rule, js_lib, base_url) = (source.rule_explore.clone(), source.js_lib.clone(), base.clone());
@@ -2161,19 +2235,10 @@ impl Engine {
         match extracted {
             Ok(Ok((books, js_out))) => {
                 logs.push(LogEntry { level: "info".into(), module: "search".into(), msg: format!("explore: extracted {} books", books.len()), ms: t0.elapsed().as_millis() as u64 });
-                TestResult {
-                    ok: true,
-                    elapsed_ms: t0.elapsed().as_millis() as u64,
-                    raw_status: Some(status),
-                    raw_body_truncated: Some(raw_body_truncated),
-                    extracted: serde_json::to_value(&books).unwrap_or(Value::Null),
-                    js_output: js_out,
-                    error: None,
-                    logs,
-                }
+                TestResult::ok(serde_json::to_value(&books).unwrap_or(Value::Null), js_out, Some(status), Some(raw_body_truncated), logs, t0)
             }
-            Ok(Err(e)) => fail(logs, format!("extract: {e}"), t0),
-            Err(e) => fail(logs, format!("blocking task: {e}"), t0),
+            Ok(Err(e)) => TestResult::fail(logs, format!("extract: {e}"), t0),
+            Err(e) => TestResult::fail(logs, format!("blocking task: {e}"), t0),
         }
     }
 
@@ -2183,21 +2248,15 @@ impl Engine {
     pub async fn run_search_pages(&self, source: &SourceDef, keyword: &str, start_page: i64, max_pages: i64, force_refresh: bool) -> TestResult {
         let t0 = std::time::Instant::now();
         let mut logs = vec![];
-        let fail = |logs: Vec<LogEntry>, err: String, t0: std::time::Instant| TestResult {
-            ok: false,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status: None,
-            raw_body_truncated: None,
-            extracted: Value::Null,
-            js_output: vec![],
-            error: Some(err),
-            logs,
-        };
         if source.search_url.is_empty() {
-            return fail(logs, "source has no searchUrl".into(), t0);
+            return TestResult::fail(logs, "source has no searchUrl".into(), t0);
         }
         self.maybe_login(source, &mut logs, t0).await;
         let max_pages = max_pages.clamp(1, 10);
+        // The ruleBookInfo detail-page fallback below only applies when
+        // no bookUrlPattern is configured; skip cloning page 1's body
+        // (a whole page) when it can never be used.
+        let keep_first = source.book_url_pattern.trim().is_empty() && source.rule_book_info.is_object();
         let mut all_books: Vec<BookHit> = Vec::new();
         let mut all_js: Vec<String> = Vec::new();
         let mut raw_status: Option<u16> = None;
@@ -2210,21 +2269,23 @@ impl Engine {
             let base_url = source.base_url();
             let spec = match tokio::task::spawn_blocking(move || parse_request_rule(&template, &base_url, &keyword_owned, page, &js_lib)).await {
                 Ok(Ok(s)) => s,
-                Ok(Err(e)) => return fail(logs, format!("bad search url: {e}"), t0),
-                Err(e) => return fail(logs, format!("blocking task: {e}"), t0),
+                Ok(Err(e)) => return TestResult::fail(logs, format!("bad search url: {e}"), t0),
+                Err(e) => return TestResult::fail(logs, format!("blocking task: {e}"), t0),
             };
             let base = match Url::parse(&spec.url) {
                 Ok(u) => u,
-                Err(e) => return fail(logs, format!("bad search url: {e}"), t0),
+                Err(e) => return TestResult::fail(logs, format!("bad search url: {e}"), t0),
             };
             let (status, body) = match self.fetch_spec(source, &spec, CacheKind::Search, force_refresh, &mut logs, t0, true).await {
                 Ok(v) => v,
-                Err(e) => return fail(logs, e.to_string(), t0),
+                Err(e) => return TestResult::fail(logs, e.to_string(), t0),
             };
             if raw_status.is_none() {
                 raw_status = Some(status);
                 raw_body_truncated = Some(body.chars().take(8192).collect());
-                first_page = Some((body.clone(), spec.url.clone()));
+                if keep_first {
+                    first_page = Some((body.clone(), spec.url.clone()));
+                }
             }
             let (rule, js_lib, base_url) = (source.rule_search.clone(), source.js_lib.clone(), base.clone());
             let extracted = tokio::task::spawn_blocking(move || extract_search(&body, &rule, &base_url, &js_lib)).await;
@@ -2237,8 +2298,8 @@ impl Engine {
                     all_books.extend(books);
                     all_js.extend(js_out);
                 }
-                Ok(Err(e)) => return fail(logs, format!("extract: {e}"), t0),
-                Err(e) => return fail(logs, format!("blocking task: {e}"), t0),
+                Ok(Err(e)) => return TestResult::fail(logs, format!("extract: {e}"), t0),
+                Err(e) => return TestResult::fail(logs, format!("blocking task: {e}"), t0),
             }
         }
         // Fallback: no books at all, and the page may actually be a book
@@ -2258,16 +2319,7 @@ impl Engine {
             }
         }
         logs.push(LogEntry { level: "info".into(), module: "search".into(), msg: format!("extracted {} books", all_books.len()), ms: t0.elapsed().as_millis() as u64 });
-        TestResult {
-            ok: true,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status,
-            raw_body_truncated,
-            extracted: serde_json::to_value(&all_books).unwrap_or(Value::Null),
-            js_output: all_js,
-            error: None,
-            logs,
-        }
+        TestResult::ok(serde_json::to_value(&all_books).unwrap_or(Value::Null), all_js, raw_status, raw_body_truncated, logs, t0)
     }
 
     /// Fetch the toc, following ruleToc.nextTocUrl up to MAX_TOC_PAGES
@@ -2275,18 +2327,8 @@ impl Engine {
     pub async fn run_toc(&self, source: &SourceDef, book_url: &str, force_refresh: bool) -> TestResult {
         let t0 = std::time::Instant::now();
         let mut logs = vec![];
-        let fail = |logs: Vec<LogEntry>, err: String, t0: std::time::Instant| TestResult {
-            ok: false,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status: None,
-            raw_body_truncated: None,
-            extracted: Value::Null,
-            js_output: vec![],
-            error: Some(err),
-            logs,
-        };
         if Url::parse(book_url).is_err() {
-            return fail(logs, format!("bad book url: {book_url}"), t0);
+            return TestResult::fail(logs, format!("bad book url: {book_url}"), t0);
         }
         self.maybe_login(source, &mut logs, t0).await;
         let mut all: Vec<ChapterHit> = Vec::new();
@@ -2303,7 +2345,7 @@ impl Engine {
             let spec = RequestSpec { url: url.clone(), method: "GET".into(), body: None, headers: vec![], charset: None };
             let (status, body) = match self.fetch_spec(source, &spec, CacheKind::Toc, force_refresh, &mut logs, t0, true).await {
                 Ok(v) => v,
-                Err(e) => return fail(logs, e.to_string(), t0),
+                Err(e) => return TestResult::fail(logs, e.to_string(), t0),
             };
             if raw_status.is_none() {
                 raw_status = Some(status);
@@ -2323,21 +2365,12 @@ impl Engine {
                     }
                     url = next;
                 }
-                Ok(Err(e)) => return fail(logs, format!("extract: {e}"), t0),
-                Err(e) => return fail(logs, format!("blocking task: {e}"), t0),
+                Ok(Err(e)) => return TestResult::fail(logs, format!("extract: {e}"), t0),
+                Err(e) => return TestResult::fail(logs, format!("blocking task: {e}"), t0),
             }
         }
         logs.push(LogEntry { level: "info".into(), module: "search".into(), msg: format!("extracted {} chapters", all.len()), ms: t0.elapsed().as_millis() as u64 });
-        TestResult {
-            ok: true,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status,
-            raw_body_truncated,
-            extracted: serde_json::to_value(&all).unwrap_or(Value::Null),
-            js_output: all_js,
-            error: None,
-            logs,
-        }
+        TestResult::ok(serde_json::to_value(&all).unwrap_or(Value::Null), all_js, raw_status, raw_body_truncated, logs, t0)
     }
 
     /// Fetch the chapter, following ruleContent.nextContentUrl up to
@@ -2346,18 +2379,8 @@ impl Engine {
     pub async fn run_content(&self, source: &SourceDef, chapter_url: &str, force_refresh: bool) -> TestResult {
         let t0 = std::time::Instant::now();
         let mut logs = vec![];
-        let fail = |logs: Vec<LogEntry>, err: String, t0: std::time::Instant| TestResult {
-            ok: false,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status: None,
-            raw_body_truncated: None,
-            extracted: Value::Null,
-            js_output: vec![],
-            error: Some(err),
-            logs,
-        };
         if Url::parse(chapter_url).is_err() {
-            return fail(logs, format!("bad chapter url: {chapter_url}"), t0);
+            return TestResult::fail(logs, format!("bad chapter url: {chapter_url}"), t0);
         }
         self.maybe_login(source, &mut logs, t0).await;
         let mut all: Vec<Paragraph> = Vec::new();
@@ -2374,7 +2397,7 @@ impl Engine {
             let spec = RequestSpec { url: url.clone(), method: "GET".into(), body: None, headers: vec![], charset: None };
             let (status, body) = match self.fetch_spec(source, &spec, CacheKind::Content, force_refresh, &mut logs, t0, true).await {
                 Ok(v) => v,
-                Err(e) => return fail(logs, e.to_string(), t0),
+                Err(e) => return TestResult::fail(logs, e.to_string(), t0),
             };
             if raw_status.is_none() {
                 raw_status = Some(status);
@@ -2394,29 +2417,24 @@ impl Engine {
                     }
                     url = next;
                 }
-                Ok(Err(e)) => return fail(logs, format!("extract: {e}"), t0),
-                Err(e) => return fail(logs, format!("blocking task: {e}"), t0),
+                Ok(Err(e)) => return TestResult::fail(logs, format!("extract: {e}"), t0),
+                Err(e) => return TestResult::fail(logs, format!("blocking task: {e}"), t0),
             }
         }
         logs.push(LogEntry { level: "info".into(), module: "search".into(), msg: format!("extracted {} paragraphs", all.len()), ms: t0.elapsed().as_millis() as u64 });
-        TestResult {
-            ok: true,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-            raw_status,
-            raw_body_truncated,
-            extracted: serde_json::to_value(&all).unwrap_or(Value::Null),
-            js_output: all_js,
-            error: None,
-            logs,
-        }
+        TestResult::ok(serde_json::to_value(&all).unwrap_or(Value::Null), all_js, raw_status, raw_body_truncated, logs, t0)
     }
 }
 
-fn urlencoding(s: &str) -> String {
+/// Shared percent-encoding (unreserved ASCII kept, the rest `%XX`).
+/// `space_as_plus` is for form bodies (`application/x-www-form-urlencoded`);
+/// path segments and query values keep spaces as `%20`.
+pub(crate) fn urlencode(s: &str, space_as_plus: bool) -> String {
     let mut out = String::new();
     for b in s.as_bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+            b' ' if space_as_plus => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -2604,7 +2622,6 @@ mod tests {
         let raw = serde_json::json!({
             "bookSourceName": "test",
             "bookSourceUrl": "https://example.com",
-            "bookSourceName": "test",
             "searchUrl": "https://example.com/s?q={key}&page={page}",
             "ruleSearch": {"bookList": "div.book"}
         });
@@ -3055,7 +3072,7 @@ mod tests {
         let engine = Arc::new(Engine::new(Cache::new(db.clone())));
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         let tmp = std::env::temp_dir().join(format!("shuku-sub-test-{}", uuid::Uuid::new_v4()));
-        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), tmp.join("data")));
+        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), tmp.join("data"), crate::config::default_scan_workers()));
         let url = format!("http://127.0.0.1:{port}/subscription");
         let msg = crate::scheduler::process_refresh_subscription(&sched, &url).await.unwrap();
         assert!(msg.contains("1 imported, 1 skipped"), "msg: {msg}");
@@ -3090,7 +3107,7 @@ mod tests {
         let engine = Arc::new(Engine::new(Cache::new(db.clone())));
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         let tmp = std::env::temp_dir().join(format!("shuku-health-test-{}", uuid::Uuid::new_v4()));
-        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), tmp.join("data")));
+        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), tmp.join("data"), crate::config::default_scan_workers()));
         let msg = crate::scheduler::process_health_check(&sched, &source.id).await.unwrap();
         assert!(msg.contains("healthy"), "msg: {msg}");
         let (health, error, checked) = db.source_health(&source.id).await.unwrap().unwrap();
@@ -3127,7 +3144,7 @@ mod tests {
         let search = Arc::new(SearchIndex::open_in_ram().unwrap());
         let tmp = std::env::temp_dir().join(format!("shuku-change-test-{}", uuid::Uuid::new_v4()));
         let data_dir = tmp.join("data");
-        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), data_dir.clone()));
+        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), data_dir.clone(), crate::config::default_scan_workers()));
         // Explicit book_url: old book has 5 chapters (one more than the new
         // TOC), so the stale 5th file must be removed.
         let old_url = format!("http://127.0.0.1:{port}/toc");
@@ -3178,7 +3195,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("shuku-update-test-{}", uuid::Uuid::new_v4()));
         let data_dir = tmp.join("data");
         std::fs::create_dir_all(data_dir.join("chapters")).unwrap();
-        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), data_dir.clone()));
+        let sched = Arc::new(Scheduler::new(db.clone(), search, engine, tmp.join("books"), data_dir.clone(), crate::config::default_scan_workers()));
         // A cached book with 2 stored chapters; the fixture TOC has 4.
         let book_id = crate::scanner::book_id_for_url(&format!("http://127.0.0.1:{port}/toc-update"));
         let now = chrono::Utc::now().timestamp();

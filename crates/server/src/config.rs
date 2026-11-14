@@ -6,16 +6,15 @@ use std::path::PathBuf;
 /// an empty string) falls back to `default`; an out-of-range value is
 /// clamped instead of being silently accepted (a `SHUKU_RATE_PER_SEC=1e9`
 /// would otherwise hammer sources, `SHUKU_CACHE_MAX_MB=1e9` would OOM).
-fn env_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
-    std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok()).map(|v| v.clamp(min, max)).unwrap_or(default)
-}
-
-fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).map(|v| v.clamp(min, max)).unwrap_or(default)
-}
-
-fn env_i64(name: &str, default: i64, min: i64, max: i64) -> i64 {
-    std::env::var(name).ok().and_then(|v| v.parse::<i64>().ok()).map(|v| v.clamp(min, max)).unwrap_or(default)
+fn env_num<T>(name: &str, default: T, min: T, max: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Copy,
+{
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<T>().ok())
+        .map(|v| if v < min { min } else if v > max { max } else { v })
+        .unwrap_or(default)
 }
 
 /// String env var; an empty / whitespace-only value counts as unset
@@ -75,6 +74,35 @@ pub struct Config {
     pub task_retention_days: i64,
     /// Task history cap: max total rows across scan_tasks + crawl_tasks.
     pub task_max_rows: i64,
+    /// Parallel scan width (`SHUKU_SCAN_WORKERS`).
+    pub scan_workers: usize,
+    /// tantivy writer threads (`SHUKU_INDEX_THREADS`).
+    pub index_threads: usize,
+    /// tantivy writer heap in MiB (`SHUKU_INDEX_HEAP_MB`).
+    pub index_heap_mb: usize,
+}
+
+/// Parse + index workers share the cores, so both default to half the
+/// CPU count (1..=8): total compute threads stay near core count
+/// (measured best on 4 cores: 2 parse + 2 index; 4+4 was slower).
+fn half_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .div_ceil(2)
+        .clamp(1, 8)
+}
+
+pub(crate) fn default_scan_workers() -> usize {
+    half_cores()
+}
+
+pub(crate) fn default_index_threads() -> usize {
+    half_cores()
+}
+
+pub(crate) fn default_index_heap_mb() -> usize {
+    150
 }
 
 impl Default for Config {
@@ -98,6 +126,9 @@ impl Default for Config {
             cache_prune_interval_secs: 86_400,
             task_retention_days: 30,
             task_max_rows: 10_000,
+            scan_workers: default_scan_workers(),
+            index_threads: default_index_threads(),
+            index_heap_mb: default_index_heap_mb(),
         }
     }
 }
@@ -115,20 +146,23 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("data")),
             addr: env_str("SHUKU_ADDR").unwrap_or(d.addr),
-            rate_per_sec: env_f64("SHUKU_RATE_PER_SEC", d.rate_per_sec, 0.1, 1000.0),
-            rate_burst: env_f64("SHUKU_RATE_BURST", d.rate_burst, 1.0, 1000.0),
-            breaker_failures: env_u64("SHUKU_BREAKER_FAILURES", d.breaker_failures as u64, 1, 1000) as u32,
-            breaker_cooldown_secs: env_u64("SHUKU_BREAKER_COOLDOWN_SECS", d.breaker_cooldown_secs, 1, 86_400),
-            cache_ttl_search_secs: env_i64("SHUKU_CACHE_TTL_SEARCH_SECS", d.cache_ttl_search_secs, 0, 86_400),
-            cache_ttl_toc_secs: env_i64("SHUKU_CACHE_TTL_TOC_SECS", d.cache_ttl_toc_secs, 0, 2_592_000),
-            cache_ttl_content_secs: env_i64("SHUKU_CACHE_TTL_CONTENT_SECS", d.cache_ttl_content_secs, 0, 31_536_000),
-            update_check_interval_secs: env_u64("SHUKU_UPDATE_CHECK_INTERVAL_SECS", d.update_check_interval_secs, 60, 2_592_000),
-            source_health_interval_secs: env_u64("SHUKU_SOURCE_HEALTH_INTERVAL_SECS", d.source_health_interval_secs, 3600, 2_592_000),
-            cache_max_mb: env_i64("SHUKU_CACHE_MAX_MB", d.cache_max_mb, 16, 16_384),
-            cache_max_rows: env_i64("SHUKU_CACHE_MAX_ROWS", d.cache_max_rows, 100, 1_000_000),
-            cache_prune_interval_secs: env_u64("SHUKU_CACHE_PRUNE_INTERVAL_SECS", d.cache_prune_interval_secs, 3600, 2_592_000),
-            task_retention_days: env_i64("SHUKU_TASK_RETENTION_DAYS", d.task_retention_days, 1, 3650),
-            task_max_rows: env_i64("SHUKU_TASK_MAX_ROWS", d.task_max_rows, 100, 1_000_000),
+            rate_per_sec: env_num("SHUKU_RATE_PER_SEC", d.rate_per_sec, 0.1, 1000.0),
+            rate_burst: env_num("SHUKU_RATE_BURST", d.rate_burst, 1.0, 1000.0),
+            breaker_failures: env_num("SHUKU_BREAKER_FAILURES", d.breaker_failures as u64, 1, 1000) as u32,
+            breaker_cooldown_secs: env_num("SHUKU_BREAKER_COOLDOWN_SECS", d.breaker_cooldown_secs, 1, 86_400),
+            cache_ttl_search_secs: env_num("SHUKU_CACHE_TTL_SEARCH_SECS", d.cache_ttl_search_secs, 0, 86_400),
+            cache_ttl_toc_secs: env_num("SHUKU_CACHE_TTL_TOC_SECS", d.cache_ttl_toc_secs, 0, 2_592_000),
+            cache_ttl_content_secs: env_num("SHUKU_CACHE_TTL_CONTENT_SECS", d.cache_ttl_content_secs, 0, 31_536_000),
+            update_check_interval_secs: env_num("SHUKU_UPDATE_CHECK_INTERVAL_SECS", d.update_check_interval_secs, 60, 2_592_000),
+            source_health_interval_secs: env_num("SHUKU_SOURCE_HEALTH_INTERVAL_SECS", d.source_health_interval_secs, 3600, 2_592_000),
+            cache_max_mb: env_num("SHUKU_CACHE_MAX_MB", d.cache_max_mb, 16, 16_384),
+            cache_max_rows: env_num("SHUKU_CACHE_MAX_ROWS", d.cache_max_rows, 100, 1_000_000),
+            cache_prune_interval_secs: env_num("SHUKU_CACHE_PRUNE_INTERVAL_SECS", d.cache_prune_interval_secs, 3600, 2_592_000),
+            task_retention_days: env_num("SHUKU_TASK_RETENTION_DAYS", d.task_retention_days, 1, 3650),
+            task_max_rows: env_num("SHUKU_TASK_MAX_ROWS", d.task_max_rows, 100, 1_000_000),
+            scan_workers: env_num("SHUKU_SCAN_WORKERS", d.scan_workers, 1, 32),
+            index_threads: env_num("SHUKU_INDEX_THREADS", d.index_threads, 1, 16),
+            index_heap_mb: env_num("SHUKU_INDEX_HEAP_MB", d.index_heap_mb, 50, 2048),
         }
     }
 
@@ -170,6 +204,33 @@ mod tests {
         assert_eq!(c.breaker_failures, 3);
         assert_eq!(c.cache_ttl_search_secs, 5);
         assert_eq!(c.cache_ttl_toc_secs, 600, "unset vars keep defaults");
+    }
+
+    #[test]
+    fn scan_and_index_vars() {
+        std::env::set_var("SHUKU_SCAN_WORKERS", "3");
+        std::env::set_var("SHUKU_INDEX_THREADS", "2");
+        std::env::set_var("SHUKU_INDEX_HEAP_MB", "200");
+        let c = Config::from_env();
+        std::env::remove_var("SHUKU_SCAN_WORKERS");
+        std::env::remove_var("SHUKU_INDEX_THREADS");
+        std::env::remove_var("SHUKU_INDEX_HEAP_MB");
+        assert_eq!(c.scan_workers, 3);
+        assert_eq!(c.index_threads, 2);
+        assert_eq!(c.index_heap_mb, 200);
+        // Out-of-range values clamp instead of failing startup.
+        std::env::set_var("SHUKU_SCAN_WORKERS", "99");
+        std::env::set_var("SHUKU_INDEX_HEAP_MB", "1");
+        let c = Config::from_env();
+        std::env::remove_var("SHUKU_SCAN_WORKERS");
+        std::env::remove_var("SHUKU_INDEX_HEAP_MB");
+        assert_eq!(c.scan_workers, 32);
+        assert_eq!(c.index_heap_mb, 50);
+        // Unset: half the cores (1..=8) and 150 MiB heap.
+        let c = Config::from_env();
+        assert!((1..=8).contains(&c.scan_workers));
+        assert!((1..=8).contains(&c.index_threads));
+        assert_eq!(c.index_heap_mb, 150);
     }
 
     #[test]

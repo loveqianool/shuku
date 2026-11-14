@@ -79,12 +79,12 @@ impl ChapterCache {
         Some(chapters)
     }
 
-    pub fn put(&self, book_id: String, mtime: i64, chapters: Vec<String>) {
+    pub fn put(&self, book_id: String, mtime: i64, chapters: Arc<Vec<String>>) {
         let Ok(mut inner) = self.inner.lock() else { return };
         if inner.map.contains_key(&book_id) {
             inner.order.retain(|k| k != &book_id);
         }
-        inner.map.insert(book_id.clone(), (mtime, Arc::new(chapters)));
+        inner.map.insert(book_id.clone(), (mtime, chapters));
         inner.order.push_back(book_id);
         while inner.map.len() > self.max_books {
             match inner.order.pop_front() {
@@ -158,6 +158,19 @@ impl PageQuery {
 
 fn page_envelope<T: Serialize>(items: Vec<T>, total: i64, page: i64, page_size: i64) -> Json<Value> {
     Json(json!({ "items": items, "total": total, "page": page, "page_size": page_size }))
+}
+
+/// The list/search query structs each carry `page`/`page_size` and expose
+/// them as a `PageQuery`. (Do NOT use `#[serde(flatten)]` here: it made
+/// `?page_size=1` fail with 400 — see the integration test.)
+macro_rules! impl_pq {
+    ($t:ty) => {
+        impl $t {
+            fn pq(&self) -> PageQuery {
+                PageQuery { page: self.page, page_size: self.page_size }
+            }
+        }
+    };
 }
 
 pub fn router(state: AppState) -> Router {
@@ -237,11 +250,7 @@ pub struct BookListQuery {
     pub page_size: Option<i64>,
 }
 
-impl BookListQuery {
-    fn pq(&self) -> PageQuery {
-        PageQuery { page: self.page, page_size: self.page_size }
-    }
-}
+impl_pq!(BookListQuery);
 
 async fn list_books(State(s): State<AppState>, Query(q): Query<BookListQuery>) -> ApiResult<Json<Value>> {
     let (page, page_size) = (q.pq().page(), q.pq().page_size());
@@ -276,19 +285,27 @@ async fn list_recent_books(State(s): State<AppState>) -> ApiResult<Json<Value>> 
 
 async fn get_book(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let book = s.db.get_book(&id).await?.ok_or_else(|| ApiError::not_found(format!("book not found: {id}")))?;
-    let tags = s.db.list_tags(&id).await.unwrap_or_default();
-    let progress = s.db.get_progress(&id).await.ok().flatten();
-    Ok(Json(json!({
-        "id": book.id, "title": book.title, "author": book.author,
-        "path": book.path, "source_url": book.source_url, "source": book.source,
-        "status": book.status, "chapter_count": book.chapter_count,
-        "has_update": book.has_update, "last_update_check": book.last_update_check,
-        "cover_mime": book.cover_mime,
-        "mtime": book.mtime, "size": book.size, "index_version": book.index_version,
-        "created_at": book.created_at, "updated_at": book.updated_at,
-        "tags": tags,
-        "progress": progress.map(|(c, o)| json!({"chapter_idx": c, "offset": o})),
-    })))
+    // A DB error here is a 500, not "no tags / no progress": the old
+    // unwrap_or_default / ok().flatten() made errors indistinguishable
+    // from genuinely empty results.
+    let tags = s.db.list_tags(&id).await?;
+    let progress = s.db.get_progress(&id).await?;
+    // BookRow already derives Serialize: build the object from it instead
+    // of hand-writing all 16 fields (they drifted apart before).
+    let mut v = serde_json::to_value(&book)?;
+    if let Some(obj) = v.as_object_mut() {
+        // The old hand-built object did not expose source_id; keep the
+        // response shape unchanged.
+        obj.remove("source_id");
+        obj.insert("tags".to_string(), serde_json::json!(tags));
+        obj.insert(
+            "progress".to_string(),
+            progress
+                .map(|(c, o)| json!({"chapter_idx": c, "offset": o}))
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    Ok(Json(v))
 }
 
 async fn list_duplicates(State(s): State<AppState>) -> ApiResult<Json<Value>> {
@@ -304,16 +321,25 @@ async fn delete_book(State(s): State<AppState>, Path(id): Path<String>) -> ApiRe
         // a stale index doc or leftover file is harmless and gets
         // rebuilt/cleaned on the next scan. Failures are logged (not
         // swallowed) so a broken index dir or permission problem is visible.
-        let id_num: u64 = id.parse().unwrap_or(0);
-        let search = s.search.clone();
-        // spawn_blocking gives Result<Result<()>, JoinError>: flatten both
-        // layers so an index failure is logged, not silently dropped.
-        let idx_res = tokio::task::spawn_blocking(move || search.delete_book(id_num))
-            .await
-            .map_err(|e| anyhow::anyhow!("join: {e}"))
-            .and_then(|r| r);
-        if let Err(e) = idx_res {
-            tracing::warn!(book_id = %id, error = %e, "delete_book: index cleanup failed");
+        // A non-numeric id can never be a tantivy book id (ids are FNV
+        // u64s): skip the index cleanup instead of silently cleaning up
+        // the unrelated book 0.
+        match id.parse::<u64>() {
+            Ok(id_num) => {
+                let search = s.search.clone();
+                // spawn_blocking gives Result<Result<()>, JoinError>: flatten both
+                // layers so an index failure is logged, not silently dropped.
+                let idx_res = tokio::task::spawn_blocking(move || search.delete_book(id_num))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("join: {e}"))
+                    .and_then(|r| r);
+                if let Err(e) = idx_res {
+                    tracing::warn!(book_id = %id, error = %e, "delete_book: index cleanup failed");
+                }
+            }
+            Err(_) => {
+                tracing::warn!(book_id = %id, "delete_book: non-numeric id, skipping index cleanup");
+            }
         }
         if let Err(e) = std::fs::remove_dir_all(s.config.data_dir.join("chapters").join(&id)) {
             tracing::warn!(book_id = %id, error = %e, "delete_book: chapter files cleanup failed");
@@ -344,7 +370,15 @@ async fn get_chapter(State(s): State<AppState>, Path((id, idx)): Path<(String, i
     let (text, reflow): (String, bool) = if book.source == "cached" {
         // Cached network book: per-chapter text file.
         let f = s.config.chapter_file(&id, idx as usize);
-        let text = tokio::fs::read_to_string(&f).await.unwrap_or_default();
+        let text = match tokio::fs::read_to_string(&f).await {
+            Ok(t) => t,
+            // A cached book with a missing chapter file is an empty
+            // chapter, not a 500 — but log it instead of swallowing it.
+            Err(e) => {
+                tracing::warn!(book_id = %id, chapter = idx, "cached chapter file unreadable: {e}");
+                String::new()
+            }
+        };
         // 缓存的网络书是纯文本（可能带硬换行），做断行合并。
         (text, true)
     } else {
@@ -368,9 +402,14 @@ async fn get_chapter(State(s): State<AppState>, Path((id, idx)): Path<(String, i
             Some(cached) => cached,
             None => {
                 let parsed = tokio::task::spawn_blocking(move || parser::parse_book_file(&path)).await??;
-                let texts: Vec<String> = parsed.chapters.into_iter().map(|c| c.text).collect();
+                // Arc first, then clone the Arc into the cache: the old
+                // code cloned the whole Vec<String> (the full book text)
+                // before Arc::new, so every cold chapter read copied
+                // the book once for no reason.
+                let texts: Arc<Vec<String>> =
+                    Arc::new(parsed.chapters.into_iter().map(|c| c.text).collect());
                 s.chapter_cache.put(id.clone(), mtime, texts.clone());
-                Arc::new(texts)
+                texts
             }
         };
         let ch_text = texts.get(idx_usize).ok_or_else(|| anyhow!("chapter {idx} out of range"))?;
@@ -448,11 +487,7 @@ pub struct SearchQuery {
     pub page_size: Option<i64>,
 }
 
-impl SearchQuery {
-    fn pq(&self) -> PageQuery {
-        PageQuery { page: self.page, page_size: self.page_size }
-    }
-}
+impl_pq!(SearchQuery);
 
 async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> ApiResult<Json<Value>> {
     if q.q.trim().is_empty() {
@@ -505,23 +540,26 @@ async fn suggest(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> Api
         return Ok(Json(json!({ "items": [] })));
     }
     // Primary: title/author/pinyin matches via tantivy (jieba + pinyin),
-    // in relevance order.
-    let mut items: Vec<BookRow> = vec![];
+    // in relevance order; then top up from the full-text index (which
+    // also covers chapter-content matches). Collect the ids first, fetch
+    // the rows in ONE batch query, then restore tantivy order in memory
+    // (list_books_by_ids sorts by title/updated, not by relevance).
+    let mut ordered_ids: Vec<u64> = vec![];
     let query = term.clone();
     let search = s.search.clone();
     if let Ok(Ok(ids)) =
         tokio::task::spawn_blocking(move || search.search_book_ids(&query, 8)).await
     {
         for id in ids {
-            if items.len() >= 8 {
+            if ordered_ids.len() >= 8 {
                 break;
             }
-            if let Ok(Some(b)) = s.db.get_book(&id.to_string()).await {
-                items.push(b);
+            if !ordered_ids.contains(&id) {
+                ordered_ids.push(id);
             }
         }
     }
-    if items.len() < 8 {
+    if ordered_ids.len() < 8 {
         // Full-text top-up: dedupe by book, keep tantivy title order first.
         let query = term.clone();
         let search = s.search.clone();
@@ -529,18 +567,27 @@ async fn suggest(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> Api
             tokio::task::spawn_blocking(move || search.search(&query, None, None, 20, 0)).await
         {
             for h in hits {
-                if items.len() >= 8 {
+                if ordered_ids.len() >= 8 {
                     break;
                 }
-                if items.iter().any(|b: &BookRow| b.id == h.book_id) {
-                    continue;
-                }
-                if let Ok(Some(b)) = s.db.get_book(&h.book_id).await {
-                    items.push(b);
+                if let Ok(n) = h.book_id.parse::<u64>() {
+                    if !ordered_ids.contains(&n) {
+                        ordered_ids.push(n);
+                    }
                 }
             }
         }
     }
+    let items: Vec<BookRow> = if ordered_ids.is_empty() {
+        vec![]
+    } else {
+        let (rows, _) = s.db.list_books_by_ids(ordered_ids.clone(), None, None, "title", 1, 8).await?;
+        let by_id: std::collections::HashMap<u64, BookRow> = rows
+            .into_iter()
+            .filter_map(|b| b.id.parse::<u64>().ok().map(|n| (n, b)))
+            .collect();
+        ordered_ids.iter().filter_map(|id| by_id.get(id)).cloned().collect()
+    };
     Ok(Json(json!({
         "items": items.iter().map(|b| json!({
             "id": b.id, "title": b.title, "author": b.author,
@@ -553,21 +600,10 @@ async fn suggest(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> Api
 // ---------------------------------------------------------------------------
 
 async fn list_sources(State(s): State<AppState>) -> ApiResult<Json<Value>> {
-    let mut items = s.db.list_sources().await?;
-    for item in &mut items {
-        if let Some(id) = item.get("bookSourceUrl").and_then(|v| v.as_str()).map(|x| x.to_string()) {
-            if let Some((health, error, checked)) = s.db.source_health(&id).await? {
-                item["health"] = json!(health);
-                item["healthError"] = json!(error);
-                item["lastCheckTime"] = json!(checked);
-            }
-            if let Some((sub_url, _)) = s.db.get_source_subscription(&id).await? {
-                if !sub_url.is_empty() {
-                    item["subscriptionUrl"] = json!(sub_url);
-                }
-            }
-        }
-    }
+    // One query: health + subscription columns are inlined by
+    // list_sources_with_meta (the old code issued two extra queries per
+    // source).
+    let items = s.db.list_sources_with_meta().await?;
     let total = items.len();
     Ok(Json(json!({ "items": items, "total": total })))
 }
@@ -823,11 +859,7 @@ pub struct TaskListQuery {
     pub page_size: Option<i64>,
 }
 
-impl TaskListQuery {
-    fn pq(&self) -> PageQuery {
-        PageQuery { page: self.page, page_size: self.page_size }
-    }
-}
+impl_pq!(TaskListQuery);
 
 async fn list_tasks(State(s): State<AppState>, Query(q): Query<TaskListQuery>) -> ApiResult<Json<Value>> {
     let (items, total) = match q.r#type.as_deref() {
@@ -887,21 +919,17 @@ async fn check_book_chapters(State(s): State<AppState>, Path(id): Path<String>) 
     let titles = s.db.list_chapter_titles(&id).await?;
     let mut issues = crate::chapter_check::detect_gaps(&titles);
     if book.source == "cached" {
-        for (idx, title) in &titles {
-            let f = s.config.chapter_file(&id, *idx as usize);
-            let empty = match tokio::fs::metadata(&f).await {
+        // Sync stat (a few microseconds per file) instead of an async
+        // one: the shared helper takes a plain predicate.
+        let data_dir = s.config.data_dir.clone();
+        let book_id = id.clone();
+        issues.extend(crate::chapter_check::empty_file_issues(&titles, |idx| {
+            let f = data_dir.join("chapters").join(&book_id).join(format!("{idx}.txt"));
+            match std::fs::metadata(&f) {
                 Ok(m) => m.len() == 0,
                 Err(_) => true, // missing file = missing chapter
-            };
-            if empty {
-                issues.push(ChapterIssue {
-                    idx: *idx,
-                    title: title.clone(),
-                    kind: "empty".into(),
-                    detail: "章节文件为空或缺失（抓取失败）".into(),
-                });
             }
-        }
+        }));
     } else if let Some(path) = book.path.clone() {
         // Local book: parse once, flag chapters with no body text.
         let parsed = tokio::task::spawn_blocking(move || {
@@ -1029,22 +1057,25 @@ async fn find_task_table(s: &AppState, id: &str) -> ApiResult<Option<&'static st
     Ok(None)
 }
 
-async fn retry_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let table = find_task_table(&s, &id).await?.ok_or_else(|| ApiError::not_found(format!("task not found: {id}")))?;
-    s.db.set_task_status(table, &id, "pending").await?;
+/// Shared body of retry / pause / resume: find the task's table, set the
+/// status. (Retry and resume both set "pending" — the bodies were
+/// identical except for the status word.)
+async fn set_task_status_handler(s: &AppState, id: &str, status: &'static str) -> ApiResult<Json<Value>> {
+    let table = find_task_table(s, id).await?.ok_or_else(|| ApiError::not_found(format!("task not found: {id}")))?;
+    s.db.set_task_status(table, id, status).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn retry_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    set_task_status_handler(&s, &id, "pending").await
 }
 
 async fn pause_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let table = find_task_table(&s, &id).await?.ok_or_else(|| ApiError::not_found(format!("task not found: {id}")))?;
-    s.db.set_task_status(table, &id, "paused").await?;
-    Ok(Json(json!({ "ok": true })))
+    set_task_status_handler(&s, &id, "paused").await
 }
 
 async fn resume_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let table = find_task_table(&s, &id).await?.ok_or_else(|| ApiError::not_found(format!("task not found: {id}")))?;
-    s.db.set_task_status(table, &id, "pending").await?;
-    Ok(Json(json!({ "ok": true })))
+    set_task_status_handler(&s, &id, "pending").await
 }
 
 async fn task_stats(State(s): State<AppState>) -> ApiResult<Json<Value>> {
@@ -1069,7 +1100,7 @@ mod tests {
     fn chapter_cache_hit_miss_and_mtime_invalidation() {
         let cache = ChapterCache::new(2);
         assert!(cache.get("b1", 100).is_none());
-        cache.put("b1".to_string(), 100, vec!["c1".to_string(), "c2".to_string()]);
+        cache.put("b1".to_string(), 100, Arc::new(vec!["c1".to_string(), "c2".to_string()]));
         assert_eq!(cache.get("b1", 100).unwrap().len(), 2);
         // Same book, different mtime (file changed) -> miss, entry dropped.
         assert!(cache.get("b1", 101).is_none());
@@ -1079,11 +1110,11 @@ mod tests {
     #[test]
     fn chapter_cache_evicts_least_recently_used() {
         let cache = ChapterCache::new(2);
-        cache.put("b1".to_string(), 1, vec!["x".to_string()]);
-        cache.put("b2".to_string(), 1, vec!["x".to_string()]);
+        cache.put("b1".to_string(), 1, Arc::new(vec!["x".to_string()]));
+        cache.put("b2".to_string(), 1, Arc::new(vec!["x".to_string()]));
         // Touch b1 so b2 becomes the least recently used.
         assert!(cache.get("b1", 1).is_some());
-        cache.put("b3".to_string(), 1, vec!["x".to_string()]);
+        cache.put("b3".to_string(), 1, Arc::new(vec!["x".to_string()]));
         assert!(cache.get("b1", 1).is_some());
         assert!(cache.get("b2", 1).is_none());
         assert!(cache.get("b3", 1).is_some());

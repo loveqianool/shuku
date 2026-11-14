@@ -188,7 +188,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     // 默认 15 秒超时：以前没设 signal，网络挂住时请求永远不回，
     // 前端一直转圈。调用方自带 signal 时不覆盖。
     signal: init?.signal ?? AbortSignal.timeout(15000),
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    // 只在有 body 时发 Content-Type: application/json；以前 GET 也带，
+    // 无意义且可能触发不必要的 CORS 预检。
+    headers: { ...(init?.body ? { "Content-Type": "application/json" } : {}), ...(init?.headers ?? {}) },
   });
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -212,8 +214,6 @@ const qs = (o: Record<string, string | number | undefined>) =>
     .join("&");
 
 export const api = {
-  health: () => req<{ ok: boolean; version?: string }>("/api/health"),
-
   listBooks: (p: { q?: string; author?: string; tag?: string; sort?: string; page?: number; page_size?: number }) =>
     req<Page<Book>>("/api/books" + qs(p)),
   recentBooks: () => req<{ items: RecentBook[] }>("/api/books/recent"),
@@ -239,11 +239,7 @@ export const api = {
   deleteSource: (id: string) => req<void>(`/api/sources/${encodeURIComponent(id)}`, { method: "DELETE" }),
   importSources: (sources: Source[]) =>
     req<{ imported?: number }>("/api/sources/import", { method: "POST", body: JSON.stringify({ sources }) }),
-  exportSources: async (): Promise<Source[]> => {
-    const res = await fetch("/api/sources/export");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return (await res.json()) as Source[];
-  },
+  exportSources: () => req<Source[]>("/api/sources/export"),
   testSource: (id: string, body: { kind: TestKind; keyword?: string; book_url?: string; chapter_url?: string; force_refresh?: boolean; page?: number; max_pages?: number }) =>
     req<TestResult>(`/api/sources/${encodeURIComponent(id)}/test`, { method: "POST", body: JSON.stringify(body) }),
   healthCheck: (id: string) =>

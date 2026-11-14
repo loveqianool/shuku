@@ -12,7 +12,7 @@ cargo build --release
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-> 前端 dist 在构建期嵌入：`frontend/dist` 存在时由 `include_dir` 打包进二进制；不存在时编译仍通过，但只提供占位页（见 `crates/server/BUILD_NOTES.md`）。
+> 前端 dist 在构建期嵌入：`frontend/dist` 存在时由 `include_dir` 打包进二进制；不存在时编译仍通过，但只提供占位页（见 `docs/CHANGELOG.md`）。
 
 ## 运行
 
@@ -23,15 +23,14 @@ SHUKU_ADDR=0.0.0.0:8080 \
 ./target/release/shuku
 ```
 
-环境变量：
+环境变量（最常用 4 个；完整列表见 `docs/API.md`）：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `SHUKU_BOOKS_DIR` | `./books` | 本地 epub/txt 书库目录（递归扫描） |
-| `SHUKU_DATA_DIR` | `./data` | SQLite + tantivy 索引 + 缓存章节文件 |
+| `SHUKU_HOME` | `.` | 服务根目录；书库在 `$SHUKU_HOME/books`，数据在 `$SHUKU_HOME/data` |
+| `SHUKU_BOOKS_DIR` | `$SHUKU_HOME/books` | 本地 epub/txt 书库目录（递归扫描） |
+| `SHUKU_DATA_DIR` | `$SHUKU_HOME/data` | SQLite + tantivy 索引 + 缓存章节文件 |
 | `SHUKU_ADDR` | `0.0.0.0:8080` | 监听地址 |
-| `SHUKU_HTTP_PROXY` / `SHUKU_SOCKS_PROXY` | — | 书源抓取代理（可选） |
-| `RUST_LOG` | `shuku=info` | 日志级别 |
 
 首次启动会自动增量扫描书库并建索引；后续文件变动由 notify 监听 + 周期扫描补齐。
 

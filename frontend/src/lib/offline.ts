@@ -82,7 +82,12 @@ export async function deleteOfflineBook(bookId: string, total: number): Promise<
       caches.open(META_CACHE),
     ]);
     const base = `/api/books/${encodeURIComponent(bookId)}`;
-    for (let i = 0; i < total; i++) await chapters.delete(chapterUrl(bookId, i));
+    // 章节删除分批并行（每批 100 个）；以前逐章串行 await，几千章的
+    // 书就是几千次串行 Cache 操作。
+    const urls = Array.from({ length: total }, (_, i) => chapterUrl(bookId, i));
+    for (let i = 0; i < urls.length; i += 100) {
+      await Promise.all(urls.slice(i, i + 100).map((u) => chapters.delete(u)));
+    }
     const imgKeys = await images.keys();
     for (const req of imgKeys) {
       if (new URL(req.url).pathname.startsWith(`${base}/`)) await images.delete(req);

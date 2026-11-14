@@ -23,6 +23,22 @@ use source::Engine;
 use std::sync::Arc;
 use tracing::info;
 
+/// Lock a Mutex, recovering the inner value when a previous holder
+/// panicked: a poisoned lock must not turn one panic into a permanent
+/// outage for every later caller (the old `.lock().unwrap()` did).
+pub(crate) fn lock_or_poisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Same recovery for RwLock readers / writers.
+pub(crate) fn rw_read_or_poisoned<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn rw_write_or_poisoned<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|e| e.into_inner())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -38,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(cfg.data_dir.join("chapters"))?;
 
     let database = Database::open(&cfg.db_path()).await?;
-    let search = Arc::new(SearchIndex::open(&cfg.index_path())?);
+    let search = Arc::new(SearchIndex::open(&cfg.index_path(), cfg.index_threads, cfg.index_heap_mb)?);
     let cache = Cache::with_ttls(
         database.clone(),
         cfg.cache_ttl_search_secs,
@@ -58,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         engine.clone(),
         cfg.books_dir.clone(),
         cfg.data_dir.clone(),
+        cfg.scan_workers,
     ));
 
     // Background workers: two independent SQLite-driven queues.

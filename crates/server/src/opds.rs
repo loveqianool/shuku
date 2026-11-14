@@ -95,11 +95,22 @@ pub fn navigation_feed(title: &str, self_href: &str, links: &[(String, String)])
     s
 }
 
-fn book_mime(book: &BookRow) -> &'static str {
-    match book.path.as_deref().unwrap_or("") {
-        p if p.ends_with(".epub") => "application/epub+zip",
+/// MIME for a book file by extension: epub is its own type, everything
+/// else is served as plain text. Shared by `book_mime` and `download`.
+fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "epub" => "application/epub+zip",
         _ => "text/plain; charset=utf-8",
     }
+}
+
+fn book_mime(book: &BookRow) -> &'static str {
+    let ext = book
+        .path
+        .as_deref()
+        .map(|p| std::path::Path::new(p).extension().and_then(|e| e.to_str()).unwrap_or("txt"))
+        .unwrap_or("txt");
+    mime_for_ext(ext)
 }
 
 fn book_entry(book: &BookRow) -> String {
@@ -137,7 +148,8 @@ pub fn acquisition_feed(
         "<opds:totalResults>{}</opds:totalResults>\n<opds:itemsPerPage>{}</opds:itemsPerPage>\n",
         total, page_size
     ));
-    let base = self_href.split('?').next().unwrap_or(self_href);
+    // split('?') always yields at least one item.
+    let base = self_href.split('?').next().unwrap();
     let last_page = (total.max(0) + page_size - 1) / page_size;
     let link = |rel: &str, p: i64| {
         format!(
@@ -210,40 +222,34 @@ async fn authors(State(s): State<AppState>) -> ApiResult<impl IntoResponse> {
         .map(|(a, n)| {
             (
                 format!("{a} ({n})"),
-                format!("/opds/authors/{}", urlencoding(a)),
+                format!("/opds/authors/{}", crate::source::urlencode(a, false)),
             )
         })
         .collect();
     Ok(atom(NAV_CT, navigation_feed("按作者", "/opds/authors", &links)))
 }
 
-fn urlencoding(s: &str) -> String {
-    // Minimal percent-encoding for a path segment (UTF-8 bytes, keep
-    // unreserved ASCII). Avoids a new dependency for one call.
-    let mut out = String::new();
-    for b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 async fn author_books(
     State(s): State<AppState>,
     Path(author): Path<String>,
+    Query(q): Query<PageQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let items = s.db.books_by_author(&author).await?;
-    let total = items.len() as i64;
+    let page = page_of(&q);
+    // Exact author match (unlike list_books' substring author filter),
+    // so the whole author list is fetched and paged in memory; total
+    // stays the full count.
+    let all = s.db.books_by_author(&author).await?;
+    let total = all.len() as i64;
+    let start = ((page - 1) * PAGE_SIZE).max(0) as usize;
+    let items: Vec<BookRow> = all.into_iter().skip(start).take(PAGE_SIZE as usize).collect();
     Ok(atom(
         ACQ_CT,
         acquisition_feed(
             &format!("{author} 的书"),
-            &format!("/opds/authors/{}", urlencoding(&author)),
+            &format!("/opds/authors/{}?page={page}", crate::source::urlencode(&author, false)),
             &items,
             total,
-            1,
+            page,
             PAGE_SIZE,
         ),
     ))
@@ -276,7 +282,7 @@ async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> ApiR
         ACQ_CT,
         acquisition_feed(
             &format!("搜索：{term}"),
-            &format!("/opds/search?q={}", urlencoding(&term)),
+            &format!("/opds/search?q={}", crate::source::urlencode(&term, false)),
             &items,
             total,
             1,
@@ -303,12 +309,23 @@ async fn download(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
         .await?
         .ok_or_else(|| anyhow!("book not found: {id}"))?;
     let (bytes, mime, filename) = if book.source == "cached" {
-        // Rebuild a .txt from the per-chapter files.
+        // Rebuild a .txt from the per-chapter files. Titles come from
+        // one query up front (was one query per chapter).
+        let titles: std::collections::HashMap<i64, String> =
+            s.db.list_chapter_titles(&id).await?.into_iter().collect();
         let mut text = String::new();
         for idx in 0..book.chapter_count.max(0) {
             let f = s.config.chapter_file(&id, idx as usize);
-            let raw = tokio::fs::read_to_string(&f).await.unwrap_or_default();
-            let title = s.db.get_chapter_title(&id, idx).await?.unwrap_or_default();
+            let raw = match tokio::fs::read_to_string(&f).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // A missing chapter file used to be silently empty;
+                    // still serve empty text, but say so in the log.
+                    tracing::warn!(book_id = %id, chapter = idx, "download: chapter file unreadable, using empty text: {e}");
+                    String::new()
+                }
+            };
+            let title = titles.get(&idx).cloned().unwrap_or_default();
             if !title.is_empty() {
                 text.push_str(&title);
                 text.push_str("\n\n");
@@ -334,10 +351,7 @@ async fn download(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("txt");
-        let mime = match ext {
-            "epub" => "application/epub+zip",
-            _ => "text/plain; charset=utf-8",
-        };
+        let mime = mime_for_ext(ext);
         let bytes = tokio::fs::read(&path).await.map_err(|e| anyhow!("read {path}: {e}"))?;
         let filename = std::path::Path::new(&path)
             .file_name()

@@ -1,4 +1,4 @@
-import { createSignal, For, Show, type Component } from "solid-js";
+import { createSignal, For, Show, onMount, type Component } from "solid-js";
 import { api, type BookWithIssues, type TaskItem, type TaskStats } from "../lib/api";
 
 const Tasks: Component = () => {
@@ -22,6 +22,7 @@ const Tasks: Component = () => {
       setTasks(t.items);
       setTotal(t.total);
       setPage(1);
+      setStats(s);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -32,7 +33,7 @@ const Tasks: Component = () => {
       /* 缺章列表失败不影响任务页 */
     }
   };
-  refresh();
+  onMount(refresh);
 
   // 加载更多：下一页追加到列表（刷新/换筛选条件时回到第 1 页）。
   const loadMore = async () => {

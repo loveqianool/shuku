@@ -83,8 +83,6 @@ fn resolve_epub_path(base_dir: &Path, src: &str) -> String {
 // Variant（改中文字形，有搜索风险）、Unicode 转义（txt 里罕见）、
 // Chapter/Separator/SerialNumber/English/End（结构类，与段落展示无关）。
 
-static PUNCT_MAP: &[(char, char)] = &[('-', '—'), ('︐', '，'), ('︑', '、'), ('︒', '。'), ('︓', '：'), ('︔', '；'), ('︕', '！'), ('︖', '？'), ('‛', '`'), ('｀', '`'), ('‐', '—'), ('━', '—'), ('―', '—'), ('─', '—'), ('ー', '—'), ('ˉ', '—'), ('﹣', '－'), ('~', '～'), ('〜', '～'), ('∽', '～'), ('∼', '～'), ('⁓', '～'), ('﹗', '！'), ('!', '！'), ('﹫', '@'), ('＠', '@'), ('﹟', '#'), ('＃', '#'), ('﹩', '$'), ('＄', '$'), ('﹪', '%'), ('％', '%'), ('﹠', '&'), ('＆', '&'), ('﹡', '＊'), ('ꁘ', '＊'), ('(', '（'), ('﹙', '（'), ('﹚', '）'), (')', '）'), ('﹐', '，'), (',', '，'), ('｡', '。'), ('.', '。'), ('．', '。'), ('∶', '：'), ('﹕', '：'), ('︰', '：'), (':', '：'), ('﹔', '；'), (';', '；'), ('､', '、'), ('丶', '、'), ('﹑', '、'), ('﹖', '？'), ('?', '？'), ('⋯', '…'), ('┅', '…'), ('¨', '…'), ('▪', '·'), ('•', '·'), ('‧', '·'), ('・', '·'), ('﹒', '·'), ('ꔷ', '·'), ('︳', '〉'), ('﹛', '｛'), ('﹜', '｝'), ('{', '｛'), ('}', '｝'), ('〝', '“'), ('〞', '”'), ('｢', '“'), ('″', '”'), ('〃', '”'), ('｣', '”'), ('‴', '”'), ('⌈', '「'), ('⌋', '」'), ('﹤', '＜'), ('﹥', '＞'), ('︿', '∧'), ('﹀', '∨'), ('＾', '^'), ('﹦', '='), ('＝', '='), ('﹢', '+'), ('＋', '+'), ('／', '/'), ('﹨', '\\'), ('＼', '\\'), ('｜', '|'), ('︱', '|'), ('¦', '|'), ('‖', '|'), ('＂', '"'), ('‟', '"'), ('′', '\''), ('＇', '\''), ];
-
 /// 全角数字字母 → 半角（vvsolo NumberLetter；全角区与半角区固定差 0xFEE0）。
 fn fullwidth_alnum_to_half(c: char) -> char {
     let u = c as u32;
@@ -100,7 +98,11 @@ fn normalize_number_letter(text: &str) -> String {
 }
 
 static PUNCT_MAP_LOOKUP: LazyLock<std::collections::HashMap<char, char>> =
-    LazyLock::new(|| PUNCT_MAP.iter().copied().collect());
+    // The pairs live here: their only use is building this table.
+    LazyLock::new(|| [('-', '—'), ('︐', '，'), ('︑', '、'), ('︒', '。'), ('︓', '：'), ('︔', '；'), ('︕', '！'), ('︖', '？'), ('‛', '`'), ('｀', '`'), ('‐', '—'), ('━', '—'), ('―', '—'), ('─', '—'), ('ー', '—'), ('ˉ', '—'), ('﹣', '－'), ('~', '～'), ('〜', '～'), ('∽', '～'), ('∼', '～'), ('⁓', '～'), ('﹗', '！'), ('!', '！'), ('﹫', '@'), ('＠', '@'), ('﹟', '#'), ('＃', '#'), ('﹩', '$'), ('＄', '$'), ('﹪', '%'), ('％', '%'), ('﹠', '&'), ('＆', '&'), ('﹡', '＊'), ('ꁘ', '＊'), ('(', '（'), ('﹙', '（'), ('﹚', '）'), (')', '）'), ('﹐', '，'), (',', '，'), ('｡', '。'), ('.', '。'), ('．', '。'), ('∶', '：'), ('﹕', '：'), ('︰', '：'), (':', '：'), ('﹔', '；'), (';', '；'), ('､', '、'), ('丶', '、'), ('﹑', '、'), ('﹖', '？'), ('?', '？'), ('⋯', '…'), ('┅', '…'), ('¨', '…'), ('▪', '·'), ('•', '·'), ('‧', '·'), ('・', '·'), ('﹒', '·'), ('ꔷ', '·'), ('︳', '〉'), ('﹛', '｛'), ('﹜', '｝'), ('{', '｛'), ('}', '｝'), ('〝', '“'), ('〞', '”'), ('｢', '“'), ('″', '”'), ('〃', '”'), ('｣', '”'), ('‴', '”'), ('⌈', '「'), ('⌋', '」'), ('﹤', '＜'), ('﹥', '＞'), ('︿', '∧'), ('﹀', '∨'), ('＾', '^'), ('﹦', '='), ('＝', '='), ('﹢', '+'), ('＋', '+'), ('／', '/'), ('﹨', '\\'), ('＼', '\\'), ('｜', '|'), ('︱', '|'), ('¦', '|'), ('‖', '|'), ('＂', '"'), ('‟', '"'), ('′', '\''), ('＇', '\''), ]
+        .iter()
+        .copied()
+        .collect());
 
 static PUNCT_R2A: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"…[，；：、。·`～—？！]+").unwrap()
@@ -134,22 +136,22 @@ static PUNCT_R13: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[？！]{2,}")
 /// vvsolo Punctuation R1：连续相同的标点（·、`°—－～：；（）［］｛｝%∧∨〈〉《》）
 /// 合并———－～ 成对化，·、`° → ……，其余留单个。
 fn merge_repeated_punct(text: &str) -> String {
-    let set = "·、`°—－～：；（）［］｛｝%∧∨〈〉《》";
+    // Repeated-punctuation set (was `str::contains`, a linear scan per char).
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if set.contains(c) {
+        if matches!(c, '·' | '、' | '`' | '°' | '—' | '－' | '～' | '：' | '；' | '（' | '）' | '［' | '］' | '｛' | '｝' | '%' | '∧' | '∨' | '〈' | '〉' | '《' | '》') {
             let mut j = i + 1;
             while j < chars.len() && chars[j] == c {
                 j += 1;
             }
             if j - i > 1 {
-                if "—－～".contains(c) {
+                if matches!(c, '—' | '－' | '～') {
                     out.push(c);
                     out.push(c);
-                } else if "·、`°".contains(c) {
+                } else if matches!(c, '·' | '、' | '`' | '°') {
                     out.push_str("……");
                 } else {
                     out.push(c);
@@ -166,46 +168,62 @@ fn merge_repeated_punct(text: &str) -> String {
     out
 }
 
-/// vvsolo Punctuation：先按 PUNCT_MAP 把半角/异体标点逐字映射为全角，
+/// vvsolo Punctuation：先按标点映射表把半角/异体标点逐字映射为全角，
 /// 再跑 13 组 rps（合并重复标点、省略号/破折号后缀清理、?! 连用规范化）。
 /// 其中第 5 组（跨行的省略号行）只在整章文本层有意义，段落展示层跳过。
 fn normalize_punctuation(text: &str) -> String {
-    let mut s: String = text
+    let s: String = text
         .chars()
         .map(|c| PUNCT_MAP_LOOKUP.get(&c).copied().unwrap_or(c))
         .collect();
     // R1：重复标点合并（—－～ 成对化，·、`° → ……，其余留单个）。
     // 不用正则 backreference（Rust regex 不支援 \1），手写扫描连续相同标点。
-    s = merge_repeated_punct(&s);
-    s = PUNCT_R2A.replace_all(&s, "…").into_owned();
-    s = PUNCT_R2B.replace_all(&s, "…").into_owned();
-    s = PUNCT_R2C.replace_all(&s, "…").into_owned();
-    s = PUNCT_R3.replace_all(&s, "……").into_owned();
-    s = PUNCT_R4.replace_all(&s, "$1").into_owned();
-    s = PUNCT_R6.replace_all(&s, "：“").into_owned();
-    s = PUNCT_R7.replace_all(&s, "”、“").into_owned();
-    s = PUNCT_R8.replace_all(&s, "）。").into_owned();
-    s = PUNCT_R9.replace_all(&s, "$1”").into_owned();
-    s = PUNCT_R10.replace_all(&s, "$1").into_owned();
-    s = PUNCT_R11.replace_all(&s, "$1").into_owned();
-    s = PUNCT_R12.replace_all(&s, "～").into_owned();
+    // One Cow chain: a step that matches nothing keeps the input Cow
+    // borrowed, so only the final into_owned() allocates (was one
+    // into_owned() per step). `replace_all` cannot be assigned back into
+    // the same Cow directly — its result may borrow the input.
+    let mut s: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(merge_repeated_punct(&s));
+    s = replace_cow(s, &PUNCT_R2A, "…");
+    s = replace_cow(s, &PUNCT_R2B, "…");
+    s = replace_cow(s, &PUNCT_R2C, "…");
+    s = replace_cow(s, &PUNCT_R3, "……");
+    s = replace_cow(s, &PUNCT_R4, "$1");
+    s = replace_cow(s, &PUNCT_R6, "：“");
+    s = replace_cow(s, &PUNCT_R7, "”、“");
+    s = replace_cow(s, &PUNCT_R8, "）。");
+    s = replace_cow(s, &PUNCT_R9, "$1”");
+    s = replace_cow(s, &PUNCT_R10, "$1");
+    s = replace_cow(s, &PUNCT_R11, "$1");
+    s = replace_cow(s, &PUNCT_R12, "～");
     // R13：?! 连用规范化（？ 开头 → ？！/？？？；！ 开头 → ！？/！！！）。
-    s = PUNCT_R13
-        .replace_all(&s, |caps: &regex::Captures| {
-            let m = caps.get(0).unwrap().as_str();
-            let mut it = m.chars();
-            let first = it.next().unwrap_or('？');
-            let rest: String = it.collect();
-            if first == '？' {
-                if rest.contains('！') { "？！".to_string() } else { "？？？".to_string() }
-            } else if rest.contains('？') {
-                "！？".to_string()
-            } else {
-                "！！！".to_string()
-            }
-        })
-        .into_owned();
-    s
+    s = replace_cow(s, &PUNCT_R13, |caps: &regex::Captures| {
+        let m = caps.get(0).unwrap().as_str();
+        let mut it = m.chars();
+        let first = it.next().unwrap_or('？');
+        let rest: String = it.collect();
+        if first == '？' {
+            if rest.contains('！') { "？！".to_string() } else { "？？？".to_string() }
+        } else if rest.contains('？') {
+            "！？".to_string()
+        } else {
+            "！！！".to_string()
+        }
+    });
+    s.into_owned()
+}
+
+/// Apply one regex replace to a Cow, keeping the Cow borrowed when
+/// nothing matched (so a no-op step costs no allocation).
+fn replace_cow<'a, R: regex::Replacer>(
+    s: std::borrow::Cow<'a, str>,
+    re: &Regex,
+    replacement: R,
+) -> std::borrow::Cow<'a, str> {
+    if re.is_match(&s) {
+        std::borrow::Cow::Owned(re.replace_all(&s, replacement).into_owned())
+    } else {
+        s
+    }
 }
 
 /// 是否中文或全角符号（vvsolo Space 字符组的近似：汉字+假名+注音+全角区）。

@@ -28,7 +28,7 @@
 ## 全文检索
 - `GET /api/search?q=&scope=local|cached|all&book_id=&page=&page_size=20` — `book_id` 限定某本书内搜索
 - 返回章节级命中：`{book_id, book_title, author, chapter_idx, chapter_title, snippet（高亮 <em>…</em>）, score}`；scope=local 只查本地书，cached 只查已缓存网络书，all 两者
-- 检索走 tantivy，禁止 SQLite LIKE；索引含 `pinyin` 字段（书名+作者+章节名拼音，空格分隔与连写两种形式），查询侧把拉丁字母按音节切分（`xiuxian` → `xiu xian`），所以打拼音能找到汉字书名/作者；索引版本 3（老库下次扫描自动重建）
+- 检索走 tantivy，禁止 SQLite LIKE；索引含 `pinyin` 字段（书名+作者+章节名拼音，空格分隔与连写两种形式），查询侧把拉丁字母按音节切分（`xiuxian` → `xiu xian`），所以打拼音能找到汉字书名/作者；索引版本 4（老库下次扫描自动重建）
 - `GET /api/suggest?q=` — 搜索联想：书名/作者子串匹配（书名优先）+ 全文索引补足（覆盖拼音），最多 8 条 `{id, title, author}`
 
 ## 阅读统计
@@ -66,7 +66,7 @@
 - `POST /api/tasks/chapter-check` — 全库缺章检查（后台扫全部书，写 `chapter_issues` 表）
 - `GET /api/tasks/stats` — 队列长度、熔断状态、令牌桶余量、source_cache 行数/字节数（调试用）
 
-## 环境变量（共 19 个；数值型非法值回默认值，越界值夹到上下限，空字符串按未设置）
+## 环境变量（数值型非法值回默认值，越界值夹到上下限，空字符串按未设置）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -91,3 +91,6 @@
 | `SHUKU_SCAN_WORKERS` | 核数一半（1..8） | 并行扫描解析线程数（钳 1..32） |
 | `SHUKU_INDEX_THREADS` | 核数一半（1..8） | tantivy 写线程数（钳 1..16） |
 | `SHUKU_INDEX_HEAP_MB` | `150` | tantivy 写堆 MB（钳 50..2048） |
+| `SHUKU_HTTP_PROXY` | — | 书源抓取 HTTP 代理（可选） |
+| `SHUKU_SOCKS_PROXY` | — | 书源抓取 SOCKS 代理（可选） |
+| `RUST_LOG` | `shuku=info,tower_http=info` | 日志级别（tracing EnvFilter） |

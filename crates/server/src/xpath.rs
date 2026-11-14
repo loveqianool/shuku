@@ -231,9 +231,12 @@ where
     let mut groups: Vec<(Option<ElementRef<'a>>, Vec<ElementRef<'a>>)> = Vec::new();
     for e in els {
         let key = e.parent().and_then(ElementRef::wrap);
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, g)) => g.push(e),
-            None => groups.push((key, vec![e])),
+        // A parent's children are contiguous in document order, so the
+        // group for `key` — if it exists — is always the last one; a
+        // linear find over all groups was O(groups) per element.
+        match groups.last_mut() {
+            Some((k, g)) if *k == key => g.push(e),
+            _ => groups.push((key, vec![e])),
         }
     }
     let mut out = Vec::new();

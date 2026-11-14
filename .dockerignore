@@ -2,11 +2,13 @@
 # binaries (bin-*/shuku) are needed at image build time.
 .git
 .github
-target/
 crates/
 frontend/
 data/
 books/
 perf-books/
+docs/
+*.md
+smoke-fixture.py
 *.log
 .DS_Store

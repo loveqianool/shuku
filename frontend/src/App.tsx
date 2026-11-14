@@ -43,38 +43,37 @@ const App: Component = () => {
     (localStorage.getItem("shuku.ui.theme") ?? localStorage.getItem("legado.ui.theme") ?? "dark") === "dark",
   );
   const onHash = () => setRoute(parseHash());
-  window.addEventListener("hashchange", onHash);
-  onCleanup(() => window.removeEventListener("hashchange", onHash));
-
-  // 离线横幅：navigator.onLine 不是响应式的，首次渲染后不断网/联网
-  // 横幅都不会变；监听 online/offline 事件驱动 signal。
   const [online, setOnline] = createSignal(navigator.onLine);
+
+  // 全部监听收进一个 onMount，对应清理放一起：hash 路由、online/offline
+  // 离线横幅、定期 SW 更新检查。
   onMount(() => {
+    window.addEventListener("hashchange", onHash);
+    // 离线横幅：navigator.onLine 不是响应式的，首次渲染后不断网/联网
+    // 横幅都不会变；监听 online/offline 事件驱动 signal。
     const up = () => setOnline(true);
     const down = () => setOnline(false);
     window.addEventListener("online", up);
     window.addEventListener("offline", down);
-    onCleanup(() => {
-      window.removeEventListener("online", up);
-      window.removeEventListener("offline", down);
-    });
-  });
-
-  // 定期检查 Service Worker 更新（2026-11-12）：阅读器翻页是 hash 跳转，
-  // 不触发浏览器的 SW 更新检查，旧 SW 会一直钉住（导致章节一直吃旧版
-  // 缓存）。每 30 分钟 + 每次切回前台时手动调 registration.update()，
-  // 有新版时 autoUpdate 会自动接管并刷新。
-  onMount(() => {
-    if (!("serviceWorker" in navigator)) return;
+    // 定期检查 Service Worker 更新（2026-11-12）：阅读器翻页是 hash 跳转，
+    // 不触发浏览器的 SW 更新检查，旧 SW 会一直钉住（导致章节一直吃旧版
+    // 缓存）。每 30 分钟 + 每次切回前台时手动调 registration.update()，
+    // 有新版时 autoUpdate 会自动接管并刷新。
     const checkSW = () => {
       navigator.serviceWorker.getRegistration().then((reg) => reg?.update()).catch(() => {});
     };
-    checkSW();
-    const timer = setInterval(checkSW, 30 * 60 * 1000);
+    let timer: ReturnType<typeof setInterval> | undefined;
     const onVisible = () => { if (!document.hidden) checkSW(); };
-    document.addEventListener("visibilitychange", onVisible);
+    if ("serviceWorker" in navigator) {
+      checkSW();
+      timer = setInterval(checkSW, 30 * 60 * 1000);
+      document.addEventListener("visibilitychange", onVisible);
+    }
     onCleanup(() => {
-      clearInterval(timer);
+      window.removeEventListener("hashchange", onHash);
+      window.removeEventListener("online", up);
+      window.removeEventListener("offline", down);
+      if (timer !== undefined) clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     });
   });

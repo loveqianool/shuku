@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
@@ -19,33 +19,10 @@ use tracing::info;
 
 pub const INDEX_VERSION: i64 = 4;
 
-/// tantivy indexing threads: `SHUKU_INDEX_THREADS`, else half the CPU
-/// count (1..=8). Writer threads show strongly diminishing returns past 2
-/// (probe: 1 thread 5.7s vs 8 threads 4.8s for 159MB), and scan parse
-/// workers already occupy cores — total compute threads should stay near
-/// core count, so the writer gets half and parsing gets the rest.
-fn writer_threads() -> usize {
-    std::env::var("SHUKU_INDEX_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|n| n.clamp(1, 16))
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .div_ceil(2)
-                .clamp(1, 8)
-        })
-}
-
-/// tantivy writer heap: `SHUKU_INDEX_HEAP_MB`, default 150MB (was 50MB:
-/// too small for big scans, forces constant segment flushes).
-fn writer_heap_bytes() -> usize {
-    std::env::var("SHUKU_INDEX_HEAP_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb.clamp(50, 2048) * 1_000_000)
-        .unwrap_or(150_000_000)
+/// Highlight `<b>` → `<em>` in a tantivy snippet (the frontend styles
+/// `<em>`; tantivy emits `<b>`).
+fn em_html(s: &str) -> String {
+    s.replace("<b>", "<em>").replace("</b>", "</em>")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -368,8 +345,36 @@ fn clear_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The eight schema fields, resolved in one place (`open` and
+/// `open_in_ram` used to repeat the same eight `get_field` calls).
+struct IndexFields {
+    book_id: Field,
+    book_title: Field,
+    author: Field,
+    chapter_idx: Field,
+    chapter_title: Field,
+    content: Field,
+    pinyin: Field,
+    source: Field,
+}
+
+fn fields(schema: &Schema) -> Result<IndexFields> {
+    Ok(IndexFields {
+        book_id: schema.get_field("book_id")?,
+        book_title: schema.get_field("book_title")?,
+        author: schema.get_field("author")?,
+        chapter_idx: schema.get_field("chapter_idx")?,
+        chapter_title: schema.get_field("chapter_title")?,
+        content: schema.get_field("content")?,
+        pinyin: schema.get_field("pinyin")?,
+        source: schema.get_field("source")?,
+    })
+}
+
 impl SearchIndex {
-    pub fn open(path: &Path) -> Result<Self> {
+    /// `threads` / `heap_mb` come from Config (`SHUKU_INDEX_THREADS` /
+    /// `SHUKU_INDEX_HEAP_MB`); production passes them from `main`.
+    pub fn open(path: &Path, threads: usize, heap_mb: usize) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let schema = build_schema();
         let index = match Index::open_or_create(
@@ -398,16 +403,17 @@ impl SearchIndex {
         };
         index.tokenizers().register("jieba", JiebaTokenizer::new());
         index.tokenizers().register("raw", tantivy::tokenizer::RawTokenizer::default());
-        let writer = index.writer_with_num_threads(writer_threads(), writer_heap_bytes())?;
+        let writer = index.writer_with_num_threads(threads, heap_mb * 1_000_000)?;
+        let f = fields(&schema)?;
         Ok(Self {
-            f_book_id: schema.get_field("book_id")?,
-            f_book_title: schema.get_field("book_title")?,
-            f_author: schema.get_field("author")?,
-            f_chapter_idx: schema.get_field("chapter_idx")?,
-            f_chapter_title: schema.get_field("chapter_title")?,
-            f_content: schema.get_field("content")?,
-            f_pinyin: schema.get_field("pinyin")?,
-            f_source: schema.get_field("source")?,
+            f_book_id: f.book_id,
+            f_book_title: f.book_title,
+            f_author: f.author,
+            f_chapter_idx: f.chapter_idx,
+            f_chapter_title: f.chapter_title,
+            f_content: f.content,
+            f_pinyin: f.pinyin,
+            f_source: f.source,
             index,
             writer: Mutex::new(writer),
         })
@@ -419,23 +425,28 @@ impl SearchIndex {
         let index = Index::create_in_ram(schema.clone());
         index.tokenizers().register("jieba", JiebaTokenizer::new());
         index.tokenizers().register("raw", tantivy::tokenizer::RawTokenizer::default());
-        let writer = index.writer_with_num_threads(writer_threads(), writer_heap_bytes())?;
+        let writer = index.writer_with_num_threads(
+            crate::config::default_index_threads(),
+            crate::config::default_index_heap_mb() * 1_000_000,
+        )?;
+        let f = fields(&schema)?;
         Ok(Self {
-            f_book_id: schema.get_field("book_id")?,
-            f_book_title: schema.get_field("book_title")?,
-            f_author: schema.get_field("author")?,
-            f_chapter_idx: schema.get_field("chapter_idx")?,
-            f_chapter_title: schema.get_field("chapter_title")?,
-            f_content: schema.get_field("content")?,
-            f_pinyin: schema.get_field("pinyin")?,
-            f_source: schema.get_field("source")?,
+            f_book_id: f.book_id,
+            f_book_title: f.book_title,
+            f_author: f.author,
+            f_chapter_idx: f.chapter_idx,
+            f_chapter_title: f.chapter_title,
+            f_content: f.content,
+            f_pinyin: f.pinyin,
+            f_source: f.source,
             index,
             writer: Mutex::new(writer),
         })
     }
 
     /// Delete all chapters of a book, then add the new ones. Blocking call —
-    /// run inside spawn_blocking.
+    /// run inside spawn_blocking. Thin wrapper over `index_books` (one
+    /// book, one commit); the batch path is what the scanner uses.
     pub fn index_book(
         &self,
         book_id_num: u64,
@@ -444,17 +455,39 @@ impl SearchIndex {
         source: &str,
         chapters: &[(String, String)],
     ) -> Result<usize> {
+        let counts = self.index_books(&[(
+            book_id_num,
+            book_title.to_string(),
+            author.to_string(),
+            source.to_string(),
+            chapters.to_vec(),
+        )])?;
+        Ok(counts.into_iter().next().unwrap_or(0))
+    }
+
+    /// Append chapters to a book without touching its existing docs.
+    /// Only for update checks: new chapters have fresh idx values past
+    /// the stored count, so no `delete_term` is needed and the rest of
+    /// the book is not re-indexed. `chapters` is (chapter_idx, title,
+    /// content). Blocking call — run inside spawn_blocking.
+    pub fn index_book_append(
+        &self,
+        book_id_num: u64,
+        book_title: &str,
+        author: &str,
+        source: &str,
+        chapters: &[(usize, String, String)],
+    ) -> Result<usize> {
         let mut w = self.writer.lock().map_err(|e| anyhow::anyhow!("index writer lock poisoned: {e}"))?;
-        w.delete_term(Term::from_field_u64(self.f_book_id, book_id_num));
         let book_pinyin = format!("{} {}", pinyin_text(book_title), pinyin_text(author));
         let mut n = 0;
-        for (i, (title, content)) in chapters.iter().enumerate() {
+        for (idx, title, content) in chapters.iter().map(|(i, t, c)| (*i, t, c)) {
             let pinyin = format!("{book_pinyin} {}", pinyin_text(title));
             w.add_document(doc!(
                 self.f_book_id => book_id_num,
                 self.f_book_title => book_title,
                 self.f_author => author,
-                self.f_chapter_idx => i as u64,
+                self.f_chapter_idx => idx as u64,
                 self.f_chapter_title => title.as_str(),
                 self.f_content => content.as_str(),
                 self.f_pinyin => pinyin.as_str(),
@@ -463,7 +496,7 @@ impl SearchIndex {
             n += 1;
         }
         w.commit()?;
-        info!(target: "search", book_id = book_id_num, chapters = n, "indexed book");
+        info!(target: "search", book_id = book_id_num, chapters = n, "appended chapters");
         Ok(n)
     }
 
@@ -495,14 +528,23 @@ impl SearchIndex {
         &self,
         books: &[(u64, String, String, String, Vec<(String, String)>)],
     ) -> Result<Vec<usize>> {
-        self.index_books_pinyin(books, true)
+        self.index_books_inner(books, true)
     }
 
     /// Same as `index_books` but with the pinyin field left empty when
     /// `include_pinyin` is false, so probes can measure what pinyin search
-    /// actually costs (index size, index time). Production always passes
-    /// true; the flag exists only for the probe.
+    /// actually costs (index size, index time). Test-only: production
+    /// always indexes pinyin.
+    #[cfg(test)]
     pub fn index_books_pinyin(
+        &self,
+        books: &[(u64, String, String, String, Vec<(String, String)>)],
+        include_pinyin: bool,
+    ) -> Result<Vec<usize>> {
+        self.index_books_inner(books, include_pinyin)
+    }
+
+    fn index_books_inner(
         &self,
         books: &[(u64, String, String, String, Vec<(String, String)>)],
         include_pinyin: bool,
@@ -607,11 +649,13 @@ impl SearchIndex {
                 }
             }
         };
-        let top_docs = searcher.search(
-            &*query,
-            &TopDocs::with_limit(limit + offset).and_offset(offset).order_by_score(),
-        )?;
-        let total = searcher.search(&*query, &tantivy::collector::Count)?;
+        let mut collectors = MultiCollector::new();
+        let top_docs_handle =
+            collectors.add_collector(TopDocs::with_limit(limit + offset).and_offset(offset).order_by_score());
+        let count_handle = collectors.add_collector(Count);
+        let mut multi_fruit = searcher.search(&*query, &collectors)?;
+        let top_docs = top_docs_handle.extract(&mut multi_fruit);
+        let total = count_handle.extract(&mut multi_fruit);
         let mut snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_content)?;
         snippet_gen.set_max_num_chars(400);
         // Fallback generators (title / book / pinyin) are created lazily:
@@ -624,18 +668,14 @@ impl SearchIndex {
         for (score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
             let bid = doc.get_first(self.f_book_id).and_then(|v| v.as_u64()).unwrap_or(0);
-            let mut snippet = snippet_gen
-                .snippet_from_doc(&doc)
-                .to_html()
-                .replace("<b>", "<em>")
-                .replace("</b>", "</em>");
+            let mut snippet = em_html(&snippet_gen.snippet_from_doc(&doc).to_html());
             if snippet.is_empty() {
                 // Match was in the title/author, not the body: highlight there.
                 if title_snippet_gen.is_none() {
                     title_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_chapter_title).ok().map(|mut g| { g.set_max_num_chars(120); g });
                 }
                 if let Some(g) = title_snippet_gen.as_mut() {
-                    snippet = g.snippet_from_doc(&doc).to_html().replace("<b>", "<em>").replace("</b>", "</em>");
+                    snippet = em_html(&g.snippet_from_doc(&doc).to_html());
                 }
             }
             if snippet.is_empty() {
@@ -643,7 +683,7 @@ impl SearchIndex {
                     book_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_book_title).ok().map(|mut g| { g.set_max_num_chars(120); g });
                 }
                 if let Some(g) = book_snippet_gen.as_mut() {
-                    snippet = g.snippet_from_doc(&doc).to_html().replace("<b>", "<em>").replace("</b>", "</em>");
+                    snippet = em_html(&g.snippet_from_doc(&doc).to_html());
                 }
             }
             if snippet.is_empty() {
@@ -652,7 +692,7 @@ impl SearchIndex {
                     pinyin_snippet_gen = SnippetGenerator::create(&searcher, &*query, self.f_pinyin).ok().map(|mut g| { g.set_max_num_chars(120); g });
                 }
                 if let Some(g) = pinyin_snippet_gen.as_mut() {
-                    snippet = g.snippet_from_doc(&doc).to_html().replace("<b>", "<em>").replace("</b>", "</em>");
+                    snippet = em_html(&g.snippet_from_doc(&doc).to_html());
                 }
             }
             // One tantivy fragment per chapter made results look
@@ -766,11 +806,21 @@ impl SearchIndex {
         ]);
         // All matching chapters (a book has at most a few thousand);
         // document order comes from sorting by chapter_idx below.
-        let n_chapters = searcher.search(&query, &Count)?;
+        // One MultiCollector run: the count and the top docs are the
+        // same query, so collect both at once instead of running it twice.
+        // The TopDocs limit must be fixed up front (TopDocs pre-allocates
+        // 2x the limit per segment), so it is a generous bound, not the
+        // count: real books stay far below it.
+        const MAX_MATCH_CHAPTERS: usize = 100_000;
+        let mut collectors = MultiCollector::new();
+        let count_handle = collectors.add_collector(Count);
+        let top_docs_handle = collectors.add_collector(TopDocs::with_limit(MAX_MATCH_CHAPTERS).order_by_score());
+        let mut multi_fruit = searcher.search(&query, &collectors)?;
+        let n_chapters = count_handle.extract(&mut multi_fruit);
         if n_chapters == 0 {
             return Ok((vec![], 0));
         }
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(n_chapters).order_by_score())?;
+        let top_docs = top_docs_handle.extract(&mut multi_fruit);
         let mut all: Vec<BookMatch> = vec![];
         for (_score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
@@ -866,7 +916,7 @@ mod tests {
                 .unwrap();
             w.commit().unwrap();
         }
-        let idx = SearchIndex::open(&dir).unwrap();
+        let idx = SearchIndex::open(&dir, crate::config::default_index_threads(), crate::config::default_index_heap_mb()).unwrap();
         assert!(idx.index.schema().get_field("source").is_ok());
         assert_eq!(idx.index.reader().unwrap().searcher().num_docs(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1086,7 +1136,7 @@ mod tests {
             books.push((i as u64 + 1, parsed.title, parsed.author, "local".to_string(), chs));
         }
         let parse_ms = t0.elapsed().as_millis();
-        let total_ch: usize = books.iter().map(|b| b.3.len()).sum();
+        let total_ch: usize = books.iter().map(|b| b.4.len()).sum();
         let total_bytes: usize = books.iter().flat_map(|b| b.4.iter().map(|c| c.1.len())).sum();
 
         // 1. Raw cost of computing pinyin_text for every title/author.
@@ -1123,7 +1173,7 @@ mod tests {
         for (name, with_pinyin) in [("with", true), ("without", false)] {
             let idx_dir = base.join(format!("probe-pinyin-{name}-{}", uuid::Uuid::new_v4()));
             let (size, index_ms) = {
-                let idx = SearchIndex::open(&idx_dir).unwrap();
+                let idx = SearchIndex::open(&idx_dir, crate::config::default_index_threads(), crate::config::default_index_heap_mb()).unwrap();
                 let t0 = Instant::now();
                 for chunk in books.chunks(16) {
                     idx.index_books_pinyin(chunk, with_pinyin).unwrap();
@@ -1156,7 +1206,7 @@ mod tests {
 
         // 3. Query latency on the pinyin index (fresh build, median of 21).
         let idx_dir = base.join(format!("probe-pinyin-q-{}", uuid::Uuid::new_v4()));
-        let idx = SearchIndex::open(&idx_dir).unwrap();
+        let idx = SearchIndex::open(&idx_dir, crate::config::default_index_threads(), crate::config::default_index_heap_mb()).unwrap();
         for chunk in books.chunks(16) {
             idx.index_books_pinyin(chunk, true).unwrap();
         }

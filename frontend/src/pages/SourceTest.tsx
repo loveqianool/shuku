@@ -1,4 +1,4 @@
-import { createSignal, For, Show, type Component } from "solid-js";
+import { createEffect, createSignal, For, Show, type Component } from "solid-js";
 import { api, type Source, type TestKind, type TestResult } from "../lib/api";
 
 const SourceTest: Component<{ sourceId: string }> = (props) => {
@@ -14,13 +14,23 @@ const SourceTest: Component<{ sourceId: string }> = (props) => {
   const [running, setRunning] = createSignal(false);
   const [error, setError] = createSignal("");
 
-  api.getSource(props.sourceId).then((s) => {
-    setSource(s);
-    // checkKeyWord is the source's default search keyword (plain string,
-    // not a selector): prefill the keyword box when it is empty.
-    const kw = (s.ruleSearch as Record<string, unknown> | null | undefined)?.checkKeyWord;
-    if (typeof kw === "string" && kw.trim() !== "" && keyword() === "") setKeyword(kw);
-  }).catch((e) => setError(String(e)));
+  // 按 props.sourceId 拉书源：放 createEffect 里，换源（hash 变但组件
+  // 不重挂）时重拉；以前是组件体里一次性调用，换源后还留着旧书源的
+  // 标题与默认 keyword（Picker.tsx 同类问题已修）。
+  createEffect(() => {
+    const sid = props.sourceId;
+    setSource(null);
+    setKeyword("");
+    setError("");
+    api.getSource(sid).then((s) => {
+      if (sid !== props.sourceId) return;
+      setSource(s);
+      // checkKeyWord is the source's default search keyword (plain string,
+      // not a selector): prefill the keyword box when it is empty.
+      const kw = (s.ruleSearch as Record<string, unknown> | null | undefined)?.checkKeyWord;
+      if (typeof kw === "string" && kw.trim() !== "" && keyword() === "") setKeyword(kw);
+    }).catch((e) => { if (sid === props.sourceId) setError(String(e)); });
+  });
 
   const run = async () => {
     setRunning(true);

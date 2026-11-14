@@ -16,13 +16,13 @@
 //! (`location`), no `fetch`/`XMLHttpRequest` — scripts using anything
 //! else fail loudly instead of silently doing nothing.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use url::Url;
 
-use crate::source::{strip_js_wrapper, JS_HELPERS, JS_MEMORY_LIMIT, JS_TIMEOUT};
+use crate::source::{strip_js_wrapper, JS_HELPERS, JS_TIMEOUT};
 
 #[derive(Debug, Clone)]
 pub struct FormSubmit {
@@ -165,27 +165,17 @@ pub fn run_login_ui(html: &str, script: &str, js_lib: &str, page_url: &Url) -> R
     let html_json = serde_json::to_string(html)?;
     let js_lib = js_lib.to_string();
 
-    let rt = rquickjs::Runtime::new().context("create js runtime")?;
-    rt.set_memory_limit(JS_MEMORY_LIMIT);
-    rt.set_max_stack_size(256 * 1024);
-    let deadline = std::time::Instant::now() + JS_TIMEOUT;
-    rt.set_interrupt_handler(Some(Box::new(move || std::time::Instant::now() > deadline)));
-    let ctx = rquickjs::Context::full(&rt).context("create js context")?;
-    let script_json = serde_json::to_string(&script)?;
     let setup = format!(
         "{js_lib} let result = {html_json}; let input = result; let src = result; {JS_HELPERS} var __els = {els_json}; var __forms = {forms_json}; var __clicked = -1; var __submittedForm = -1; {DOCUMENT_SHIM}"
     );
-    // JSON-escaped copy of the setup, for the `return`-retry path below.
-    let setup_json = serde_json::to_string(&setup)?;
-    let code = format!(
-        "(function(){{ try {{ {setup} let __out; try {{ __out = eval({script_json}); }} catch(e) {{ if (String(e).indexOf('return') !== -1) {{ __out = (new Function({setup_json} + \"\\n\" + {script_json}))(); }} else {{ throw e; }} }} return JSON.stringify({{els: __els, clicked: __clicked, submittedForm: __submittedForm}}); }} catch(e) {{ return 'LOGINUI_ERROR:' + String(e); }} }})()"
-    );
-    let out: String = ctx
-        .with(|ctx| ctx.eval::<String, _>(code))
-        .map_err(|e| anyhow!("loginUi exec: {e}"))?;
-    if let Some(msg) = out.strip_prefix("LOGINUI_ERROR:") {
-        return Err(anyhow!("loginUi exec: {msg}"));
-    }
+    let out = crate::source::eval_js_with_setup(
+        &setup,
+        &script,
+        JS_TIMEOUT,
+        "LOGINUI_ERROR:",
+        "JSON.stringify({els: __els, clicked: __clicked, submittedForm: __submittedForm})",
+    )
+    .map_err(|e| anyhow!("loginUi exec: {e}"))?;
     let state: serde_json::Value = serde_json::from_str(&out)?;
     let els: Vec<ElRec> = serde_json::from_value(state["els"].clone())?;
     let clicked = state["clicked"].as_i64().unwrap_or(-1);
@@ -276,15 +266,8 @@ fn form_urlencode(fields: &[(String, String)]) -> String {
 }
 
 fn urlencode_component(s: &str) -> String {
-    let mut out = String::new();
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+    // Form fields: spaces become `+` (application/x-www-form-urlencoded).
+    crate::source::urlencode(s, true)
 }
 
 /// Parse the login page into the element table + form list.

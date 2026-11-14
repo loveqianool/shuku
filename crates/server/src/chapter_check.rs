@@ -82,27 +82,33 @@ pub fn cn_numeral(s: &str) -> Option<i64> {
     Some(result + num)
 }
 
+/// One `OnceLock<Regex>` per call site, without the four-line
+/// boilerplate each. Each expansion gets its own static storage.
+macro_rules! regex_once {
+    ($pattern:expr, $msg:expr) => {{
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new($pattern).expect($msg))
+    }};
+}
+
 fn numbered_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // NOTE: 卷 is deliberately NOT in the class — in "第一卷 第二章"
-        // the chapter number is 2, not the volume number 1.
-        Regex::new(r"第\s*([0-9]+|[一二三四五六七八九十百千零两]+)\s*[章节回集话篇]")
-            .expect("numbered chapter regex")
-    })
+    // NOTE: 卷 is deliberately NOT in the class — in "第一卷 第二章"
+    // the chapter number is 2, not the volume number 1.
+    regex_once!(
+        r"第\s*([0-9]+|[一二三四五六七八九十百千零两]+)\s*[章节回集话篇]",
+        "numbered chapter regex"
+    )
 }
 
 fn leading_digits_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^\s*(\d+)[、\.\s]").expect("leading digits regex"))
+    regex_once!(r"^\s*(\d+)[、\.\s]", "leading digits regex")
 }
 
 fn volume_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"第\s*([0-9]+|[一二三四五六七八九十百千零两]+)\s*卷")
-            .expect("volume regex")
-    })
+    regex_once!(
+        r"第\s*([0-9]+|[一二三四五六七八九十百千零两]+)\s*卷",
+        "volume regex"
+    )
 }
 
 /// The chapter number in a title, if any. `None` for 序章/后记 etc.
@@ -128,6 +134,26 @@ fn volume_number(title: &str) -> Option<i64> {
         return Some(n);
     }
     cn_numeral(raw)
+}
+
+/// "empty" issues for chapters whose content file is empty or missing.
+/// `is_empty` checks one chapter by idx (the callers differ only in how
+/// they stat the file: sync in the sweep, sync-via-closure in the API).
+/// Shared by the per-book live check and the library-wide sweep, which
+/// used to spell out the same loop + issue literal twice.
+pub fn empty_file_issues(titles: &[(i64, String)], is_empty: impl Fn(i64) -> bool) -> Vec<ChapterIssue> {
+    let mut issues = Vec::new();
+    for (idx, title) in titles {
+        if is_empty(*idx) {
+            issues.push(ChapterIssue {
+                idx: *idx,
+                title: title.clone(),
+                kind: "empty".into(),
+                detail: "章节文件为空或缺失（抓取失败）".into(),
+            });
+        }
+    }
+    issues
 }
 
 /// Gap / duplicate / out-of-order issues from a title sequence.

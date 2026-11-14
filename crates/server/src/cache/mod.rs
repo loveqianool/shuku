@@ -35,13 +35,49 @@ impl CacheKind {
 }
 
 /// FNV-1a 64-bit hash — stable across restarts (unlike DefaultHasher).
-pub fn url_hash(url: &str) -> String {
+/// Shared with the scanner's book-id function (book ids must stay stable).
+pub fn fnv1a_64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in url.as_bytes() {
+    for b in s.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    format!("{h:016x}")
+    h
+}
+
+pub fn url_hash(url: &str) -> String {
+    format!("{:016x}", fnv1a_64(url))
+}
+
+/// In-memory cache caps: entries and total body bytes. Without them the
+/// map only grew (every cached page body stayed resident for the life of
+/// the process). Eviction is oldest-first by last write; expired entries
+/// go first.
+const MAX_MEM_ENTRIES: usize = 512;
+const MAX_MEM_BYTES: usize = 64 * 1024 * 1024;
+
+fn mem_bytes(map: &HashMap<String, (String, Instant, i64)>) -> usize {
+    map.values().map(|(b, _, _)| b.len()).sum()
+}
+
+/// Drop expired entries, then the oldest entries until both caps hold.
+/// Callers must hold the map lock.
+fn evict_locked(map: &mut HashMap<String, (String, Instant, i64)>) {
+    map.retain(|_, (_, at, ttl)| at.elapsed() < Duration::from_secs(*ttl as u64));
+    while map.len() > MAX_MEM_ENTRIES || mem_bytes(map) > MAX_MEM_BYTES {
+        // Oldest write wins eviction (insertion order is not tracked, so
+        // scan for the smallest Instant).
+        let oldest = map
+            .iter()
+            .min_by_key(|(_, (_, at, _))| *at)
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                map.remove(&k);
+            }
+            None => break,
+        }
+    }
 }
 
 pub struct Cache {
@@ -71,15 +107,22 @@ impl Cache {
     pub async fn get(&self, kind: CacheKind, url: &str) -> Option<String> {
         let key = format!("{}:{}", kind.as_str(), url);
         let ttl = self.ttl(kind);
-        if let Some((body, at, _)) = self.mem.lock().unwrap().get(&key) {
-            if at.elapsed() < Duration::from_secs(ttl as u64) {
-                return Some(body.clone());
+        {
+            let mut mem = crate::lock_or_poisoned(&self.mem);
+            if let Some((body, at, _)) = mem.get(&key) {
+                if at.elapsed() < Duration::from_secs(ttl as u64) {
+                    return Some(body.clone());
+                }
+                // Expired: drop it instead of leaving it resident forever.
+                mem.remove(&key);
             }
         }
         let hash = url_hash(&format!("{}:{url}", kind.as_str()));
         let now = chrono::Utc::now().timestamp();
         if let Ok(Some((_u, body))) = self.db.cache_get(&hash, now).await {
-            self.mem.lock().unwrap().insert(key, (body.clone(), Instant::now(), ttl));
+            let mut mem = crate::lock_or_poisoned(&self.mem);
+            mem.insert(key, (body.clone(), Instant::now(), ttl));
+            evict_locked(&mut mem);
             return Some(body);
         }
         None
@@ -88,9 +131,30 @@ impl Cache {
     pub async fn put(&self, kind: CacheKind, url: &str, body: &str) {
         let key = format!("{}:{}", kind.as_str(), url);
         let ttl = self.ttl(kind);
-        self.mem.lock().unwrap().insert(key, (body.to_string(), Instant::now(), ttl));
+        {
+            let mut mem = crate::lock_or_poisoned(&self.mem);
+            mem.insert(key, (body.to_string(), Instant::now(), ttl));
+            evict_locked(&mut mem);
+        }
         let hash = url_hash(&format!("{}:{url}", kind.as_str()));
         let _ = self.db.cache_put(&hash, url, kind.as_str(), body, ttl).await;
+    }
+
+    /// Drop expired in-memory entries (called by the cache worker each
+    /// prune round; `put`/`get` already evict on the hot path).
+    pub fn prune_expired(&self) {
+        let mut mem = crate::lock_or_poisoned(&self.mem);
+        mem.retain(|_, (_, at, ttl)| at.elapsed() < Duration::from_secs(*ttl as u64));
+    }
+
+    #[cfg(test)]
+    pub fn mem_len(&self) -> usize {
+        crate::lock_or_poisoned(&self.mem).len()
+    }
+
+    #[cfg(test)]
+    pub fn mem_contains(&self, kind: CacheKind, url: &str) -> bool {
+        crate::lock_or_poisoned(&self.mem).contains_key(&format!("{}:{}", kind.as_str(), url))
     }
 }
 
@@ -126,5 +190,30 @@ mod tests {
     fn url_hash_stable() {
         assert_eq!(url_hash("https://example.com/a"), url_hash("https://example.com/a"));
         assert_ne!(url_hash("https://example.com/a"), url_hash("https://example.com/b"));
+    }
+
+    #[tokio::test]
+    async fn memory_cache_is_bounded_and_prunes_expired() {
+        let db = Database::open_in_memory().await.unwrap();
+        let cache = Cache::with_ttls(db, 60, 600, 86_400);
+        for i in 0..(MAX_MEM_ENTRIES + 10) {
+            cache.put(CacheKind::Search, &format!("https://a.example/{i}"), "x").await;
+        }
+        assert!(cache.mem_len() <= MAX_MEM_ENTRIES, "mem cache must stay capped");
+        assert!(!cache.mem_contains(CacheKind::Search, "https://a.example/0"), "oldest entry must be evicted");
+        assert!(cache.mem_contains(CacheKind::Search, &format!("https://a.example/{}", MAX_MEM_ENTRIES + 9)));
+        // TTL 0: entries are expired on arrival and never stay resident.
+        let db2 = Database::open_in_memory().await.unwrap();
+        let cache2 = Cache::with_ttls(db2, 0, 600, 86_400);
+        cache2.put(CacheKind::Search, "https://a.example/x", "hello").await;
+        assert_eq!(cache2.mem_len(), 0);
+        // TTL 1: the entry stays until prune_expired runs after expiry.
+        let db3 = Database::open_in_memory().await.unwrap();
+        let cache3 = Cache::with_ttls(db3, 1, 600, 86_400);
+        cache3.put(CacheKind::Search, "https://a.example/y", "hello").await;
+        assert_eq!(cache3.mem_len(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        cache3.prune_expired();
+        assert_eq!(cache3.mem_len(), 0);
     }
 }

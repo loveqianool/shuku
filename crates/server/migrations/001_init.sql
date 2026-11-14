@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS chapters (
     created_at INTEGER NOT NULL,
     UNIQUE(book_id, idx)
 );
-CREATE INDEX IF NOT EXISTS idx_chapters_book ON chapters(book_id, idx);
+-- NOTE: no separate index on (book_id, idx): the UNIQUE above already
+-- builds one (002_drop_redundant_indexes.sql drops it on old databases).
 
 CREATE TABLE IF NOT EXISTS sources (
     id               TEXT PRIMARY KEY,
@@ -64,7 +65,8 @@ CREATE TABLE IF NOT EXISTS source_cache (
     fetched_at   INTEGER NOT NULL,
     ttl_seconds  INTEGER NOT NULL DEFAULT 60
 );
-CREATE INDEX IF NOT EXISTS idx_cache_hash ON source_cache(url_hash);
+-- NOTE: no separate index on url_hash: the UNIQUE above already builds
+-- one (002_drop_redundant_indexes.sql drops it on old databases).
 
 CREATE TABLE IF NOT EXISTS scan_tasks (
     id            TEXT PRIMARY KEY,

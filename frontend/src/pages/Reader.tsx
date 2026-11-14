@@ -1,4 +1,4 @@
-import { createSignal, createEffect, For, Show, onCleanup, onMount, type Component } from "solid-js";
+import { createSignal, createEffect, createMemo, For, Show, onCleanup, onMount, type Component } from "solid-js";
 import { readerChrome as showChrome, setReaderChrome as setShowChrome } from "../lib/readerChrome";
 import { api, type Book, type Chapter, type ChapterMeta, type ChapterIssue, type SearchHit, type BookMatch } from "../lib/api";
 import { downloadBook, deleteOfflineBook, offlineChapterCount } from "../lib/offline";
@@ -133,6 +133,14 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const chapterEl = (i: number) =>
     contentRef?.querySelector(`[data-chapter-idx="${i}"]`) as HTMLElement | null;
   const currentChapter = () => chapters().find((c) => c.chapter_idx === idx()) ?? null;
+  // 当前章里搜索词的出现次数：放 createMemo，只在当前章或 searchTerm
+  // 变化时重算；以前写在 JSX 里，滚动换章就对整章段落重做一次 split。
+  const currentChapterHitCount = createMemo(() => {
+    const term = searchTerm();
+    if (!term) return 0;
+    return (currentChapter()?.paragraphs ?? [])
+      .reduce((n, p) => n + (p.text ?? "").split(term).length - 1, 0);
+  });
 
   // 当前选中处定位：目标章渲染好之后，把该章第 currentOccurrence 个
   // mark.search-hit 单独标亮（search-hit-current）并滚到它。只在当前
@@ -306,14 +314,14 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   };
 
   const loadToc = async (bid: string) => {
-    const all: ChapterMeta[] = [];
-    let page = 1;
-    for (;;) {
-      const res = await api.listChapters(bid, page, 200);
-      all.push(...res.items);
-      if (all.length >= res.total || res.items.length === 0) break;
-      page += 1;
-    }
+    // 500/页（后端 PageQuery 上限），首页后已知 total，其余页并行拉、
+    // 按页号拼回顺序；1 万章的书从 50 次串行往返降到 20 次并行。
+    const first = await api.listChapters(bid, 1, 500);
+    const pages = Math.ceil(first.total / 500);
+    const rest = await Promise.all(
+      Array.from({ length: Math.max(0, pages - 1) }, (_, k) => api.listChapters(bid, k + 2, 500)),
+    );
+    const all = [...first.items, ...rest.flatMap((r) => r.items)];
     // 只认当前这本书：换书后旧的 TOC 响应直接丢弃。不用 loadSeq 守卫，
     // 因为 resetToChapter 也会自增 loadSeq，会把目录误判为过期。
     if (bid !== props.bookId) return;
@@ -447,13 +455,11 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     await resetToChapter(i, { frac });
   };
 
-  createEffect(() => {
-    const seq = ++loadSeq;
-    const bid = props.bookId;
-    // 换书：清掉上本书的搜索/目录/设置等状态，免得旧内容闪一下。
-    // （直接复位 signal，不调 clearSearch：它定义在后面，effect 首次
-    // 同步执行时会碰到 TDZ。）
-    setInBookQ("");
+  // 搜索状态复位（三处共用：换书 effect、clearSearch、searchInBook 开头）。
+  // 不含 inBookQ：searchInBook 先取 q 再复位；clearSearch 另行清 q；
+  // 换书 effect 在调它之前先清 q。定义在换书 effect 之前，免得 effect
+  // 首次同步执行时碰到 TDZ。
+  const resetSearchState = () => {
     setInBookMatches([]);
     setInBookMatchTotal(0);
     setInBookMatchPage(1);
@@ -463,6 +469,14 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     setCurrentMatch(-1);
     setCurrentOccurrence(-1);
     setSearchDone(false);
+  };
+
+  createEffect(() => {
+    const seq = ++loadSeq;
+    const bid = props.bookId;
+    // 换书：清掉上本书的搜索/目录/设置等状态，免得旧内容闪一下。
+    setInBookQ("");
+    resetSearchState();
     setShowToc(false);
     setShowSearch(false);
     setShowSettings(false);
@@ -555,17 +569,29 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   };
   // 整页滚动：同步当前章与章内进度、防抖保存进度，并触发瀑布流载入。
   // 靠近底部 1200px 载下一章；靠近顶部 400px 补上一章。
+  // rAF 合并：scroll 事件只预约下一帧，一帧内集中跑一次
+  // updateCurrentFromScroll + setScrollFrac + 触发 append/prepend；
+  // 以前每事件都全量查 DOM（querySelectorAll + 每 section 一次
+  // getBoundingClientRect 强制 layout），长书滚动掉帧。
+  let scrollRaf: number | undefined;
   const onWinScroll = () => {
-    updateCurrentFromScroll();
-    setScrollFrac(getScrollFrac());
-    const el = chapterEl(idx());
-    if (el) scheduleSaveProgress(Math.max(0, window.scrollY - el.offsetTop));
-    const doc = document.documentElement;
-    if (window.innerHeight + window.scrollY >= doc.scrollHeight - 1200) void appendOne();
-    if (window.scrollY <= 400) void prependOne();
+    if (scrollRaf !== undefined) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = undefined;
+      updateCurrentFromScroll();
+      setScrollFrac(getScrollFrac());
+      const el = chapterEl(idx());
+      if (el) scheduleSaveProgress(Math.max(0, window.scrollY - el.offsetTop));
+      const doc = document.documentElement;
+      if (window.innerHeight + window.scrollY >= doc.scrollHeight - 1200) void appendOne();
+      if (window.scrollY <= 400) void prependOne();
+    });
   };
   window.addEventListener("scroll", onWinScroll, { passive: true });
-  onCleanup(() => window.removeEventListener("scroll", onWinScroll));
+  onCleanup(() => {
+    window.removeEventListener("scroll", onWinScroll);
+    if (scrollRaf !== undefined) cancelAnimationFrame(scrollRaf);
+  });
 
   // 全书进度（0..100）：章节序号 + 本章内滚动进度。
   const bookPct = () => {
@@ -634,17 +660,26 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     window.getSelection()?.removeAllRanges();
   };
 
+  // 点搜索结果跳章的共用骨架：定 term → 关搜索面板 → 章未载入则
+  // resetToChapter(scroll:false) → 定选中处（currentOccurrence 的
+  // effect 接手标亮并滚动定位）。两处对 currentMatch/currentOccurrence
+  // 的语义不同：jumpToSearchHit 传 (-1, -1)（只标亮该词全部出现处，
+  // 再由它自己滚到第一处）；jumpToMatch 传 (i, k)（选中第 i 处）。
+  const jumpToMatchAt = async (chapterIdx: number, matchIndex: number, occurrenceIdx: number) => {
+    setSearchTerm(inBookQ().trim());
+    setCurrentMatch(matchIndex);
+    setShowSearch(false);
+    if (!chapterEl(chapterIdx)) {
+      setCurrentOccurrence(-1);
+      await resetToChapter(chapterIdx, { scroll: false });
+    }
+    setCurrentOccurrence(occurrenceIdx);
+  };
+
   // 点章节搜索结果（拼音回退时用）：跳到那章，标亮该词全部出现处，滚到第一处。
   const jumpToSearchHit = async (h: SearchHit) => {
-    const term = inBookQ().trim();
-    setSearchTerm(term);
-    setCurrentMatch(-1);
-    setCurrentOccurrence(-1);
     setInBookHits([]);
-    setShowSearch(false);
-    if (!chapterEl(h.chapter_idx)) {
-      await resetToChapter(h.chapter_idx, { scroll: false });
-    }
+    await jumpToMatchAt(h.chapter_idx, -1, -1);
     requestAnimationFrame(() => {
       chapterEl(h.chapter_idx)?.querySelector("mark.search-hit")?.scrollIntoView({ block: "center" });
     });
@@ -655,16 +690,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const jumpToMatch = async (i: number) => {
     const m = inBookMatches()[i];
     if (!m) return;
-    setSearchTerm(inBookQ().trim());
-    setCurrentMatch(i);
-    setShowSearch(false);
     // 该处在本章里的第几个出现处（用来单独标亮）。
     const k = inBookMatches().slice(0, i).filter((x) => x.chapter_idx === m.chapter_idx).length;
-    if (!chapterEl(m.chapter_idx)) {
-      setCurrentOccurrence(-1);
-      await resetToChapter(m.chapter_idx, { scroll: false });
-    }
-    setCurrentOccurrence(k);
+    await jumpToMatchAt(m.chapter_idx, i, k);
   };
 
   // 上一处 / 下一处：超出已加载的结果时先加载下一页（可能要连加载多页，
@@ -698,29 +726,13 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
 
   const clearSearch = () => {
     setInBookQ("");
-    setInBookMatches([]);
-    setInBookMatchTotal(0);
-    setInBookMatchPage(1);
-    setInBookHits([]);
-    setInBookTotal(0);
-    setSearchTerm("");
-    setCurrentMatch(-1);
-    setCurrentOccurrence(-1);
-    setSearchDone(false);
+    resetSearchState();
   };
 
   const searchInBook = async () => {
     const q = inBookQ().trim();
     if (!q) return;
-    setSearchTerm("");
-    setCurrentMatch(-1);
-    setCurrentOccurrence(-1);
-    setInBookMatches([]);
-    setInBookMatchTotal(0);
-    setInBookMatchPage(1);
-    setInBookHits([]);
-    setInBookTotal(0);
-    setSearchDone(false);
+    resetSearchState();
     setInBookSearching(true);
     try {
       const res = await api.listMatches(props.bookId, q, 1, 500);
@@ -821,7 +833,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       <Show when={searchTerm() && showChrome()}>
         <div class="card row">
           <Show when={currentMatch() >= 0} fallback={
-            <span>搜索「{searchTerm()}」：本章 {(currentChapter()?.paragraphs ?? []).reduce((n, p) => n + (p.text ?? "").split(searchTerm()).length - 1, 0)} 处</span>
+            <span>搜索「{searchTerm()}」：本章 {currentChapterHitCount()} 处</span>
           }>
             <span>搜索「{searchTerm()}」：第 {currentMatch() + 1} / 共 {inBookMatchTotal()} 处</span>
             <button onClick={() => stepMatch(-1)}>‹ 上一处</button>

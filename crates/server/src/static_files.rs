@@ -1,8 +1,6 @@
 //! Serve the embedded frontend dist (include_dir) with SPA fallback.
 //! If `frontend/dist` was absent at build time (no `frontend_dist` cfg),
 //! serve a placeholder page instead of failing the build.
-//! TODO(main agent): build `frontend/dist` before release builds so the real
-//! PWA is embedded.
 
 use crate::api::AppState;
 use axum::extract::State;
@@ -17,7 +15,8 @@ const PLACEHOLDER: &str = r#"<!doctype html><html lang="zh-CN"><head><meta chars
 <body><h1>shuku</h1><p>Frontend dist not embedded in this build (placeholder). API is live at <code>/api/health</code>.</p></body></html>"#;
 
 fn content_type(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("") {
+    // rsplit always yields at least one item.
+    match path.rsplit('.').next().unwrap() {
         "html" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -83,19 +82,8 @@ pub async fn serve(State(_state): State<AppState>, uri: Uri) -> Response {
             )
                 .into_response();
         }
-        if rel.is_empty() {
-            if let Some(f) = DIST.get_file("index.html") {
-                return (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                        (header::CACHE_CONTROL, "no-cache"),
-                    ],
-                    f.contents().to_vec(),
-                )
-                    .into_response();
-            }
-        }
+        // (No separate empty-rel branch: rel == "" has no file and no
+        // '.', so the or_else above already fell back to index.html.)
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
     #[cfg(not(frontend_dist))]
