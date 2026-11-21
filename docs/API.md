@@ -31,6 +31,11 @@
 - 检索走 tantivy，禁止 SQLite LIKE；索引含 `pinyin` 字段（书名+作者+章节名拼音，空格分隔与连写两种形式），查询侧把拉丁字母按音节切分（`xiuxian` → `xiu xian`），所以打拼音能找到汉字书名/作者；索引版本 4（老库下次扫描自动重建）
 - `GET /api/suggest?q=` — 搜索联想：书名/作者子串匹配（书名优先）+ 全文索引补足（覆盖拼音），最多 8 条 `{id, title, author}`
 
+## 语义搜索（按情节描述找段落）
+- 数据文件 `$SHUKU_DATA_DIR/semantic.json`（离线生成，当前为最近阅读前 6 本、14235 个段落）：段落向量为 bge-small-zh-v1.5（q8、mean pooling、L2 归一化），int8 量化存储（每段落存 min/scale，量化后试点排名不变）；无此文件时接口报 `available: false`，服务其余功能不受影响
+- `GET /api/semantic/status` — `{available, dims, chunk_count, book_count}`
+- `POST /api/semantic/search` — body `{vector: [512 个 float], top_k?: 10}`，返回 `{items: [{book_id, book_title, chapter_idx, chapter_title, chunk_idx, snippet（约 250 字）, score（余弦相似度）}], total}`；查询向量在浏览器内嵌（transformers.js，同模型/同 dtype/同 pooling，查询加 instruction 前缀「为这个句子生成表示以用于检索相关文章：」），后端只做余弦相似度，不跑模型；向量维数不对报 400，无 semantic.json 报 404
+
 ## 阅读统计
 - `GET /api/stats` — `{total_books, reading_books, finished_books（读到最后一章）, total_seconds（阅读器上报的累计时长）, active_days, finished_by_month[[月, 本数]], recent_finished[[id, title, author, ts]], top_books_by_time[[id, title, author, seconds]]}`；上限：`finished_by_month` 最近 12 个月，`recent_finished` 与 `top_books_by_time` 各 10 条
 

@@ -7,6 +7,7 @@ use crate::db::{BookRow, Database};
 use crate::parser;
 use crate::scheduler::Scheduler;
 use crate::search::SearchIndex;
+use crate::semantic::{SemanticHit, SemanticStore};
 use crate::source::{Engine, SourceDef};
 use anyhow::{anyhow, Context, Result};
 use axum::extract::{Path, Query, State};
@@ -31,6 +32,10 @@ pub struct AppState {
     /// Parsed local-book chapters, so `get_chapter` does not re-parse the
     /// whole book file on every chapter request.
     pub chapter_cache: Arc<ChapterCache>,
+    /// Precomputed semantic-search chunk embeddings, when a
+    /// `$data_dir/semantic.json` was present and loaded at startup.
+    /// `None` means the feature is unavailable (never a boot failure).
+    pub semantic: Option<Arc<SemanticStore>>,
 }
 
 /// In-memory cache of parsed local-book chapters. Keyed by book id; each
@@ -187,6 +192,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/books/{id}/cover", get(get_book_cover))
         .route("/api/search", get(search))
         .route("/api/suggest", get(suggest))
+        .route("/api/semantic/status", get(semantic_status))
+        .route("/api/semantic/search", post(semantic_search))
         .route("/api/sources", get(list_sources).post(create_source))
         .route("/api/sources/import", post(import_sources))
         .route("/api/sources/export", get(export_sources))
@@ -510,6 +517,55 @@ async fn search(State(s): State<AppState>, Query(q): Query<SearchQuery>) -> ApiR
     let search = s.search.clone();
     let (hits, total) = tokio::task::spawn_blocking(move || search.search(&query, ids.as_deref(), source, limit, offset)).await??;
     Ok(page_envelope(hits, total as i64, q.pq().page(), q.pq().page_size()))
+}
+
+/// Semantic search: status of the precomputed embedding store.
+async fn semantic_status(State(s): State<AppState>) -> Json<Value> {
+    match &s.semantic {
+        Some(store) => Json(json!({
+            "available": true,
+            "dims": store.dims,
+            "chunk_count": store.chunk_count(),
+            "book_count": store.book_count(),
+        })),
+        None => Json(json!({ "available": false })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SemanticSearchBody {
+    /// Query embedding, same dims as the store (bge-small-zh-v1.5 = 512),
+    /// ideally L2-normalized (the store normalizes defensively anyway).
+    vector: Vec<f32>,
+    top_k: Option<usize>,
+}
+
+/// Semantic search: cosine similarity of the query embedding against the
+/// precomputed chunk vectors. The query embedding is produced in the
+/// browser (transformers.js, same model/dtype/pooling as the chunks);
+/// the server only compares vectors, so no ML runs here.
+async fn semantic_search(
+    State(s): State<AppState>,
+    Json(body): Json<SemanticSearchBody>,
+) -> ApiResult<Json<Value>> {
+    let Some(store) = s.semantic.clone() else {
+        return Err(ApiError::not_found(
+            "semantic search is not available (no semantic.json)",
+        ));
+    };
+    if body.vector.len() != store.dims {
+        return Err(ApiError::bad_request(format!(
+            "vector must have {} dims, got {}",
+            store.dims,
+            body.vector.len()
+        )));
+    }
+    let top_k = body.top_k.unwrap_or(10);
+    let vector = body.vector;
+    let hits: Vec<SemanticHit> =
+        tokio::task::spawn_blocking(move || store.search(&vector, top_k)).await?;
+    let total = hits.len();
+    Ok(Json(json!({ "items": hits, "total": total })))
 }
 
 /// Flat in-book match list: every literal occurrence of the query in

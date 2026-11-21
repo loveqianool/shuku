@@ -10,6 +10,7 @@ mod parser;
 mod scanner;
 mod scheduler;
 mod search;
+mod semantic;
 mod source;
 mod static_files;
 mod xpath;
@@ -19,6 +20,7 @@ use config::Config;
 use db::Database;
 use scheduler::{run_crawl_worker, run_scan_worker, Scheduler};
 use search::SearchIndex;
+use semantic::SemanticStore;
 use source::Engine;
 use std::sync::Arc;
 use tracing::info;
@@ -105,6 +107,30 @@ async fn main() -> anyhow::Result<()> {
         .enqueue_task("scan_tasks", "scan", &serde_json::json!({}).to_string())
         .await;
 
+    // Semantic search store (precomputed chunk embeddings, optional):
+    // absent or malformed file just disables the feature, never the boot.
+    let semantic_path = cfg.data_dir.join("semantic.json");
+    let semantic = if semantic_path.exists() {
+        match SemanticStore::load(&semantic_path) {
+            Ok(s) => {
+                info!(
+                    "semantic search ready: {} chunks, {} books, dims {}",
+                    s.chunk_count(),
+                    s.book_count(),
+                    s.dims
+                );
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!("semantic.json present but failed to load ({e}); semantic search disabled");
+                None
+            }
+        }
+    } else {
+        info!("no semantic.json in data dir; semantic search disabled");
+        None
+    };
+
     let state = api::AppState {
         db: database,
         search,
@@ -112,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         scheduler: sched,
         config: cfg.clone(),
         chapter_cache: Arc::new(api::ChapterCache::new(8)),
+        semantic,
     };
     let app = api::router(state);
 

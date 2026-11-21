@@ -171,6 +171,23 @@ export interface Suggestion {
   author: string;
 }
 
+export interface SemanticStatus {
+  available: boolean;
+  dims?: number;
+  chunk_count?: number;
+  book_count?: number;
+}
+
+export interface SemanticHit {
+  book_id: string;
+  book_title: string;
+  chapter_idx: number;
+  chapter_title: string;
+  chunk_idx: number;
+  snippet: string;
+  score: number;
+}
+
 export interface TaskStats {
   scan_pending?: number;
   crawl_pending?: number;
@@ -229,6 +246,12 @@ export const api = {
     req<Page<BookMatch>>(`/api/books/${encodeURIComponent(bookId)}/matches${qs({ q, page, page_size })}`),
   suggest: (q: string) =>
     req<{ items: Suggestion[] }>("/api/suggest" + qs({ q })),
+  semanticStatus: () => req<SemanticStatus>("/api/semantic/status"),
+  semanticSearch: (vector: number[], top_k = 10) =>
+    req<{ items: SemanticHit[]; total: number }>("/api/semantic/search", {
+      method: "POST",
+      body: JSON.stringify({ vector, top_k }),
+    }),
 
   listSources: async (): Promise<Source[]> =>
     (await req<{ items: Source[]; total: number }>("/api/sources")).items,

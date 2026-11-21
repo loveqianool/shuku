@@ -1,5 +1,11 @@
 # CHANGELOG — shuku
 
+## 语义搜索（2026-11-21，6 本试点转常驻）
+- 后端新增 `src/semantic.rs`：读 `$SHUKU_DATA_DIR/semantic.json`（离线生成的段落向量），int8 量化向量解码后做余弦相似度；无文件时功能关闭、不影响启动。新增 `GET /api/semantic/status` 与 `POST /api/semantic/search`（body `{vector: [512 float], top_k}`）；依赖新增 `base64 0.22`。
+- 前端新增 `pages/SemanticSearch.tsx`（路由 `#/semantic`，导航「语义搜索」）：查询向量在浏览器内嵌（transformers.js CDN 动态 import，同模型 bge-small-zh-v1.5 q8 / mean pooling / normalize，查询加 instruction 前缀），发给后端比对，点结果跳阅读器对应章节。
+- 数据：当前 semantic.json 为最近阅读前 6 本、14235 个段落（约 23MB，int8 量化 + 正文截短 250 字）；量化后自测排名与 float32 完全一致（4 场景排 1、6、1、1 名）。数据文件不进 git，部署时单独放到 jparm 数据目录。
+- 测试：新增 3 个 semantic 单元测试（余弦排序、维数校验、JSON 加载往返）；全量 123 单元 + 2 端到端全绿；本地冒烟：`/api/semantic/status` 返 available 且 14235 段，POST 查询向量头名即目标段落。
+
 ## 依赖版本决策（已验证可编译）
 
 - `tantivy 0.27.0` + `tantivy-jieba 0.21.0`：直接兼容，无需降级。

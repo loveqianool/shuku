@@ -2,6 +2,7 @@ import { createSignal, onCleanup, onMount, Show, type Component } from "solid-js
 import { readerChrome } from "./lib/readerChrome";
 import Bookshelf from "./pages/Bookshelf";
 import SearchPage from "./pages/SearchPage";
+import SemanticSearch from "./pages/SemanticSearch";
 import Reader from "./pages/Reader";
 import Sources from "./pages/Sources";
 import Duplicates from "./pages/Duplicates";
@@ -11,7 +12,7 @@ import Picker from "./pages/Picker";
 import Tasks from "./pages/Tasks";
 
 export interface Route {
-  name: "books" | "search" | "read" | "sources" | "test" | "picker" | "tasks" | "duplicates" | "stats";
+  name: "books" | "search" | "semantic" | "read" | "sources" | "test" | "picker" | "tasks" | "duplicates" | "stats";
   bookId?: string;
   chapterIdx?: number;
   sourceId?: string;
@@ -21,6 +22,7 @@ function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, "");
   const parts = h.split("/").filter(Boolean);
   if (parts[0] === "search") return { name: "search" };
+  if (parts[0] === "semantic") return { name: "semantic" };
   if (parts[0] === "read" && parts[1]) {
     const n = Number(parts[2]);
     return { name: "read", bookId: decodeURIComponent(parts[1]), chapterIdx: parts[2] && Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0 };
@@ -92,6 +94,7 @@ const App: Component = () => {
       <nav class="nav" classList={{ "nav-overlay": route().name === "read" }}>
         <a href="#/" class={route().name === "books" ? "brand active" : "brand"}>📚 书库</a>
         <a href="#/search" class={route().name === "search" ? "active" : ""}>检索</a>
+        <a href="#/semantic" class={route().name === "semantic" ? "active" : ""}>语义搜索</a>
         <a href="#/sources" class={route().name === "sources" || route().name === "test" ? "active" : ""}>书源</a>
         <a href="#/picker" class={route().name === "picker" ? "active" : ""}>规则拾取</a>
         <a href="#/duplicates" class={route().name === "duplicates" ? "active" : ""}>去重</a>
@@ -107,6 +110,7 @@ const App: Component = () => {
       </Show>
       <Show when={route().name === "books"}><Bookshelf /></Show>
       <Show when={route().name === "search"}><SearchPage /></Show>
+      <Show when={route().name === "semantic"}><SemanticSearch /></Show>
       <Show when={route().name === "read" && route().bookId}>
         <Reader bookId={route().bookId!} initialIdx={route().chapterIdx ?? 0} />
       </Show>
