@@ -64,6 +64,12 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .recent-row { padding: 6px 2px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .recent-row:last-child { border-bottom: none; }
 .recent-row:hover { background: var(--surface2); }
+/* 最近阅读左滑移除：外层裁剪，底下是红色移除区，行本身不透明（var(--surface) 与卡片一致），
+   touch-action: pan-y 让浏览器只接管竖向滚动，横向滑动交给 JS。 */
+.recent-swipe { position: relative; overflow: hidden; }
+.recent-swipe-bg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: flex-end; background: var(--danger); color: #fff; padding: 0 16px; font-size: 14px; }
+.recent-swipe-row { position: relative; background: var(--surface); touch-action: pan-y; }
+.recent-swipe-row.sliding { transition: transform 0.2s ease-out; }
 
 /* 阅读页 */
 .reader { max-width: 720px; margin: 0 auto; }

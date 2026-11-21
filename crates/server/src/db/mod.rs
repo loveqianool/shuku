@@ -1350,6 +1350,19 @@ impl Database {
             .await
     }
 
+    /// Delete a book's reading progress. That is what removes it from
+    /// the 最近阅读 list (recent_books joins on reading_progress), and
+    /// it also forgets the reading position; the book itself stays in
+    /// the library, and opening it again re-creates progress.
+    pub async fn delete_progress(&self, book_id: &str) -> Result<()> {
+        let book_id = book_id.to_string();
+        self.call_db(move |c| {
+                c.execute("DELETE FROM reading_progress WHERE book_id=?1", params![book_id])?;
+                Ok(())
+            })
+            .await
+    }
+
     /// The most recently opened books, for the 最近阅读 list: one row
     /// per book (reading_progress has book_id as PRIMARY KEY), newest
     /// first. Opening a book writes progress (see Reader loadChapter),
@@ -1861,6 +1874,33 @@ mod tests {
         let got = db.recent_books(1).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].book.id, "2");
+    }
+
+    #[tokio::test]
+    async fn delete_progress_removes_from_recent() {
+        let db = Database::open_in_memory().await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mk = |id: &str, title: &str| BookRow {
+            id: id.into(), title: title.into(), author: "".into(), path: None,
+            source_url: None, source: "local".into(),
+            mtime: now, size: 0, index_version: 1, status: "ok".into(), chapter_count: 5,
+            created_at: now, updated_at: now, source_id: String::new(),
+            has_update: false, last_update_check: 0, cover_mime: String::new(),
+        };
+        db.upsert_book(&mk("1", "第一本")).await.unwrap();
+        db.upsert_book(&mk("2", "第二本")).await.unwrap();
+        db.put_progress("1", 2, 0).await.unwrap();
+        db.put_progress("2", 0, 0).await.unwrap();
+        assert_eq!(db.recent_books(100).await.unwrap().len(), 2);
+        db.delete_progress("1").await.unwrap();
+        // Progress gone (so the reader restarts at chapter 0) and the
+        // book is out of the recent list; the other book is untouched.
+        assert_eq!(db.get_progress("1").await.unwrap(), None);
+        let got = db.recent_books(100).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].book.id, "2");
+        // Deleting a book with no progress is a no-op, not an error.
+        db.delete_progress("1").await.unwrap();
     }
 
     #[tokio::test]

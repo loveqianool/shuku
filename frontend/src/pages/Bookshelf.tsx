@@ -4,6 +4,102 @@ import { api, type Book, type RecentBook } from "../lib/api";
 
 const PAGE_SIZE = 50;
 
+// 最近阅读的一行：左滑移除。Pointer Events 统一触摸/鼠标；
+// touch-action: pan-y（样式）让浏览器只接管竖向滚动，横向滑动交给这里。
+// 滑过 80px 松手即移除（先滑出动画，再调接口删进度并从列表去掉）；
+// 没滑够则回弹。一次横向滑动不会触发点开（suppressClick 挡住随后的 click）。
+function RecentRow(props: { book: RecentBook; onRemove: (id: string) => void }) {
+  const [offsetX, setOffsetX] = createSignal(0);
+  const [sliding, setSliding] = createSignal(false);
+  let rowEl: HTMLDivElement | undefined;
+  let startX = 0;
+  let startY = 0;
+  let tracking = false;
+  let isSwipe = false;
+  let suppressClick = false;
+
+  const onPointerDown = (e: PointerEvent) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    tracking = true;
+    isSwipe = false;
+    suppressClick = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    setSliding(false);
+  };
+  const onPointerMove = (e: PointerEvent) => {
+    if (!tracking) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (!isSwipe) {
+      if (Math.abs(dy) > 12 && Math.abs(dy) > Math.abs(dx)) {
+        // 竖向滚动：交给浏览器，停止跟手。
+        tracking = false;
+        return;
+      }
+      if (Math.abs(dx) > 12) {
+        isSwipe = true;
+        suppressClick = true;
+        try {
+          rowEl?.setPointerCapture(e.pointerId);
+        } catch {
+          /* 指针已释放 */
+        }
+      }
+    }
+    if (isSwipe) {
+      // 只允许向左，夹在 [-160, 0]。
+      setOffsetX(Math.min(0, Math.max(-160, dx)));
+    }
+  };
+  const finish = (remove: boolean) => {
+    tracking = false;
+    setSliding(true);
+    if (remove) {
+      setOffsetX(-(rowEl?.offsetWidth ?? 320));
+      window.setTimeout(() => props.onRemove(props.book.id), 200);
+    } else {
+      setOffsetX(0);
+    }
+  };
+  const onPointerUp = () => {
+    if (!tracking) return;
+    finish(isSwipe && offsetX() < -80);
+  };
+  const onPointerCancel = () => {
+    if (!tracking) return;
+    finish(false);
+  };
+  const onClick = () => {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    location.hash = `#/read/${encodeURIComponent(props.book.id)}/${props.book.last_chapter_idx}`;
+  };
+
+  return (
+    <div class="recent-swipe">
+      <div class="recent-swipe-bg">移除</div>
+      <div
+        ref={rowEl}
+        class="recent-row recent-swipe-row"
+        classList={{ sliding: sliding() }}
+        style={{ transform: `translateX(${offsetX()}px)` }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerCancel}
+        onClick={onClick}
+      >
+        <strong>{props.book.title}</strong>
+        <span class="muted"> {props.book.author ?? ""}</span>
+        <span class="muted"> · 第 {props.book.last_chapter_idx + 1} 章</span>
+      </div>
+    </div>
+  );
+}
+
 const Bookshelf: Component = () => {
   const [q, setQ] = createSignal("");
   const [author, setAuthor] = createSignal("");
@@ -27,6 +123,18 @@ const Bookshelf: Component = () => {
   const [recent, setRecent] = createSignal<RecentBook[]>([]);
   const [recentOpen, setRecentOpen] = createSignal(true);
   let parentRef: HTMLDivElement | undefined;
+
+  // 左滑移除：先从列表去掉（即时反馈），再调接口删进度；接口失败则
+  // 把该行加回去（避免列表与服务端不一致）。
+  const removeRecent = async (id: string) => {
+    const prev = recent();
+    setRecent(prev.filter((r) => r.id !== id));
+    try {
+      await api.deleteProgress(id);
+    } catch {
+      setRecent(prev);
+    }
+  };
 
   // 每次筛选输入都会触发 load，连续输入会并发多个请求；用序号丢弃过期响应，
   // 否则先发的慢响应会覆盖后发的筛选结果。
@@ -115,23 +223,16 @@ const Bookshelf: Component = () => {
           <option value="author">作者</option>
         </select>
       </div>
-      <Show when={recent().length > 0}>
+      {/* 书名搜索时自动隐藏最近阅读（给搜索结果让地方）；清空搜索后恢复
+          （recentOpen 折叠状态保留）。只看书名输入，不看作者/标签。 */}
+      <Show when={recent().length > 0 && q().trim() === ""}>
         <div class="card">
           <h3 style={{ cursor: "pointer", margin: "0 0 8px" }} onClick={() => setRecentOpen(!recentOpen())}>
             最近阅读 {recentOpen() ? "▾" : "▸"}
           </h3>
           <Show when={recentOpen()}>
             <For each={recent()}>
-              {(r) => (
-                <div
-                  class="recent-row"
-                  onClick={() => (location.hash = `#/read/${encodeURIComponent(r.id)}/${r.last_chapter_idx}`)}
-                >
-                  <strong>{r.title}</strong>
-                  <span class="muted"> {r.author ?? ""}</span>
-                  <span class="muted"> · 第 {r.last_chapter_idx + 1} 章</span>
-                </div>
-              )}
+              {(r) => <RecentRow book={r} onRemove={removeRecent} />}
             </For>
           </Show>
         </div>

@@ -202,7 +202,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sources/{id}/health-check", post(trigger_health_check))
         .route("/api/sources/subscribe", post(subscribe_sources))
         .route("/api/picker/fetch", post(picker_fetch))
-        .route("/api/books/{id}/progress", get(get_progress).put(put_progress))
+        .route("/api/books/{id}/progress", get(get_progress).put(put_progress).delete(delete_progress))
         .route("/api/books/{id}/reading-time", post(add_reading_time))
         .route("/api/stats", get(reading_stats))
         .route("/api/books/{id}/bookmarks", get(list_bookmarks).post(add_bookmark))
@@ -835,6 +835,14 @@ async fn get_progress(State(s): State<AppState>, Path(id): Path<String>) -> ApiR
 
 async fn put_progress(State(s): State<AppState>, Path(id): Path<String>, Json(req): Json<ProgressReq>) -> ApiResult<Json<Value>> {
     s.db.put_progress(&id, req.chapter_idx, req.offset).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Remove a book from 最近阅读: deletes its reading progress row
+/// (recent_books joins on reading_progress). The book itself stays in
+/// the library; opening it again re-creates progress.
+async fn delete_progress(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    s.db.delete_progress(&id).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

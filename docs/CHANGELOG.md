@@ -1,5 +1,9 @@
 # CHANGELOG — shuku
 
+## 最近阅读两改（2026-11-21）
+- 书名搜索时自动隐藏最近阅读：书库页书名输入框非空时不渲染最近阅读区块（只看书名，不看作者/标签）；清空搜索后恢复，折叠状态保留。
+- 最近阅读左滑移除：每行支持左滑（Pointer Events + `touch-action: pan-y`，触摸/鼠标通用，竖向滚动不受影响），滑过 80px 松手即移除（滑出动画 200ms），没滑够回弹；滑动不会误触点开。移除调 `DELETE /api/books/:id/progress` 删阅读进度（书从最近阅读消失、阅读位置清除，书本身仍在书库，再打开重新写入进度）；接口失败时该行恢复。后端新增 `Database::delete_progress` + 单元测试。
+
 ## 语义搜索（2026-11-21，6 本试点转常驻）
 - 后端新增 `src/semantic.rs`：读 `$SHUKU_DATA_DIR/semantic.json`（离线生成的段落向量），int8 量化向量解码后做余弦相似度；无文件时功能关闭、不影响启动。新增 `GET /api/semantic/status` 与 `POST /api/semantic/search`（body `{vector: [512 float], top_k}`）；依赖新增 `base64 0.22`。
 - 前端新增 `pages/SemanticSearch.tsx`（路由 `#/semantic`，导航「语义搜索」）：查询向量在浏览器内嵌（transformers.js CDN 动态 import，同模型 bge-small-zh-v1.5 q8 / mean pooling / normalize，查询加 instruction 前缀），发给后端比对，点结果跳阅读器对应章节。

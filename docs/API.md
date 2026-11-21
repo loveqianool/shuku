@@ -60,6 +60,7 @@
 
 ## 进度 / 书签 / 标签
 - `GET/PUT /api/books/:id/progress` `{chapter_idx, offset}`（PUT 幂等）
+- `DELETE /api/books/:id/progress` — 删阅读进度：该书从最近阅读移除（recent 按 reading_progress 出），阅读位置也一并清除；书本身仍在书库，再打开会重新写入进度
 - `GET/POST/DELETE /api/books/:id/bookmarks` `{chapter_idx, offset, note?}`
 - `GET/POST/DELETE /api/books/:id/tags`；`GET /api/tags`
 

@@ -275,6 +275,8 @@ export const api = {
   getProgress: (id: string) => req<Progress>(`/api/books/${encodeURIComponent(id)}/progress`),
   saveProgress: (id: string, p: Progress) =>
     req<Progress>(`/api/books/${encodeURIComponent(id)}/progress`, { method: "PUT", body: JSON.stringify(p) }),
+  deleteProgress: (id: string) =>
+    req<{ ok: boolean }>(`/api/books/${encodeURIComponent(id)}/progress`, { method: "DELETE" }),
   listTasks: (type?: "scan" | "crawl", status?: string, page = 1, page_size = 20) =>
     req<Page<TaskItem>>("/api/tasks" + qs({ type, status, page, page_size })),
   taskStats: () => req<TaskStats>("/api/tasks/stats"),
