@@ -635,14 +635,33 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       }
     });
   };
-  // 点正文切换顶栏/底栏显隐（有选词时不切换，免得干扰批注）。
+  // 点按 vs 拖动选词：记录按下位置与是否移动过。点按（移动 <10px）切换
+  // 顶栏/底栏，并清掉残留选区；拖动（移动大）是在选词，不切换。
+  // 以前只看 window.getSelection() 是否为空：搜索跳转后残留选区会一直
+  // 挡住切换，顶栏/底栏再也唤不出来，搜索、目录都点不开。
+  let pressX = 0;
+  let pressY = 0;
+  let pressMoved = false;
+  const onContentPointerDown = (e: PointerEvent) => {
+    pressX = e.clientX;
+    pressY = e.clientY;
+    pressMoved = false;
+  };
+  const onContentPointerMove = (e: PointerEvent) => {
+    if (Math.abs(e.clientX - pressX) > 10 || Math.abs(e.clientY - pressY) > 10) pressMoved = true;
+  };
+  // 点正文切换顶栏/底栏显隐（拖动选词时不切换，免得干扰批注；点按一定切换）。
   const toggleChrome = () => {
-    const sel = window.getSelection();
-    if (sel && sel.toString().trim()) return;
+    if (pressMoved) return;
+    window.getSelection()?.removeAllRanges();
+    setSelText("");
     setShowChrome(!showChrome());
   };
 
   const onSelect = () => {
+    // 只有拖动选词才记选区；点按不记（toggleChrome 随后会清掉残留选区，
+    // 免得选词条闪一下）。
+    if (!pressMoved) return;
     const sel = window.getSelection();
     const t = sel?.toString().trim() ?? "";
     setSelText(t.length > 1 && t.length < 500 ? t : "");
@@ -953,6 +972,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         }}
         onClick={toggleChrome}
         onMouseUp={onSelect}
+        onPointerDown={onContentPointerDown}
+        onPointerMove={onContentPointerMove}
       >
         <For each={chapters()}>
           {(ch) => (
