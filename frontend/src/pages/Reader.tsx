@@ -49,7 +49,13 @@ function splitOnTerm(text: string, term: string) {
 const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [book, setBook] = createSignal<Book | null>(null);
   const [toc, setToc] = createSignal<ChapterMeta[]>([]);
-  const [showToc, setShowToc] = createSignal(false);
+  // 三个面板（目录/搜索/设置）用一个状态，互斥是结构保证的——
+  // 以前三个 boolean 各自开关，搜索和目录能同时打开互相盖住。
+  type Panel = "toc" | "search" | "settings" | null;
+  const [panel, setPanel] = createSignal<Panel>(null);
+  const showToc = () => panel() === "toc";
+  const showSearch = () => panel() === "search";
+  const showSettings = () => panel() === "settings";
   // 已载入的章节（按 idx 升序连续）。跳章/搜尋跳轉時重置窗口，只留目標章起
   // 的內容，避免一次抓幾十章；自然滾動時逐章追加/前補。
   const [chapters, setChapters] = createSignal<Chapter[]>([]);
@@ -83,8 +89,6 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   const [searchTerm, setSearchTerm] = createSignal("");
   // 仿另一家阅读器的交互：顶栏和底栏平时显示，点一下正文收起来，
   // 再点一下浮出来；搜尋与设置面板由底栏按钮唤出，平时收起。
-  const [showSearch, setShowSearch] = createSignal(false);
-  const [showSettings, setShowSettings] = createSignal(false);
   // 当前章内滚动进度（0..1），驱动右边的竖向滑杆与全书进度。
   const [scrollFrac, setScrollFrac] = createSignal(0);
   // 竖向全书滑杆拖动中的值（null 表示没在拖），松手才跳章，免得拖动时反复加载。
@@ -477,9 +481,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     // 换书：清掉上本书的搜索/目录/设置等状态，免得旧内容闪一下。
     setInBookQ("");
     resetSearchState();
-    setShowToc(false);
-    setShowSearch(false);
-    setShowSettings(false);
+    setPanel(null);
+    setPanel(null);
+    setPanel(null);
     setChapterIssues(null);
     setSameAuthor([]);
     setScrollFrac(0);
@@ -622,18 +626,15 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   // 底栏「搜索」：只浮出搜索面板并聚焦输入框，不显示顶栏/底栏。
   // 回到结果列表时滚回上次点过的匹配处（jumpToMatch 会收起面板、卸载
   // 列表 DOM，再开时位置归零；这里用 current 匹配项恢复位置）。
+  // 面板是 fixed 悬浮层，输入框恒在视口顶部，focus 不用滚页面。
   let searchInputRef: HTMLInputElement | undefined;
   let matchListRef: HTMLDivElement | undefined;
   const openSearch = () => {
     setShowChrome(false);
-    // 面板互斥：开搜索时关目录和设置，免得搜索盖住目录（看似目录打不开）。
-    setShowToc(false);
-    setShowSettings(false);
-    setShowSearch(true);
+    setPanel("search");
     requestAnimationFrame(() => {
-      const hasCurrent = currentMatch() >= 0 && inBookMatches().length > 0;
-      searchInputRef?.focus({ preventScroll: hasCurrent });
-      if (hasCurrent) {
+      searchInputRef?.focus({ preventScroll: true });
+      if (currentMatch() >= 0 && inBookMatches().length > 0) {
         matchListRef?.querySelector(".match-row.current")?.scrollIntoView({ block: "nearest" });
       }
     });
@@ -688,9 +689,12 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   // 的语义不同：jumpToSearchHit 传 (-1, -1)（只标亮该词全部出现处，
   // 再由它自己滚到第一处）；jumpToMatch 传 (i, k)（选中第 i 处）。
   const jumpToMatchAt = async (chapterIdx: number, matchIndex: number, occurrenceIdx: number) => {
+    // 跳转时让搜索框失焦，收起手机键盘（否则键盘一直盖着底栏，目录/搜索点不到）。
+    searchInputRef?.blur();
+    (document.activeElement as HTMLElement | null)?.blur?.();
     setSearchTerm(inBookQ().trim());
     setCurrentMatch(matchIndex);
-    setShowSearch(false);
+    setPanel(null);
     if (!chapterEl(chapterIdx)) {
       setCurrentOccurrence(-1);
       await resetToChapter(chapterIdx, { scroll: false });
@@ -788,8 +792,12 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         </div>
       </Show>
 
+      {/* 搜索面板：fixed 悬浮层（不是文档流）。以前是文档流里的普通 .card，
+          插在正文最上面：读到深处点搜索时面板在文档顶，focus() 滚上去会
+          被手机键盘顶出可视区，键盘弹出来搜索框就不见了。现在固定在视
+          口顶部，不管滚到哪、键盘怎么弹，输入框都在。结果多时面板内部滚动。 */}
       <Show when={showSearch()}>
-        <div class="card">
+        <div class="reader-search">
           <div class="row">
             <input
               ref={searchInputRef}
@@ -799,56 +807,53 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
               onKeyDown={(e) => { if (e.key === "Enter") searchInBook(); }}
             />
             <button disabled={inBookSearching()} onClick={searchInBook}>搜</button>
-            <button onClick={() => { setShowSearch(false); clearSearch(); }}>✕</button>
+            <button onClick={() => { searchInputRef?.blur(); (document.activeElement as HTMLElement | null)?.blur?.(); setPanel(null); clearSearch(); }}>✕</button>
           </div>
-        </div>
-      </Show>
-
-      <Show when={showSearch() && inBookMatches().length > 0}>
-        <div class="card" ref={matchListRef}>
-          <strong>本书内搜索「{inBookQ()}」：共 {inBookMatchTotal()} 处</strong>
-          <button onClick={clearSearch}>清除</button>
-          <For each={inBookMatches()}>
-            {(m, i) => (
-              <p
-                class="match-row"
-                classList={{ current: i() === currentMatch() }}
-                onClick={() => jumpToMatch(i())}
-              >
-                <span class="muted">{i() + 1}. </span>
-                <span innerHTML={m.snippet} />{" "}
-                <span class="muted">{m.chapter_title}</span>
-              </p>
-            )}
-          </For>
-          <Show when={inBookMatches().length < inBookMatchTotal()}>
-            <button onClick={loadMoreMatches}>加载更多（还剩 {inBookMatchTotal() - inBookMatches().length} 处）</button>
+          <Show when={inBookMatches().length > 0}>
+            <div class="match-list" ref={matchListRef}>
+              <strong>本书内搜索「{inBookQ()}」：共 {inBookMatchTotal()} 处</strong>
+              <button onClick={clearSearch}>清除</button>
+              <For each={inBookMatches()}>
+                {(m, i) => (
+                  <p
+                    class="match-row"
+                    classList={{ current: i() === currentMatch() }}
+                    onClick={() => jumpToMatch(i())}
+                  >
+                    <span class="muted">{i() + 1}. </span>
+                    <span innerHTML={m.snippet} />{" "}
+                    <span class="muted">{m.chapter_title}</span>
+                  </p>
+                )}
+              </For>
+              <Show when={inBookMatches().length < inBookMatchTotal()}>
+                <button onClick={loadMoreMatches}>加载更多（还剩 {inBookMatchTotal() - inBookMatches().length} 处）</button>
+              </Show>
+            </div>
           </Show>
-        </div>
-      </Show>
-
-      <Show when={showSearch() && inBookMatches().length === 0 && inBookHits().length > 0}>
-        <div class="card">
-          <strong>本书内搜索：{inBookTotal()} 条</strong>
-          <button onClick={clearSearch}>清除</button>
-          <For each={inBookHits()}>
-            {(h) => (
-              <p>
-                <a href="#" onClick={(e) => { e.preventDefault(); jumpToSearchHit(h); }}>
-                  {h.chapter_title}
-                </a>{" "}
-                {(h.match_count ?? 0) > 0 ? <span class="muted">· {h.match_count} 处 </span> : null}
-                <span innerHTML={h.snippet} />
-              </p>
-            )}
-          </For>
-        </div>
-      </Show>
-
-      <Show when={showSearch() && inBookMatches().length === 0 && inBookHits().length === 0 && searchDone() && inBookQ().trim() !== ""}>
-        <div class="card">
-          <span class="muted">没有找到「{inBookQ()}」</span>
-          <button onClick={clearSearch}>清除</button>
+          <Show when={inBookMatches().length === 0 && inBookHits().length > 0}>
+            <div class="match-list">
+              <strong>本书内搜索：{inBookTotal()} 条</strong>
+              <button onClick={clearSearch}>清除</button>
+              <For each={inBookHits()}>
+                {(h) => (
+                  <p>
+                    <a href="#" onClick={(e) => { e.preventDefault(); jumpToSearchHit(h); }}>
+                      {h.chapter_title}
+                    </a>{" "}
+                    {(h.match_count ?? 0) > 0 ? <span class="muted">· {h.match_count} 处 </span> : null}
+                    <span innerHTML={h.snippet} />
+                  </p>
+                )}
+              </For>
+            </div>
+          </Show>
+          <Show when={inBookMatches().length === 0 && inBookHits().length === 0 && searchDone() && inBookQ().trim() !== ""}>
+            <div class="match-list">
+              <span class="muted">没有找到「{inBookQ()}」</span>
+              <button onClick={clearSearch}>清除</button>
+            </div>
+          </Show>
         </div>
       </Show>
 
@@ -869,7 +874,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
         <div class="toc">
           <For each={toc()}>
             {(c) => (
-              <button class={c.idx === idx() ? "current" : ""} onClick={() => { setShowToc(false); void jumpToChapter(c.idx); }}>
+              <button class={c.idx === idx() ? "current" : ""} onClick={() => { setPanel(null); void jumpToChapter(c.idx); }}>
                 {c.title}
               </button>
             )}
@@ -883,7 +888,7 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       <div class="reader-settings">
         <div class="settings-head">
           <strong>设置</strong>
-          <button onClick={() => setShowSettings(false)}>✕</button>
+          <button onClick={() => setPanel(null)}>✕</button>
         </div>
         <div class="settings-row">
           <label>字号 <input type="number" min={12} max={32} value={s().fontSize} onChange={(e) => patchSettings({ fontSize: Number(e.currentTarget.value) })} /></label>
@@ -1061,9 +1066,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       <Show when={showChrome()}>
         <div class="reader-bottombar">
           <div class="bar-actions">
-            <button onClick={() => { setShowSearch(false); setShowSettings(false); setShowToc(!showToc()); }}>📑 目录</button>
+            <button onClick={() => { setPanel(null); setPanel(null); setPanel(panel() === "toc" ? null : "toc"); }}>📑 目录</button>
             <button onClick={openSearch}>🔍 搜索</button>
-            <button onClick={() => { setShowSearch(false); setShowToc(false); setShowSettings(!showSettings()); }}>⚙️ 设置</button>
+            <button onClick={() => { setPanel(null); setPanel(null); setPanel(panel() === "settings" ? null : "settings"); }}>⚙️ 设置</button>
           </div>
         </div>
       </Show>
