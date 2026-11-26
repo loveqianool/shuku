@@ -626,6 +626,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
   let matchListRef: HTMLDivElement | undefined;
   const openSearch = () => {
     setShowChrome(false);
+    // 面板互斥：开搜索时关目录和设置，免得搜索盖住目录（看似目录打不开）。
+    setShowToc(false);
+    setShowSettings(false);
     setShowSearch(true);
     requestAnimationFrame(() => {
       const hasCurrent = currentMatch() >= 0 && inBookMatches().length > 0;
@@ -1058,9 +1061,9 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       <Show when={showChrome()}>
         <div class="reader-bottombar">
           <div class="bar-actions">
-            <button onClick={() => setShowToc(!showToc())}>📑 目录</button>
+            <button onClick={() => { setShowSearch(false); setShowSettings(false); setShowToc(!showToc()); }}>📑 目录</button>
             <button onClick={openSearch}>🔍 搜索</button>
-            <button onClick={() => setShowSettings(!showSettings())}>⚙️ 设置</button>
+            <button onClick={() => { setShowSearch(false); setShowToc(false); setShowSettings(!showSettings()); }}>⚙️ 设置</button>
           </div>
         </div>
       </Show>
