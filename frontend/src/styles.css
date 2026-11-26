@@ -84,10 +84,9 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .reader-chapter h2 { margin: 0.2em 0 0.8em; }
 /* 全书读完标记（只在全部章节载入后出现）。 */
 .book-end { text-align: center; margin: 2.5em 0 1em; }
-/* 搜索面板：fixed 悬浮层，浮在底栏上方（像设置面板一样，不再贴在视口最顶上；
-   贴顶上时读到深处要点搜索，面板在屏幕顶端够不着）。输入框钉在面板顶部不动，
-   只让结果在内部滚动。 */
-.reader-search { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); z-index: 30; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; box-sizing: border-box; box-shadow: 0 8px 24px rgba(0,0,0,0.35); max-height: 62dvh; display: flex; flex-direction: column; }
+/* 搜索面板：全屏浮层（top/bottom 都贴边，占满整屏，不再留空隙露正文）。
+   输入框钉在面板顶部不动，只让结果在内部滚动。 */
+.reader-search { position: fixed; top: 0; bottom: 0; left: 50%; transform: translateX(-50%); width: min(720px, 100%); z-index: 30; background: var(--bg); padding: 12px; padding-top: calc(12px + env(safe-area-inset-top, 0px)); padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); box-sizing: border-box; display: flex; flex-direction: column; }
 .reader-search .row { display: flex; gap: 8px; align-items: center; }
 .reader-search .row input { flex: 1; min-width: 0; }
 /* 结果列表是面板里唯一会滚的部分：输入框钉在面板顶部不动，
@@ -103,11 +102,13 @@ em { font-style: normal; background: #b58900; color: #fff; border-radius: 2px; p
 .reader-settings .settings-section { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 .reader-settings .settings-section .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .reader-settings .settings-section p { margin: 0; }
-/* 目录：fixed 悬浮层，浮在底栏上方（像设置面板一样，不再贴在视口最顶上）。
-   章多时内部滚动。 */
-.toc { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); width: min(680px, calc(100% - 24px)); z-index: 30; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; box-sizing: border-box; box-shadow: 0 8px 24px rgba(0,0,0,0.35); max-height: 62dvh; overflow: auto; overscroll-behavior: contain; }
-.toc button { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; padding: 8px 12px; }
-.toc button:hover, .toc button.current { background: var(--surface2); color: var(--accent); }
+/* 目录：全屏浮层（占满整屏，不再留空隙露正文）。标题栏钉在顶部不动，
+   章节列表在内部滚动。 */
+.toc { position: fixed; top: 0; bottom: 0; left: 50%; transform: translateX(-50%); width: min(720px, 100%); z-index: 30; background: var(--bg); padding: 12px; padding-top: calc(12px + env(safe-area-inset-top, 0px)); padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); box-sizing: border-box; display: flex; flex-direction: column; }
+.toc-head { display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; padding-bottom: 8px; }
+.toc-list { overflow: auto; flex: 1; min-height: 0; overscroll-behavior: contain; }
+.toc-list button { display: block; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; padding: 8px 12px; }
+.toc-list button:hover, .toc-list button.current { background: var(--surface2); color: var(--accent); }
 
 /* 阅读主题（仅作用于正文区） */
 .reader-content[data-reader-theme="light"] { background: #faf6ee; color: #222; }

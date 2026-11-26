@@ -872,13 +872,19 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
 
       <Show when={showToc()}>
         <div class="toc">
-          <For each={toc()}>
-            {(c) => (
-              <button class={c.idx === idx() ? "current" : ""} onClick={() => { setPanel(null); void jumpToChapter(c.idx); }}>
-                {c.title}
-              </button>
-            )}
-          </For>
+          <div class="toc-head">
+            <strong>目录</strong>
+            <button onClick={() => setPanel(null)}>✕</button>
+          </div>
+          <div class="toc-list">
+            <For each={toc()}>
+              {(c) => (
+                <button class={c.idx === idx() ? "current" : ""} onClick={() => { setPanel(null); void jumpToChapter(c.idx); }}>
+                  {c.title}
+                </button>
+              )}
+            </For>
+          </div>
         </div>
       </Show>
 
