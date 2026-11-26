@@ -623,14 +623,14 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     }
     void jumpToChapter(target, frac);
   };
-  // 底栏「搜索」：只浮出搜索面板并聚焦输入框，不显示顶栏/底栏。
+  // 底栏「搜索」：浮出搜索面板并聚焦输入框，像设置面板一样——
+  // 顶栏/底栏留着，面板浮在底栏正上方（以前藏掉顶栏/底栏，面板贴在视口顶上）。
   // 回到结果列表时滚回上次点过的匹配处（jumpToMatch 会收起面板、卸载
   // 列表 DOM，再开时位置归零；这里用 current 匹配项恢复位置）。
-  // 面板是 fixed 悬浮层，输入框恒在视口顶部，focus 不用滚页面。
+  // 面板是 fixed 悬浮层，输入框恒在视口内，focus 不用滚页面。
   let searchInputRef: HTMLInputElement | undefined;
   let matchListRef: HTMLDivElement | undefined;
   const openSearch = () => {
-    setShowChrome(false);
     setPanel("search");
     requestAnimationFrame(() => {
       searchInputRef?.focus({ preventScroll: true });
