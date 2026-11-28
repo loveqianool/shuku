@@ -158,13 +158,20 @@ const Bookshelf: Component = () => {
   };
 
   // 最近阅读：最近打开的 100 本书（打开书时阅读器会写进度），点开续读。
-  onMount(async () => {
+  const loadRecent = async () => {
     try {
       const res = await api.recentBooks();
       setRecent(res.items);
     } catch {
       // 没有最近阅读不影响书库列表。
     }
+  };
+  onMount(() => {
+    void loadRecent();
+    // 刚从阅读器返回时，阅读器的退出保存可能比这次拉取晚到；
+    // 0.6 秒后再拉一次兜底，免得新读的书要整页刷新才出现。
+    const t = setTimeout(() => void loadRecent(), 600);
+    onCleanup(() => clearTimeout(t));
   });
 
   // 筛选变化时回到第 1 页并滚回顶部（否则虚拟列表还停在旧的滚动位置，

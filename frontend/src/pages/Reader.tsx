@@ -330,6 +330,8 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     // 因为 resetToChapter 也会自增 loadSeq，会把目录误判为过期。
     if (bid !== props.bookId) return;
     setToc(all);
+    // 目录到了：如果页面还矮（初始章太短），把后续章节补进来。
+    void fillViewport();
   };
 
   // 序号守卫：换书/跳章时先到的响应不覆盖后到的（Bookshelf 同款 loadSeq）。
@@ -399,6 +401,23 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
     }
   };
 
+  // 打开后页面比视口矮就没法滚（第 0 章只有 52 字的“前言”就这样）：
+  // 持续追加章节，直到页面比视口高出一截或已到底。resetToChapter 里
+  // 的预载只追加一章，还依赖目录已加载完——目录晚到就跳过，直接卡住。
+  // loadToc 完成后也调一次，两种到货顺序都兜住。
+  const fillViewport = async () => {
+    const seq = loadSeq;
+    // 等一帧让 Solid 把刚载入的章节渲染出来，再量高度。
+    await new Promise((r) => requestAnimationFrame(r));
+    while (seq === loadSeq) {
+      if (chapters().length === 0) return;
+      if (document.documentElement.scrollHeight > window.innerHeight + 600) return;
+      const ok = await appendOne();
+      if (!ok) return; // 已到底 / 在载 / 序号过期
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+  };
+
   // 跳转：把载入窗口重置到目标章（只留目标章，免得远跳时一次抓幾十章），
   // 再滚到章内位置。opts.frac：章内 0..1；opts.offsetPx：恢复进度用的
   // 章内像素偏移；opts.scroll=false 时只载入不滚动（搜尋定位由 effect 接手）。
@@ -420,23 +439,27 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
       // 用 replaceState 更新深链（不触发 hashchange → App 路由重算，
       // 免得换书 effect 被重複觸發、loadSeq 自增令在途的追加漏清 loadingMore）。
       history.replaceState(null, "", `#/read/${encodeURIComponent(props.bookId)}/${i}`);
-      // 后台先把下一章也载好，往下滚时无缝（不 await，不阻塞定位）。
-      const total = toc().length;
-      if (i + 1 < total) void appendOne();
+      // 把页面补到能滚动为止（不 await，不阻塞定位）：只预载一章不够，
+      // 短章连着短章时页面还是比视口矮，照样滚不动。
+      void fillViewport();
       if (opts?.scroll === false) return;
       requestAnimationFrame(() => {
         if (seq !== loadSeq) return;
         const el = chapterEl(i);
-        if (!el) return;
-        const max = Math.max(0, el.scrollHeight - window.innerHeight);
-        const top = el.offsetTop + (opts?.offsetPx !== undefined
-          ? Math.min(opts.offsetPx, max)
-          : (opts?.frac ?? 0) * max);
-        window.scrollTo(0, top);
-        setScrollFrac(getScrollFrac());
+        if (el) {
+          const max = Math.max(0, el.scrollHeight - window.innerHeight);
+          const top = el.offsetTop + (opts?.offsetPx !== undefined
+            ? Math.min(opts.offsetPx, max)
+            : (opts?.frac ?? 0) * max);
+          window.scrollTo(0, top);
+          setScrollFrac(getScrollFrac());
+        }
+        // 保存进度不依赖章节 DOM 是否已渲染：没渲染就按 offset 0 存。
+        // 以前 el 为空直接 return，刚打开就返回会丢掉这次打开记录，
+        // 最近阅读不更新。
         api.saveProgress(props.bookId, {
           chapter_idx: i,
-          offset: Math.max(0, window.scrollY - el.offsetTop),
+          offset: el ? Math.max(0, window.scrollY - el.offsetTop) : 0,
         }).catch(() => {});
       });
     } catch (e) {
@@ -515,13 +538,24 @@ const Reader: Component<{ bookId: string; initialIdx: number }> = (props) => {
 
   // 滚动进度自动保存（防抖 1s）。offset 是章内像素偏移（scrollY - 章节
   // section 顶），与旧 Progress 格式兼容。
+  // 待保存的进度（防抖期内）：退出阅读器时立刻写掉，不只清掉定时器。
+  // 以前 1 秒内返回书库会把这次保存直接丢掉，最近阅读就不更新。
+  let pendingSave: { chapter_idx: number; offset: number } | null = null;
   const scheduleSaveProgress = (offset: number) => {
+    pendingSave = { chapter_idx: idx(), offset };
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      api.saveProgress(props.bookId, { chapter_idx: idx(), offset }).catch(() => {});
+      const p = pendingSave;
+      pendingSave = null;
+      if (p) api.saveProgress(props.bookId, p).catch(() => {});
     }, 1000);
   };
-  onCleanup(() => clearTimeout(saveTimer));
+  onCleanup(() => {
+    clearTimeout(saveTimer);
+    const p = pendingSave;
+    pendingSave = null;
+    if (p) api.saveProgress(props.bookId, p).catch(() => {});
+  });
 
   // 阅读时长：页面可见且章节已加载时每秒累计，满 60 秒上报一次，
   // 退出阅读器时把剩余秒数一起上报。
